@@ -26,13 +26,32 @@ const FONT_CANDIDATES = [
     regularFamily: "STHeitiSC-Light",
     boldFamily: "STHeitiSC-Light",
   },
+  {
+    // Windows：微软雅黑随系统分发，常规与粗体在不同的 TTC 文件中。
+    filePath: "C:\\Windows\\Fonts\\msyh.ttc",
+    regularFamily: "MicrosoftYaHei",
+    boldFilePath: "C:\\Windows\\Fonts\\msyhbd.ttc",
+    boldFamily: "MicrosoftYaHei-Bold",
+  },
+  {
+    // Windows 备选：宋体（常规与粗体同文件，postScript 名一致）。
+    filePath: "C:\\Windows\\Fonts\\simsun.ttc",
+    regularFamily: "SimSun",
+    boldFamily: "SimSun",
+  },
 ];
 
 function registerFonts(document) {
   const candidate = FONT_CANDIDATES.find((entry) => fs.existsSync(entry.filePath));
   if (!candidate) return { regular: "Helvetica", bold: "Helvetica-Bold" };
   document.registerFont("DomiBody", candidate.filePath, candidate.regularFamily);
-  document.registerFont("DomiBold", candidate.filePath, candidate.boldFamily);
+  const boldPath = candidate.boldFilePath || candidate.filePath;
+  try {
+    document.registerFont("DomiBold", boldPath, candidate.boldFamily);
+  } catch {
+    // 粗体缺失时退回常规字重，避免整个 PDF 渲染失败。
+    document.registerFont("DomiBold", candidate.filePath, candidate.regularFamily);
+  }
   return { regular: "DomiBody", bold: "DomiBold" };
 }
 

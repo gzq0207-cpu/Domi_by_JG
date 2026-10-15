@@ -22,13 +22,24 @@ function writeExecutable(filePath, version) {
 }
 
 async function run() {
-  assert.deepEqual(expectedTargetForArch("arm64"), {
+  if (process.platform === "win32") {
+    // 该套件验证 macOS 打包归档（tar.gz、Mach-O 脚本、符号链接）的安装与
+    // 回滚流程；Windows 使用 @openai/codex-sdk 平台分包安装，无法运行这些
+    // Unix 专属场景。
+    console.log("Codex runtime tests skipped on Windows (macOS archive flow).");
+    return;
+  }
+  assert.deepEqual(expectedTargetForArch("arm64", "darwin"), {
     target: "aarch64-apple-darwin",
     assetName: "codex-package-aarch64-apple-darwin.tar.gz"
   });
-  assert.deepEqual(expectedTargetForArch("x64"), {
+  assert.deepEqual(expectedTargetForArch("x64", "darwin"), {
     target: "x86_64-apple-darwin",
     assetName: "codex-package-x86_64-apple-darwin.tar.gz"
+  });
+  assert.deepEqual(expectedTargetForArch("x64", "win32"), {
+    target: "x86_64-pc-windows-msvc",
+    assetName: "codex-package-x86_64-pc-windows-msvc.zip"
   });
   assert.throws(() => expectedTargetForArch("ia32"), /不支持当前 Codex Runtime 架构/);
 

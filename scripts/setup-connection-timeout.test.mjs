@@ -94,11 +94,13 @@ test("connection fingerprints change for every tested identity and path field", 
     authMode: "chatgpt",
     apiBaseUrl: "",
     apiModel: "",
+    apiWireApi: "responses",
     relayCredentialConfigured: false,
     codexPath: "/Applications/domi.app/codex",
     relayApiKey: "",
     runtimeAuthMode: "chatgpt",
     runtimeApiBaseUrl: "",
+    runtimeApiWireApi: "",
     runtimeModel: "gpt-current",
     runtimePath: "/Applications/domi.app/codex",
     runtimeAccount: "person@example.com"
@@ -108,11 +110,13 @@ test("connection fingerprints change for every tested identity and path field", 
     ["authMode", "relay"],
     ["apiBaseUrl", "https://relay.example/v1"],
     ["apiModel", "relay-model"],
+    ["apiWireApi", "chat"],
     ["relayCredentialConfigured", true],
     ["codexPath", "/tmp/another-codex"],
     ["relayApiKey", "changed-secret"],
     ["runtimeAuthMode", "relay"],
     ["runtimeApiBaseUrl", "https://runtime.example/v1"],
+    ["runtimeApiWireApi", "chat"],
     ["runtimeModel", "another-model"],
     ["runtimePath", "/tmp/runtime-codex"],
     ["runtimeAccount", "other@example.com"]
@@ -151,8 +155,15 @@ test("first-run path application can replace a package-manager symlink with the 
   try {
     const runtime = path.join(root, "runtime-codex");
     const symlink = path.join(root, "codex");
-    fs.writeFileSync(runtime, "runtime");
-    fs.symlinkSync(runtime, symlink);
+    if (process.platform === "win32") {
+      // Windows 无特权时无法创建符号链接；junction（目录链接）是
+      // 包管理器在 Windows 上的等价物，realpath 解析语义一致。
+      fs.mkdirSync(runtime);
+      fs.symlinkSync(runtime, symlink, "junction");
+    } else {
+      fs.writeFileSync(runtime, "runtime");
+      fs.symlinkSync(runtime, symlink);
+    }
     const canonicalPath = fs.realpathSync(symlink);
 
     assert.match(codexConnectionDraftBlockReason({

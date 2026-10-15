@@ -9,7 +9,6 @@ export type Workflow = {
   quickStart?: boolean;
   hidden?: boolean;
   webSearch?: boolean;
-  requiresPlaud?: boolean;
 };
 
 export const RADAR_MAX_LOOKBACK_MS = 72 * 60 * 60 * 1000;
@@ -369,13 +368,13 @@ export function todoRecentEntriesContext(
 export const workflows: Workflow[] = [
   {
     id: "domi-router",
-    title: "处理录音",
+    title: "domi 多阶段任务",
     shortTitle: "domi",
     skill: "$domi:domi-router",
-    description: "恢复并运行 PLAUD → 纪要 → 投资快评 → 当前项目库主工作流。",
-    output: "文字稿、结构化纪要、投资评分和项目库结果",
+    description: "按 domi Router 的阶段规则运行多阶段串联任务（纪要入库、订阅日报等）。",
+    output: "按工作流分阶段的执行结果",
     defaultPrompt:
-      "运行 domi PLAUD 投资录音主工作流：先检查并恢复未完成队列，再发现尚未生成文字稿的录音；严格按 domi Router 的阶段和确认规则执行。",
+      "运行 domi 多阶段主工作流：按 domi Router 的阶段和确认规则执行。",
     hidden: true
   },
   {
@@ -647,7 +646,7 @@ export function workflowPrompt(
     return [
       "你正在 domi 投资工作台中运行，底层是本地 Codex。",
       "当前启用的分析师是 domi-AI分析师。必须使用已安装的 domi 插件完成本轮任务。",
-      "先判断是否属于 PLAUD、录音、纪要后续入库等明确的多阶段串联任务；只有这些任务才先完整读取 $domi:domi-router。普通研究、分析、评级、项目管理或交易任务直接选择最匹配的单项 domi Skill，并只读取该 Skill 要求的 references，避免重复加载 Router。不要使用同名的非 domi Skill 替代。",
+      "先判断是否属于录音、纪要后续入库等明确的多阶段串联任务；只有这些任务才先完整读取 $domi:domi-router。普通研究、分析、评级、项目管理或交易任务直接选择最匹配的单项 domi Skill，并只读取该 Skill 要求的 references，避免重复加载 Router。不要使用同名的非 domi Skill 替代。",
       investmentSlidesRule,
       QUALITY_FIRST_CONTEXT_EFFICIENCY_RULE,
       "确实没有匹配 Skill 时，再以投资分析师身份直接回答；不得为了形式完整而加载与本轮无关的 Skill 或 references。",

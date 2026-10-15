@@ -15,8 +15,12 @@ const {
   isOfficialCodexInstallerUrl,
   mergeRelayConfig,
   normalizeRelayBaseUrl,
+  relayCredentialPath,
   runCodexWithPrompt
 } = require("../electron/codex-bootstrap.cjs");
+
+const isWindows = process.platform === "win32";
+const EXPECTED_AUTH_COMMAND = isWindows ? "cmd.exe" : "/usr/bin/security";
 
 function createRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "domi-codex-bootstrap-"));
@@ -159,7 +163,13 @@ test("relay config preserves unrelated settings and uses a Keychain token comman
   assert.equal(merged.model, "relay-model");
   assert.equal(merged.model_provider, DOMI_PROVIDER_ID);
   assert.equal(merged.model_providers.existing.name, "Existing");
-  assert.deepEqual(merged.model_providers[DOMI_PROVIDER_ID].auth, {
+  assert.equal(merged.model_providers[DOMI_PROVIDER_ID].wire_api, "responses");
+  assert.equal(merged.model_providers[DOMI_PROVIDER_ID].name, "domi Responses 中转站");
+  assert.deepEqual(merged.model_providers[DOMI_PROVIDER_ID].auth, isWindows ? {
+    command: "cmd.exe",
+    args: ["/d", "/c", "type", relayCredentialPath()],
+    timeout_ms: 5000
+  } : {
     command: "/usr/bin/security",
     args: [
       "find-generic-password",
@@ -171,6 +181,24 @@ test("relay config preserves unrelated settings and uses a Keychain token comman
     ],
     timeout_ms: 5000
   });
+});
+
+test("relay config supports the chat completions wire protocol and rejects unknown values safely", () => {
+  const chat = mergeRelayConfig({}, {
+    baseUrl: "https://api.deepseek.com/v1",
+    model: "deepseek-chat",
+    wireApi: "chat"
+  });
+  assert.equal(chat.model_providers[DOMI_PROVIDER_ID].wire_api, "chat");
+  assert.equal(chat.model_providers[DOMI_PROVIDER_ID].name, "domi Chat Completions 中转站");
+
+  const fallback = mergeRelayConfig({}, {
+    baseUrl: "https://relay.example.com/v1",
+    model: "relay-model",
+    wireApi: "something-else"
+  });
+  assert.equal(fallback.model_providers[DOMI_PROVIDER_ID].wire_api, "responses");
+  assert.equal(fallback.model_providers[DOMI_PROVIDER_ID].name, "domi Responses 中转站");
 });
 
 test("configuring a relay stores the credential outside config.toml", async () => {
@@ -218,8 +246,18 @@ test("configuring a relay stores the credential outside config.toml", async () =
     assert.equal(configContent.includes(credential), false);
     assert.equal(config.personality, "friendly");
     assert.equal(config.model_provider, DOMI_PROVIDER_ID);
-    assert.equal(config.model_providers[DOMI_PROVIDER_ID].auth.command, "/usr/bin/security");
-    assert.equal(fs.statSync(service.configPath()).mode & 0o777, 0o600);
+    assert.equal(config.model_providers[DOMI_PROVIDER_ID].auth.command, EXPECTED_AUTH_COMMAND);
+    assert.equal(config.model_providers[DOMI_PROVIDER_ID].wire_api, "responses");
+    assert.equal(result.wireApi, "responses");
+    if (isWindows) {
+      assert.equal(
+        config.model_providers[DOMI_PROVIDER_ID].auth.args.at(-1),
+        relayCredentialPath(root)
+      );
+    }
+    if (!isWindows) {
+      assert.equal(fs.statSync(service.configPath()).mode & 0o777, 0o600);
+    }
 
     const restored = service.restoreChatGPTConfig();
     assert.equal(restored.ok, true);
@@ -308,6 +346,7 @@ test("official installer is idempotent and installs to the user local bin direct
   const root = createRoot();
   let installed = false;
   let installerCalls = 0;
+  let localWindowsInstalls = 0;
   try {
     const service = new CodexBootstrapService({
       homeDir: root,
@@ -317,10 +356,17 @@ test("official installer is idempotent and installs to the user local bin direct
       },
       resolveBinary: (preferredPath) => {
         if (!installed) throw new Error("not installed");
-        return preferredPath || path.join(root, ".local", "bin", "codex");
+        return preferredPath || path.join(root, ".local", "bin", isWindows ? "codex.exe" : "codex");
       },
       writeCredential: async () => {},
       sleep: async () => {},
+      ...(isWindows ? {
+        installLocalWindows: async () => {
+          localWindowsInstalls += 1;
+          installed = true;
+          return { path: path.join(root, ".local", "bin", "codex.exe") };
+        }
+      } : {}),
       exec: async (binary, args, options) => {
         if (binary === "/bin/sh") {
           assert.equal(options.env.CODEX_NON_INTERACTIVE, "1");
@@ -337,12 +383,14 @@ test("official installer is idempotent and installs to the user local bin direct
     const first = await service.install();
     assert.equal(first.ok, true);
     assert.equal(first.installedNow, true);
-    assert.equal(installerCalls, 1);
+    assert.equal(installerCalls, isWindows ? 0 : 1);
+    if (isWindows) assert.equal(localWindowsInstalls, 1);
 
     const second = await service.install();
     assert.equal(second.ok, true);
     assert.equal(second.installedNow, false);
-    assert.equal(installerCalls, 1);
+    assert.equal(installerCalls, isWindows ? 0 : 1);
+    if (isWindows) assert.equal(localWindowsInstalls, 1);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

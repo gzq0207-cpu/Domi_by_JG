@@ -26,7 +26,6 @@ import {
   LayoutDashboard,
   LibraryBig,
   ListChecks,
-  Mic,
   MoreHorizontal,
   Newspaper,
   PanelRightClose,
@@ -36,6 +35,7 @@ import {
   PinOff,
   Play,
   Plus,
+  Radio,
   RefreshCw,
   Scale,
   Search,
@@ -69,6 +69,7 @@ import {
   useState
 } from "react";
 import { hasNativeWorkbench, workbench } from "./bridge";
+import { CodexModelReadiness } from "./codex-model-readiness";
 import { filesFromClipboardData } from "./clipboard-files";
 import { isLocalPdfResource } from "./document-resources";
 import {
@@ -118,9 +119,6 @@ import {
   DomiDatabaseSnapshot,
   DomiDatabaseUpdateRequest,
   DomiNewsItem,
-  DomiPlaudItem,
-  DomiPlaudSnapshot,
-  DomiPlaudSyncResult,
   DomiProject,
   DomiSnapshot,
   DomiTask,
@@ -130,15 +128,19 @@ import {
   DocumentLibrarySearchMatch,
   DocumentLibrarySearchResult,
   DocumentLibrarySnapshot,
+  IntakeItem,
   LocalAttachment,
+  LibraryUsage,
+  SourceScope,
   MarkdownDocument,
   PdfDocument,
   PodcastJob,
-  PodcastProcessResult,
   RadarSourceSnapshot,
+  TwitterItem,
   UpdateStatus
 } from "./env";
 import {
+  DOMI_DEFAULT_AGENT_PREFERENCES,
   type DomiModelPolicyRunKind,
   resolveDomiModelPolicy
 } from "./model-policy";
@@ -162,6 +164,17 @@ import {
   workflows
 } from "./workflows";
 import {
+bareIntakeInput,
+intakeFilePrompt,
+intakeLinkPrompt,
+intakeMediaLinkPrompt
+} from "./intake-prompts";
+import {
+groupSubscriptionDays,
+subscriptionDayKey,
+subscriptionDigestPrompt
+} from "./subscriptions";
+import {
   PROJECT_DOMAIN_SUBDOMAINS,
   projectDomainsForNews,
   projectSubdomainsForNews,
@@ -174,18 +187,32 @@ import {
   normalizeRadarDomains
 } from "./radar-domains";
 import { parseRadarResult, radarRejectionSummary } from "./radar-result";
-import {
-  pendingPlaudContinuation,
-  plaudContinuationPrompt
-} from "./plaud-continuation";
 
 const RichMarkdownEditor = lazy(() => import("./RichMarkdownEditor"));
 const SetupCenter = lazy(() => import("./SetupCenter"));
 const MessageContent = lazy(() => import("./MessageContent"));
 const RadarSourceManager = lazy(() => import("./RadarSourceManager"));
+const SubscriptionsView = lazy(() => import("./SubscriptionsView"));
 
 type Role = "user" | "assistant" | "system";
-type WorkspaceView = "conversation" | "tasks" | "news" | "data" | "documents";
+const SOURCE_SCOPE_LABELS: Record<SourceScope, string> = {
+  selected: "仅选定材料",
+  library: "全库资料 · 不联网",
+  research: "全库＋联网研究"
+};
+function isSourceScope(value: unknown): value is SourceScope {
+  return value === "selected" || value === "library" || value === "research";
+}
+function isRestrictedScope(value?: SourceScope) {
+  return value === "selected" || value === "library";
+}
+function validateSourceSelection(scope: SourceScope | undefined, files: LocalAttachment[]) {
+  if (scope === "selected" && !files.length) throw new Error("请先通过「＋」或「加入提问」添加材料；仅选定材料模式不会自动搜索全库。");
+  if (isRestrictedScope(scope) && files.some((file) => !/\.(?:md|markdown|txt|pdf)$/i.test(file.path))) {
+    throw new Error("受限资料问答支持 Markdown、文本和 PDF；请先转换其他格式，或明确选择联网研究模式。");
+  }
+}
+type WorkspaceView = "conversation" | "tasks" | "news" | "subscriptions" | "data" | "documents";
 
 type DomiSearchOption =
   | { key: string; kind: "project"; record: DomiProject }
@@ -213,6 +240,7 @@ const WORKSPACE_VIEW_DEFAULT_RIGHT_PANEL: Record<WorkspaceView, boolean> = {
   conversation: true,
   tasks: true,
   news: true,
+  subscriptions: true,
   data: false,
   documents: false
 };
@@ -224,6 +252,7 @@ const WORKSPACE_SCROLL_SELECTORS: Record<WorkspaceView, string[]> = {
   conversation: [".right-panel:not(.document-panel)"],
   tasks: [".task-board-scroll", ".task-column-list", ".right-panel:not(.document-panel)"],
   news: [".home-weekly-news", ".right-panel:not(.document-panel)"],
+  subscriptions: [".subscriptions", ".right-panel:not(.document-panel)"],
   data: [".database-grid-shell", ".right-panel:not(.document-panel)"],
   documents: [".rich-markdown-scroll"]
 };
@@ -237,14 +266,16 @@ type DatabaseFilterKey =
   | "status"
   | "rating"
   | "city"
-  | "domain"
-  | "subdomain"
-  | "investor"
-  | "type"
-  | "organization"
-  | "source"
-  | "evidence"
-  | "following";
+| "domain"
+| "subdomain"
+| "investor"
+| "type"
+| "organization"
+| "source"
+| "evidence"
+| "following"
+| "articleType"
+| "companies";
 type DatabaseSortKey =
   | "updated"
   | "name"
@@ -285,15 +316,17 @@ const DATABASE_FILTER_OPTIONS: Record<DatabaseEntityType, Array<DatabaseToolbarO
     { value: "type", label: "类型" },
     { value: "organization", label: "所属组织与身份" }
   ],
-  news: [
-    { value: "none", label: "不筛选" },
-    { value: "domain", label: "领域" },
-    { value: "subdomain", label: "子领域" },
-    { value: "type", label: "信息类型" },
-    { value: "source", label: "来源" },
-    { value: "evidence", label: "证据状态" },
-    { value: "following", label: "继续展示" }
-  ]
+news: [
+{ value: "none", label: "不筛选" },
+{ value: "articleType", label: "内容类型" },
+{ value: "domain", label: "领域" },
+{ value: "subdomain", label: "子领域" },
+{ value: "companies", label: "公司" },
+{ value: "type", label: "信息类型" },
+{ value: "source", label: "来源" },
+{ value: "evidence", label: "证据状态" },
+{ value: "following", label: "继续展示" }
+]
 };
 const DATABASE_SORT_OPTIONS: Record<DatabaseEntityType, Array<DatabaseToolbarOption<DatabaseSortKey>>> = {
   project: [
@@ -618,15 +651,20 @@ function databaseFilterValues(
     else if (filterKey === "city") values = person.cities || [];
     else if (filterKey === "type") values = person.types || [];
     else if (filterKey === "organization") values = [person.organization];
-  } else {
-    const item = record as DomiNewsItem;
-    if (filterKey === "domain") values = item.domains || [];
-    else if (filterKey === "subdomain") values = item.subdomains || [];
-    else if (filterKey === "type") values = item.types || [];
-    else if (filterKey === "source") values = [item.source];
-    else if (filterKey === "evidence") values = [item.evidenceStatus];
-    else if (filterKey === "following") values = [item.worthFollowing === false ? "否" : "是"];
-  }
+} else {
+const item = record as DomiNewsItem;
+if (filterKey === "domain") values = item.domains || [];
+else if (filterKey === "subdomain") values = item.subdomains || [];
+else if (filterKey === "type") values = item.types || [];
+else if (filterKey === "source") values = [item.source];
+else if (filterKey === "evidence") values = [item.evidenceStatus];
+else if (filterKey === "following") values = [item.worthFollowing === false ? "否" : "是"];
+else if (filterKey === "articleType") {
+  values = [item.articleType === "article" ? "认知文章" : "行业事件"];
+} else if (filterKey === "companies") {
+  values = String(item.companies || "").split(/[,，、]/).map((value) => value.trim()).filter(Boolean);
+}
+}
   return [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))];
 }
 
@@ -815,7 +853,7 @@ function filterDocumentLibraryNodes(nodes: DocumentLibraryNode[], rawQuery: stri
     const children = (node.children || [])
       .map(filter)
       .filter((child): child is DocumentLibraryNode => Boolean(child));
-    if (node.name.toLocaleLowerCase("zh-CN").includes(query) || children.length > 0) {
+    if (`${node.displayName || ""} ${node.name}`.toLocaleLowerCase("zh-CN").includes(query) || children.length > 0) {
       return node.kind === "folder" ? { ...node, children } : node;
     }
     return null;
@@ -833,7 +871,7 @@ function documentLibrarySearchMatches(
   const matches: Array<{ node: DocumentLibraryNode; parentPath: string }> = [];
   const visit = (items: DocumentLibraryNode[], parentPath: string) => {
     for (const node of items) {
-      if (node.name.toLocaleLowerCase("zh-CN").includes(query)) {
+      if (`${node.displayName || ""} ${node.name}`.toLocaleLowerCase("zh-CN").includes(query)) {
         matches.push({ node, parentPath });
       }
       if (node.kind === "folder" && node.children?.length) {
@@ -856,6 +894,9 @@ type Message = {
   runStartedAt?: number;
   runCompletedAt?: number;
   runEventCount?: number;
+  libraryUsage?: LibraryUsage;
+  sourceScope?: SourceScope;
+  sourceScopeIsolated?: boolean;
   entityFinalizationMode?: EntityFinalizationMode;
   entityExecutionIsolated?: boolean;
   executionCodexThreadId?: string;
@@ -866,7 +907,6 @@ type Thread = {
   codexThreadId?: string;
   quarantinedCodexThreadIds?: string[];
   projectId: string;
-  plaudFileId?: string;
   workspacePath?: string;
   title: string;
   project: string;
@@ -884,12 +924,14 @@ type Thread = {
 
 type SubmitToCodexOptions = {
   thread?: Thread;
+  runKind?: DomiModelPolicyRunKind;
   useDomiPlugin?: boolean;
   displayText?: string;
   workflowContinuation?: boolean;
   resumeCodexThreadId?: string;
   privateCodexContinuation?: boolean;
   attachments?: LocalAttachment[];
+  sourceScope?: SourceScope;
   activeDocumentPath?: string;
   requestOrigin?: "user" | "programmatic";
   userInstructionText?: string;
@@ -930,6 +972,7 @@ type QueuedSubmission = {
   resumeCodexThreadId?: string;
   privateCodexContinuation?: boolean;
   attachments: LocalAttachment[];
+  sourceScope?: SourceScope;
   activeDocumentPath?: string;
   requestOrigin?: "user" | "programmatic";
   userInstructionText?: string;
@@ -1009,6 +1052,7 @@ function readQueuedSubmissions(): Record<string, QueuedSubmission[]> {
           && candidate.threadId === threadId
           && typeof candidate.input === "string"
           && Array.isArray(candidate.attachments)
+          && (candidate.sourceScope === undefined || isSourceScope(candidate.sourceScope))
           && (candidate.activeDocumentPath === undefined
             || typeof candidate.activeDocumentPath === "string")
           && (candidate.displayText === undefined
@@ -1059,6 +1103,8 @@ type RunContext = {
   workflowId?: string;
   requestText?: string;
   attachments?: LocalAttachment[];
+  sourceScope?: SourceScope;
+  sourceScopeIsolated?: boolean;
   knownProjectIds?: string[];
   knownPersonIds?: string[];
   queuedSubmission?: QueuedSubmission;
@@ -1079,6 +1125,7 @@ type ComposerDraft = {
   input: string;
   attachments: LocalAttachment[];
   attachmentError: string;
+  sourceScope?: SourceScope;
   selectedWorkflowId?: string;
 };
 
@@ -1112,11 +1159,12 @@ function readStoredComposerDrafts(): Record<string, ComposerDraft> {
         input: typeof draft.input === "string" ? draft.input : "",
         attachments,
         attachmentError: "",
+        sourceScope: isSourceScope(draft.sourceScope) ? draft.sourceScope : undefined,
         selectedWorkflowId: typeof draft.selectedWorkflowId === "string"
           ? draft.selectedWorkflowId
           : undefined
       };
-      return normalized.input || normalized.attachments.length || normalized.selectedWorkflowId
+      return normalized.input || normalized.attachments.length || normalized.selectedWorkflowId || normalized.sourceScope
         ? [[threadId, normalized]]
         : [];
     }));
@@ -1164,6 +1212,11 @@ type WeeklyNewsAutomationState = {
   lastRadarSuccessAt: number;
   nextRadarAt: number;
   retryAttempt: number;
+  lastSourceSyncAt: number;
+  nextSourceSyncAt: number;
+  // 订阅日报去重标记：最近一次已生成的日期（本地 YYYY-MM-DD）与时间。
+  lastSubscriptionDigestDay: string;
+  lastSubscriptionDigestAt: number;
 };
 
 const WEEKLY_NEWS_LIGHT_SYNC_INTERVAL_MS = 5 * 60 * 1000;
@@ -1171,6 +1224,9 @@ const WEEKLY_NEWS_FOCUS_SYNC_STALE_MS = 60 * 1000;
 const WEEKLY_NEWS_RADAR_INTERVAL_MS = 60 * 60 * 1000;
 const WEEKLY_NEWS_AUTOMATION_TICK_MS = 60 * 1000;
 const WEEKLY_NEWS_RADAR_RETRY_DELAYS_MS = [5, 15, 60].map((minutes) => minutes * 60 * 1000);
+// 订阅信源（X 大V时间线、YouTube 频道/播客新单集）的自动同步节奏：每 24
+// 小时至多一次，错过窗口后只要应用开着就会补上，与新闻雷达共用同一条循环。
+const RADAR_SOURCE_AUTO_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const MARKDOWN_AUTO_SAVE_DELAY_MS = 420;
 const MARKDOWN_AUTO_SAVE_RETRY_DELAYS_MS = [1_000, 3_000, 10_000];
 const WEEKLY_NEWS_AUTOMATION_STORAGE_KEY = "domi.weeklyNews.automation.v1";
@@ -1182,7 +1238,11 @@ function defaultWeeklyNewsAutomationState(): WeeklyNewsAutomationState {
     lastLightSyncAt: 0,
     lastRadarSuccessAt: 0,
     nextRadarAt: 0,
-    retryAttempt: 0
+    retryAttempt: 0,
+    lastSourceSyncAt: 0,
+    nextSourceSyncAt: 0,
+    lastSubscriptionDigestDay: "",
+    lastSubscriptionDigestAt: 0
   };
 }
 
@@ -1198,7 +1258,11 @@ function readWeeklyNewsAutomationState(): WeeklyNewsAutomationState {
       lastLightSyncAt: Number(stored.lastLightSyncAt) || 0,
       lastRadarSuccessAt: Number(stored.lastRadarSuccessAt) || 0,
       nextRadarAt: Number(stored.nextRadarAt) || 0,
-      retryAttempt: Math.max(0, Number(stored.retryAttempt) || 0)
+      retryAttempt: Math.max(0, Number(stored.retryAttempt) || 0),
+      lastSourceSyncAt: Number(stored.lastSourceSyncAt) || 0,
+      nextSourceSyncAt: Number(stored.nextSourceSyncAt) || 0,
+      lastSubscriptionDigestDay: String(stored.lastSubscriptionDigestDay || ""),
+      lastSubscriptionDigestAt: Number(stored.lastSubscriptionDigestAt) || 0
     };
   } catch {
     return defaultWeeklyNewsAutomationState();
@@ -1313,9 +1377,10 @@ const createId = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().to
 const NEW_THREAD_TITLE = "新的投资任务";
 const NEW_THREAD_PROJECT = "未命名项目";
 const LEGACY_NEW_THREAD_GREETING = "新对话已创建。选择一个 workflow，或直接输入你要 Codex 完成的投资任务。";
-const NEW_THREAD_MODEL = "default";
-const NEW_THREAD_REASONING_EFFORT = "max";
-const NEW_THREAD_SERVICE_TIER = "priority";
+const NEW_THREAD_MODEL = DOMI_DEFAULT_AGENT_PREFERENCES.model;
+const NEW_THREAD_REASONING_EFFORT = DOMI_DEFAULT_AGENT_PREFERENCES.reasoningEffort;
+const NEW_THREAD_SERVICE_TIER = DOMI_DEFAULT_AGENT_PREFERENCES.serviceTier;
+
 const TODO_SYNC_TIMEOUT_MS = 8 * 60 * 1000;
 const TODO_SYNC_LEDGER_POLL_MS = 10 * 1000;
 const TODO_SYNC_POST_WRITE_GRACE_MS = 20 * 1000;
@@ -1353,7 +1418,7 @@ function recentTodoCandidateCount(snapshot?: DomiSnapshot | null, now = Date.now
 }
 const COMPOSER_SUGGESTIONS = [
   "分析 NetShort 付费 Cohort 和增长质量",
-  "整理今天的项目交流录音并生成纪要",
+  "把今天的订阅内容整理成日报",
   "寻找 AI4S 领域值得沟通的创业者",
   "研究具身智能赛道的市场格局与关键公司",
   "对这个项目评级，并给出继续或放弃建议",
@@ -1476,23 +1541,6 @@ function concisePersonName(name: string) {
   return compactLabel(normalized, 10);
 }
 
-function conciseRecordingTitle(title: string) {
-  const normalized = title.trim().replace(/\.(m4a|mp3|wav|aac|flac)$/i, "");
-  const timestamp = normalized.match(
-    /^20\d{2}[-./年](\d{1,2})[-./月](\d{1,2})(?:日)?(?:[\sT_-]+(\d{1,2})[:：](\d{2})(?::\d{2})?)?$/
-  );
-  if (timestamp) {
-    const [, month, day, hour, minute] = timestamp;
-    return `${Number(month)}月${Number(day)}日${hour ? ` ${hour.padStart(2, "0")}:${minute}` : ""}录音`;
-  }
-  const withoutDate = normalized
-    .replace(/^20\d{2}[-_.年/]?\d{1,2}[-_.月/]?\d{1,2}(?:日)?[-_\s]*/, "")
-    .replace(/^\d{2}[-_.月/]\d{2}(?:日)?[-_\s]*/, "")
-    .replace(/^\d{1,2}[:：]\d{2}(?::\d{2})?[-_\s]*/, "")
-    .trim();
-  return compactLabel(withoutDate || normalized || "最新录音", 16);
-}
-
 function executionTextForThread(thread: Thread) {
   return [
     thread.title,
@@ -1582,15 +1630,6 @@ function peopleProgressStage(status: string) {
   return match ? Number(match[1]) : 0;
 }
 
-function formatPlaudDuration(duration: number | null) {
-  if (!duration) return "时长未知";
-  const totalMinutes = Math.max(1, Math.round(duration / 60000));
-  if (totalMinutes < 60) return `${totalMinutes} 分钟`;
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
-  return minutes ? `${hours} 小时 ${minutes} 分钟` : `${hours} 小时`;
-}
-
 function formatWeeklyNewsScanElapsed(totalSeconds: number) {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = String(totalSeconds % 60).padStart(2, "0");
@@ -1645,75 +1684,6 @@ function weeklyNewsScanStageFromOutput(output: string) {
     return "正在读取重点对象与行业分类";
   }
   return "domi 行业雷达正在运行";
-}
-
-function plaudItemStatus(item: DomiPlaudItem) {
-  if (item.queueStage === "managed") return "已生成并入库";
-  if (item.queueStage === "notes_non_project") return "纪要已生成";
-  if (item.transcriptPath || item.queueStage === "transcript_ready") return "文字稿待整理";
-  if (item.hasTranscript && item.queueStage) return "已生成，待同步";
-  if (item.hasTranscript || item.hasSummary) return "已有文字稿";
-  if (item.processing) return "正在生成";
-  if (item.error) return "需要重试";
-  return "未生成文字稿";
-}
-
-function canGeneratePlaudNotes(item: DomiPlaudItem) {
-  if (["managed", "notes_non_project"].includes(item.queueStage)) return false;
-  return Boolean(
-    item.hasTranscript
-    || item.hasSummary
-    || item.transcriptPath
-    || [
-      "transcript_ready",
-      "context_pending",
-      "context_ready",
-      "notes_project",
-      "reviewed",
-      "documented"
-    ].includes(item.queueStage)
-  );
-}
-
-function plaudNotesWorkflowRequest(item: DomiPlaudItem) {
-  return [
-    "请运行 domi PLAUD 投资录音处理工作流，只处理下面这一条指定录音，不要扫描或处理其他 PLAUD 录音：",
-    `- fileId：${item.fileId}`,
-    `- 录音标题：${item.fileName}`,
-    `- 当前队列阶段：${item.queueStage || "本地队列尚未记录"}`,
-    item.transcriptPath ? `- 已有本地文字稿：${item.transcriptPath}` : "- PLAUD 远端已有文字稿，本地尚未绑定文字稿路径",
-    "",
-    "目标：生成完整结构化纪要；如果实质内容属于创业项目或创始人交流，继续完成投资快评，并按运行时锁定的权威主库归档。默认本地主库使用 Markdown 文档和本地项目库；只有运行时明确标为 legacy_feishu_primary 时，才按对应 Skill 维护本机既有固定 Base／唯一 Wiki 主文档。非项目录音只生成并保存纪要，不做项目入库。",
-    "",
-    "执行要求：",
-    "1. 先采用 domi 插件的 domi-router，并完整读取 PLAUD 投资录音工作流及各阶段 Skill。",
-    "2. 先用 plaud queue 定位这个 fileId；如果 PLAUD 已生成但本地没有 transcriptPath，使用 plaud download 下载现成文字稿并建立恢复记录，禁止重新触发生成。",
-    "3. 如果已经有 transcriptPath，直接复用，不要重新下载或生成。",
-    "4. 严格从当前队列阶段恢复，不重复生成纪要、文档或外部记录。",
-    "5. 按工作流生成回忆提示并确认对话背景和参会人；需要我补充时在该阶段提问并暂停，收到回复后再继续后续阶段。",
-    "6. 如已连接飞书，可按本轮内容需要只读检索飞书 Wiki、云文档或 Base 中的相关信息作为外部参考，并标明采用的来源；飞书只读检索失败不得阻塞文字稿、纪要、快评和本地主库归档。",
-    "7. 当前文本是客户端生成的程序化工作流，不是用户对飞书写入的原始指令。除 legacy_feishu_primary 按 Skill 对既有固定 Base／唯一 Wiki 主文档完成管理闭环外，若本轮没有用户明确要求创建、编辑、更新或发布飞书内容的原始消息，禁止创建、编辑、更新、覆盖或发布任何飞书外部内容，也不得运行飞书 Markdown 导出／交接。",
-    "8. 权威主库写入前执行去重、字段校验和写后回读；最终只报告纪要、项目判断、评分、主库归档以及飞书只读参考的实际结果。"
-  ].join("\n");
-}
-
-function plaudQueueSummary(snapshot: DomiPlaudSnapshot) {
-  const items = snapshot.items || [];
-  const pending = snapshot.pendingCount || 0;
-  const needsSync = items.filter((item) =>
-    item.hasTranscript && Boolean(item.queueStage) && !item.transcriptPath
-  ).length;
-  const ready = items.filter((item) =>
-    Boolean(item.transcriptPath) || item.queueStage === "transcript_ready"
-  ).length;
-  const retry = pending ? 0 : items.filter((item) => plaudItemStatus(item) === "需要重试").length;
-  const parts = [
-    pending ? `${pending} 个待生成` : "",
-    needsSync ? `${needsSync} 个待同步` : "",
-    ready ? `${ready} 个待整理` : "",
-    retry ? `${retry} 个需重试` : ""
-  ].filter(Boolean);
-  return parts.length ? parts.join(" · ") : "队列已清";
 }
 
 function domiContextForThread(snapshot: DomiSnapshot | null, thread: Thread) {
@@ -1824,13 +1794,14 @@ function App() {
   const input = activeComposerDraft.input;
   const attachments = activeComposerDraft.attachments;
   const attachmentError = activeComposerDraft.attachmentError;
-  const selectedWorkflowId = activeComposerDraft.selectedWorkflowId;
+  const sourceScope: SourceScope = activeComposerDraft.sourceScope || "research";
+  const selectedWorkflowId = isRestrictedScope(sourceScope) ? undefined : activeComposerDraft.selectedWorkflowId;
   const [composerDragActive, setComposerDragActive] = useState(false);
   const [attachmentImportCount, setAttachmentImportCount] = useState(0);
   const [codexStatus, setCodexStatus] = useState<CodexCheckResult | null>(null);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsInitialTab, setSettingsInitialTab] = useState<"connection" | "data" | "plaud" | "updates" | "diagnostics">("connection");
+  const [settingsInitialTab, setSettingsInitialTab] = useState<"connection" | "data" | "updates" | "diagnostics">("connection");
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [sidebarUpdateBusy, setSidebarUpdateBusy] = useState(false);
   const [domiSnapshot, setDomiSnapshot] = useState<DomiSnapshot | null>(null);
@@ -1839,9 +1810,12 @@ function App() {
   const [domiQuery, setDomiQuery] = useState("");
   const [domiSearchError, setDomiSearchError] = useState("");
   const [domiSearchActiveKey, setDomiSearchActiveKey] = useState("");
+  const [domiSearchExcludeTranscripts, setDomiSearchExcludeTranscripts] = useState(false);
   const [domiDocumentSearch, setDomiDocumentSearch] = useState<DocumentLibrarySearchResult>({
     ok: true,
     results: [],
+    degraded: false,
+    partial: false,
     indexing: false,
     indexedCount: 0,
     lastIndexedAt: 0
@@ -1896,6 +1870,13 @@ function App() {
   const [radarDomainDraft, setRadarDomainDraft] = useState<RadarDomain[]>([]);
   const [radarDomainSaving, setRadarDomainSaving] = useState(false);
   const [radarSourceSnapshot, setRadarSourceSnapshot] = useState<RadarSourceSnapshot | null>(null);
+  const [subscriptionsLoading, setSubscriptionsLoading] = useState(false);
+  const [subscriptionsSyncing, setSubscriptionsSyncing] = useState(false);
+  const [subscriptionArchivingJobIds, setSubscriptionArchivingJobIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [subscriptionDigestDay, setSubscriptionDigestDay] = useState("");
+  const subscriptionArchivingJobIdsRef = useRef<Set<string>>(new Set());
+  const subscriptionsRefreshedAtRef = useRef(0);
+  const [feishuMirrorSyncing, setFeishuMirrorSyncing] = useState(false);
   const [assistantInteractions, setAssistantInteractions] = useState<AssistantInteraction[]>([]);
   const [domiTaskBoard, setDomiTaskBoard] = useState<DomiTaskBoardSnapshot | null>(null);
   const [domiTaskLoading, setDomiTaskLoading] = useState(false);
@@ -1907,6 +1888,21 @@ function App() {
   const [domiTaskSyncElapsed, setDomiTaskSyncElapsed] = useState(0);
   const [domiTaskSyncQueued, setDomiTaskSyncQueued] = useState(false);
   const [documentLibrary, setDocumentLibrary] = useState<DocumentLibrarySnapshot | null>(null);
+  // 订阅日报文档：domi 资料库 13.认知库/订阅日报/ 下的 Markdown 日报
+  // （follow-builders 计划任务每日镜像进来，以及 domi 自己生成的订阅日报）。
+  const subscriptionDigestDocuments = useMemo(() => {
+    const documents: { name: string; path: string; mtimeMs: number }[] = [];
+    const walk = (nodes: DocumentLibraryNode[]) => {
+      for (const node of nodes) {
+        if (node.kind === "markdown" && node.relativePath.split(/[\\/]/).includes("订阅日报")) {
+          documents.push({ name: node.displayName || node.name, path: node.path, mtimeMs: node.mtimeMs });
+        }
+        if (node.children) walk(node.children);
+      }
+    };
+    walk(documentLibrary?.nodes || []);
+    return documents.sort((left, right) => right.mtimeMs - left.mtimeMs).slice(0, 30);
+  }, [documentLibrary]);
   const [documentLibraryLoading, setDocumentLibraryLoading] = useState(false);
   const [documentLibraryError, setDocumentLibraryError] = useState("");
   const [documentLibraryNotice, setDocumentLibraryNotice] = useState("");
@@ -1922,17 +1918,6 @@ function App() {
   const [documentLibraryCreateName, setDocumentLibraryCreateName] = useState("");
   const [documentLibraryCreating, setDocumentLibraryCreating] = useState(false);
   const [documentLibraryCreateError, setDocumentLibraryCreateError] = useState("");
-  const [plaudSnapshot, setPlaudSnapshot] = useState<DomiPlaudSnapshot | null>(null);
-  const [plaudLoading, setPlaudLoading] = useState(false);
-  const [plaudLoadingMore, setPlaudLoadingMore] = useState(false);
-  const [plaudSyncing, setPlaudSyncing] = useState(false);
-  const [plaudError, setPlaudError] = useState("");
-  const [plaudNotice, setPlaudNotice] = useState("");
-  const [editingPlaudId, setEditingPlaudId] = useState<string | null>(null);
-  const [plaudTitleDraft, setPlaudTitleDraft] = useState("");
-  const [renamingPlaudId, setRenamingPlaudId] = useState<string | null>(null);
-  const [launchingPlaudIds, setLaunchingPlaudIds] = useState<Set<string>>(() => new Set());
-  const [deletingPlaudId, setDeletingPlaudId] = useState<string | null>(null);
   const [storageReady, setStorageReady] = useState(false);
   const [codexRecoveryReady, setCodexRecoveryReady] = useState(false);
   const [activeRunsByThread, setActiveRunsByThread] = useState<Record<string, string>>({});
@@ -1945,9 +1930,9 @@ function App() {
   const [pausedQueuedSubmissionIds, setPausedQueuedSubmissionIds] = useState<Set<string>>(
     readPausedQueuedSubmissionIds
   );
-  const [model, setModel] = useState(NEW_THREAD_MODEL);
-  const [reasoningEffort, setReasoningEffort] = useState(NEW_THREAD_REASONING_EFFORT);
-  const [serviceTier, setServiceTier] = useState(NEW_THREAD_SERVICE_TIER);
+  const [model, setModel] = useState<string>(NEW_THREAD_MODEL);
+  const [reasoningEffort, setReasoningEffort] = useState<string>(NEW_THREAD_REASONING_EFFORT);
+  const [serviceTier, setServiceTier] = useState<string>(NEW_THREAD_SERVICE_TIER);
   const [domiPluginEnabled, setDomiPluginEnabled] = useState(true);
   const [composerSuggestionIndex, setComposerSuggestionIndex] = useState(() =>
     Math.floor(Math.random() * COMPOSER_SUGGESTIONS.length)
@@ -1958,6 +1943,7 @@ function App() {
   const [executingSuggestionId, setExecutingSuggestionId] = useState<string | null>(null);
   const [executionSuggestionError, setExecutionSuggestionError] = useState("");
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [modelMenuRefreshing, setModelMenuRefreshing] = useState(false);
   const [rightPanelOpen, setRightPanelOpen] = useState(true);
   const [leftPanelWidth, setLeftPanelWidth] = useState(() =>
     readStoredWidth("domi.layout.leftPanelWidth", DEFAULT_LEFT_PANEL_WIDTH)
@@ -1982,6 +1968,7 @@ function App() {
   const [markdownError, setMarkdownError] = useState("");
   const [markdownRequestLabel, setMarkdownRequestLabel] = useState("");
   const [pdfDocument, setPdfDocument] = useState<PdfDocument | null>(null);
+  const [pdfTargetPage, setPdfTargetPage] = useState(1);
   const [pdfLoading, setPdfLoading] = useState(false);
   const [pdfFrameLoading, setPdfFrameLoading] = useState(false);
   const [pdfError, setPdfError] = useState("");
@@ -2009,6 +1996,7 @@ function App() {
     conversation: { rightPanelOpen: true, scrollPositions: [] },
     tasks: { rightPanelOpen: true, scrollPositions: [] },
     news: { rightPanelOpen: true, scrollPositions: [] },
+    subscriptions: { rightPanelOpen: true, scrollPositions: [] },
     data: { rightPanelOpen: false, scrollPositions: [] },
     documents: { rightPanelOpen: false, scrollPositions: [] }
   });
@@ -2019,6 +2007,13 @@ function App() {
   const composerDraftsByThreadRef = useRef(composerDraftsByThread);
   const activeRunsByThreadRef = useRef(activeRunsByThread);
   const domiSnapshotRef = useRef(domiSnapshot);
+  const codexModelReadinessRef = useRef<CodexModelReadiness | null>(null);
+  if (!codexModelReadinessRef.current) {
+    codexModelReadinessRef.current = new CodexModelReadiness(
+      (request) => workbench.checkCodex(request),
+      setCodexStatus
+    );
+  }
   const persistedThreadsRef = useRef(new Map<string, Thread>());
   const persistenceQueueRef = useRef<Promise<unknown>>(Promise.resolve());
   const flushClientStateRef = useRef<() => Promise<{ ok: boolean; error?: string }>>(
@@ -2039,8 +2034,6 @@ function App() {
   const weeklyNewsAutomationOperationRef = useRef(false);
   const weeklyNewsAutoRefreshActionRef = useRef<(() => Promise<boolean>) | null>(null);
   const weeklyNewsAutoScanActionRef = useRef<(() => Promise<WeeklyNewsScanOutcome>) | null>(null);
-  const podcastSourceAutomationRef = useRef(false);
-  const podcastArchiveRunIdsRef = useRef(new Set<string>());
   const appSettingsRef = useRef(appSettings);
   const localSearchRefreshAtRef = useRef(0);
   const domiSearchComposingRef = useRef(false);
@@ -2078,11 +2071,6 @@ function App() {
     new Map<string, DomiProject | DomiPerson | DomiNewsItem>()
   );
   const databaseGridSaveCountRef = useRef(0);
-  const plaudListPromiseRef = useRef<Promise<DomiPlaudSnapshot | null> | null>(null);
-  const plaudSyncPromiseRef = useRef<Promise<DomiPlaudSyncResult | null> | null>(null);
-  const plaudSnapshotRevisionRef = useRef(0);
-  const plaudMutationIdsRef = useRef(new Set<string>());
-  const launchingPlaudIdsRef = useRef(new Set<string>());
   const creatingThreadRef = useRef(false);
   const attachmentImportCountRef = useRef(0);
   const submissionStartingThreadIdsRef = useRef(new Set<string>());
@@ -2149,17 +2137,15 @@ function App() {
         lastLightSyncAt: next.lastLightSyncAt,
         lastRadarSuccessAt: next.lastRadarSuccessAt,
         nextRadarAt: next.nextRadarAt,
-        retryAttempt: next.retryAttempt
+        retryAttempt: next.retryAttempt,
+        lastSourceSyncAt: next.lastSourceSyncAt,
+        nextSourceSyncAt: next.nextSourceSyncAt,
+        lastSubscriptionDigestDay: next.lastSubscriptionDigestDay,
+        lastSubscriptionDigestAt: next.lastSubscriptionDigestAt
       }));
     } catch {
       // Automation continues for the current session if local persistence is unavailable.
     }
-  }
-
-  function setPlaudLaunching(fileId: string, launching: boolean) {
-    if (launching) launchingPlaudIdsRef.current.add(fileId);
-    else launchingPlaudIdsRef.current.delete(fileId);
-    setLaunchingPlaudIds(new Set(launchingPlaudIdsRef.current));
   }
 
   function changeAttachmentImportCount(delta: number) {
@@ -2476,9 +2462,15 @@ function App() {
     });
   }
 
+  function setSourceScope(next: SourceScope) {
+    updateComposerDraft(activeThreadId, (draft) => ({ ...draft, sourceScope: next,
+      selectedWorkflowId: isRestrictedScope(next) ? undefined : draft.selectedWorkflowId }));
+  }
+
   function setSelectedWorkflowId(next?: string) {
     const threadId = activeThreadId;
-    updateComposerDraft(threadId, (draft) => ({ ...draft, selectedWorkflowId: next }));
+    updateComposerDraft(threadId, (draft) => ({ ...draft, selectedWorkflowId: next,
+      ...(next ? { sourceScope: "research" as const } : {}) }));
   }
 
   function clearComposerDraft(threadId: string) {
@@ -2494,7 +2486,8 @@ function App() {
     threadId: string,
     submittedInput: string,
     submittedAttachments: LocalAttachment[],
-    submittedWorkflowId?: string
+    submittedWorkflowId?: string,
+    submittedScope?: SourceScope
   ) {
     setComposerDraftsByThread((current) => {
       const draft = current[threadId];
@@ -2506,12 +2499,14 @@ function App() {
       if (
         draft.input !== submittedInput
         || draft.selectedWorkflowId !== submittedWorkflowId
+        || (submittedScope !== undefined && (draft.sourceScope || "research") !== submittedScope)
         || !sameAttachments
       ) {
         return current;
       }
       const next = { ...current };
-      delete next[threadId];
+      if (draft.sourceScope) next[threadId] = { ...EMPTY_COMPOSER_DRAFT, sourceScope: draft.sourceScope };
+      else delete next[threadId];
       return next;
     });
   }
@@ -2522,6 +2517,7 @@ function App() {
       draft?.input.trim()
       || draft?.attachments.length
       || draft?.selectedWorkflowId
+      || draft?.sourceScope
     );
   }
 
@@ -2580,14 +2576,9 @@ function App() {
     () => workflows.find((workflow) => workflow.id === selectedWorkflowId),
     [selectedWorkflowId]
   );
-  const plaudEnabled = appSettings?.plaudConnectionMode === "enabled";
   const todoDocumentLabel = appSettings?.storageBackend === "local"
     ? "0.待办事项.md"
     : "1.待办事项";
-  const visibleQuickStartWorkflows = useMemo(
-    () => quickStartWorkflows.filter((workflow) => !workflow.requiresPlaud || plaudEnabled),
-    [plaudEnabled]
-  );
   const commonCalendarRecipients = useMemo(
     () => calendarRecipientOptions(appSettings?.outlookCalendarRecipients || ""),
     [appSettings?.outlookCalendarRecipients]
@@ -2604,12 +2595,18 @@ function App() {
       || codexStatus.models[0];
   }, [codexStatus, model]);
 
-  const effectiveReasoningEffort = reasoningEffort === "default"
+  const preferredReasoningEffort = reasoningEffort === "default"
     ? codexStatus?.configuredReasoningEffort || selectedModel?.defaultReasoningEffort || "medium"
     : reasoningEffort;
-  const effectiveServiceTier = serviceTier === "default"
+  const effectiveReasoningEffort = selectedModel?.supportedReasoningEfforts.some(
+    (option) => option.id === preferredReasoningEffort
+  ) ? preferredReasoningEffort : selectedModel?.defaultReasoningEffort || preferredReasoningEffort;
+  const preferredServiceTier = serviceTier === "default"
     ? codexStatus?.configuredServiceTier || "standard"
     : serviceTier;
+  const effectiveServiceTier = preferredServiceTier === "standard"
+    || selectedModel?.serviceTiers.some((tier) => tier.id === preferredServiceTier)
+    ? preferredServiceTier : "standard";
 
   function resolveRunModelPolicy(
     workflowId?: string,
@@ -2631,11 +2628,19 @@ function App() {
       domiSlidesDeliveryPolicy: options.useDomiPlugin
         ? domiSlidesDeliveryPolicyForText(semanticRequestText)
         : "",
-      models: codexStatus?.models,
+      models: codexModelReadinessRef.current?.current()?.models,
       userModel: options.model ?? model,
       userReasoningEffort: options.reasoningEffort ?? reasoningEffort,
       userServiceTier: options.serviceTier ?? serviceTier
     });
+  }
+
+  async function resolveReadyRunModelPolicy(
+    workflowId?: string,
+    options: Parameters<typeof resolveRunModelPolicy>[1] = {}
+  ) {
+    await codexModelReadinessRef.current!.ready();
+    return resolveRunModelPolicy(workflowId, options);
   }
 
   const deferredThreadQuery = useDeferredValue(threadQuery);
@@ -2766,27 +2771,10 @@ function App() {
       });
     });
 
-    const plaudItems = [...(plaudSnapshot?.items || [])]
-      .filter(canGeneratePlaudNotes)
-      .sort((left, right) => (right.createdAt || 0) - (left.createdAt || 0))
-      .slice(0, 8);
-    plaudItems.forEach((plaudItem, index) => {
-      suggestions.push({
-        id: `plaud:${plaudItem.fileId}:notes`,
-        title: `整理${conciseRecordingTitle(plaudItem.fileName)}`,
-        context: `PLAUD · ${formatPlaudDuration(plaudItem.duration)} · 生成纪要并入库`,
-        reason: `${plaudItem.fileName} · 已有文字稿 · ${formatPlaudDuration(plaudItem.duration)}`,
-        priority: index === 0 ? "P1" : "P2",
-        workflowId: "domi-router",
-        prompt: plaudNotesWorkflowRequest(plaudItem),
-        projectLabel: "推进执行 · PLAUD 纪要"
-      });
-    });
-
     const priorityWeight: Record<ExecutionSuggestionPriority, number> = { P1: 3, P2: 2, P3: 1 };
     return suggestions
       .sort((left, right) => priorityWeight[right.priority] - priorityWeight[left.priority]);
-  }, [domiSnapshot, executionFocus, plaudSnapshot]);
+  }, [domiSnapshot, executionFocus]);
 
   const executionSuggestions = useMemo(() => {
     const now = Date.now();
@@ -3032,6 +3020,8 @@ function App() {
       setDomiDocumentSearch({
         ok: true,
         results: [],
+        degraded: false,
+        partial: false,
         indexing: false,
         indexedCount: 0,
         lastIndexedAt: 0
@@ -3048,7 +3038,11 @@ function App() {
     let pollHandle: number | undefined;
     const search = async () => {
       try {
-        const result = await workbench.searchDocumentLibrary({ query, limit: 8 });
+        const result = await workbench.searchDocumentLibrary({
+          query,
+          limit: 8,
+          excludeTranscripts: domiSearchExcludeTranscripts
+        });
         if (stopped || requestId !== domiDocumentSearchRequestRef.current) return;
         setDomiDocumentSearch(result);
         if (result.indexing) {
@@ -3061,6 +3055,8 @@ function App() {
         setDomiDocumentSearch({
           ok: false,
           results: [],
+          degraded: false,
+          partial: false,
           indexing: false,
           indexedCount: 0,
           lastIndexedAt: 0,
@@ -3076,7 +3072,7 @@ function App() {
       window.clearTimeout(debounceHandle);
       if (pollHandle !== undefined) window.clearTimeout(pollHandle);
     };
-  }, [domiQuery]);
+  }, [domiQuery, domiSearchExcludeTranscripts]);
 
   const hasConversation = activeThread.messages.some((message) => message.role === "user")
     || Boolean(activeThread.externalType && activeThread.messages.length);
@@ -3176,10 +3172,7 @@ function App() {
         // Repository-backed views do not depend on Codex. Refresh them while
         // the runtime/plugin check is in flight so startup stays useful even
         // when the network is slow.
-        const statusPromise = workbench.checkCodex().then((status) => {
-          if (!cancelled) setCodexStatus(status);
-          return status;
-        });
+        const statusPromise = codexModelReadinessRef.current!.refresh();
         const dataRefreshPromise = Promise.allSettled([
           refreshDomi(),
           refreshDomiTaskBoard({ silent: Boolean(cachedTasks.tasks.length) }),
@@ -3188,7 +3181,7 @@ function App() {
         const [status] = await Promise.all([statusPromise, dataRefreshPromise]);
         if (!status.pluginSetup?.ok) {
           const pluginError = status.pluginSetup?.error
-            || "domi 插件尚未准备完成，请在 Codex 连接中重新检测。";
+            || "domi 插件尚未准备完成，请在设置的 AI 引擎中重新检测。";
           setDomiError(pluginError);
           setDomiTaskError(pluginError);
           setWeeklyNewsError(pluginError);
@@ -3207,21 +3200,6 @@ function App() {
     if (workspaceView !== "tasks" || !hasNativeWorkbench || domiTaskLoading) return;
     if (!domiTaskBoard) void refreshDomiTaskBoard();
   }, [workspaceView, domiTaskBoard, domiTaskLoading]);
-
-  useEffect(() => {
-    if (!appSettings || plaudEnabled) return;
-    setPlaudSnapshot(null);
-    setPlaudError("");
-    setPlaudNotice("");
-    setPlaudLoading(false);
-    setPlaudLoadingMore(false);
-    setPlaudSyncing(false);
-  }, [plaudEnabled, appSettings]);
-
-  useEffect(() => {
-    if (!selectedWorkflow?.requiresPlaud || plaudEnabled) return;
-    setSelectedWorkflowId(undefined);
-  }, [plaudEnabled, selectedWorkflow?.requiresPlaud]);
 
   useEffect(() => {
     if (weeklyNewsDomain !== "全部" && !weeklyNewsDomains.some((domain) => domain === weeklyNewsDomain)) {
@@ -3432,6 +3410,25 @@ function App() {
     };
   }, []);
 
+  // External intake (bookmarklet / phone shortcut) arrives from the main
+  // process at any time. Keep the latest handler in a ref so the one-shot
+  // subscription always dispatches against current state and closures.
+  const intakeItemHandlerRef = useRef<(item: IntakeItem) => void>(() => undefined);
+  intakeItemHandlerRef.current = handleIntakeItem;
+useEffect(() => {
+if (typeof workbench.onIntakeItem !== "function") return;
+return workbench.onIntakeItem((item) => intakeItemHandlerRef.current(item));
+}, []);
+
+// The Subscriptions view reads the same radar source snapshot the manager
+// and the daily automation use. Refresh it (throttled) whenever the view is
+// opened so the feed is never stale by more than a minute.
+useEffect(() => {
+if (workspaceView !== "subscriptions") return;
+if (Date.now() - subscriptionsRefreshedAtRef.current < 60_000) return;
+void refreshSubscriptions();
+}, [workspaceView]);
+
   useEffect(() => {
     if (!storageReady || codexRecoveryStartedRef.current) return;
     if (typeof workbench.recoverCodexThread !== "function") {
@@ -3493,7 +3490,7 @@ function App() {
         const recoveryThreadId = recoveryCodexThreadId(
           thread.codexThreadId,
           latestAssistant.executionCodexThreadId,
-          latestAssistant.entityExecutionIsolated === true
+          latestAssistant.entityExecutionIsolated === true || latestAssistant.sourceScopeIsolated === true
         );
         if (!recoveryThreadId) {
           blockRecoveredThread(
@@ -3553,6 +3550,8 @@ function App() {
               assistantMessageId: latestAssistant.id,
               entityFinalizationMode: latestAssistant.entityFinalizationMode,
               entityExecutionIsolated: latestAssistant.entityExecutionIsolated,
+          sourceScope: latestAssistant.sourceScope,
+          sourceScopeIsolated: latestAssistant.sourceScopeIsolated,
               executionCodexThreadId: recoveryThreadId
             });
             setActiveRunsByThread((current) => ({ ...current, [thread.id]: reboundRunId }));
@@ -3718,6 +3717,7 @@ function App() {
         resumeCodexThreadId: queued.resumeCodexThreadId,
         privateCodexContinuation: queued.privateCodexContinuation,
         attachments: queued.attachments,
+        sourceScope: queued.sourceScope,
         activeDocumentPath: queued.activeDocumentPath,
         requestOrigin: queued.requestOrigin === "user" ? "user" : "programmatic",
         userInstructionText: queued.requestOrigin === "user"
@@ -4965,7 +4965,7 @@ function App() {
       radarWorkflow.defaultPrompt,
       `followed_domains=${JSON.stringify(radarDomainsSnapshot)}`,
       `本轮设置修订快照只包含以上 ${radarDomainsSnapshot.length} 个关注领域；不得搜索、返回、归档或通知其他领域。`,
-      radarTaxonomyPrompt(radarDomainsSnapshot),
+      radarTaxonomyPrompt(radarDomainsSnapshot, databaseSnapshot?.taxonomy?.customSubdomains || []),
       configuredSourceLines.length
         ? `用户在本机配置了以下重点信源。本轮优先检查并交叉核验，但仍需遵守来源可信度、时效性和去重规则：\n${configuredSourceLines.join("\n")}`
         : "用户尚未配置自定义重点信源，按默认公开来源执行。",
@@ -5013,7 +5013,7 @@ function App() {
       return latest;
     };
     try {
-      const runModelPolicy = resolveRunModelPolicy(radarWorkflow.id);
+      const runModelPolicy = await resolveReadyRunModelPolicy(radarWorkflow.id);
       const result = await workbench.runCodex({
         runId,
         prompt: workflowPrompt(radarWorkflow, requestText, priorityPeopleContext, true, "programmatic"),
@@ -5152,65 +5152,89 @@ function App() {
     }
   }
 
-  async function archivePodcastTranscript(
-    job: PodcastJob,
-    result: PodcastProcessResult
-  ) {
-    const transcriptPath = result.transcriptPath || result.job?.transcriptPath || job.transcriptPath;
-    if (!transcriptPath) throw new Error("PLAUD 已完成，但没有返回可读取的文字稿路径。");
-    if (podcastArchiveRunIdsRef.current.has(job.id)) return;
-    const routerWorkflow = workflows.find((workflow) => workflow.id === "domi-router");
-    if (!routerWorkflow) throw new Error("未找到 domi 播客归档工作流。");
-
-    const normalizedEpisodeText = `${job.title} ${job.description}`
-      .toLocaleLowerCase("zh-CN")
-      .replace(/\s+/g, "");
-    const matchedProjects = (domiSnapshotRef.current?.projects || []).filter((project) => {
-      const normalizedName = project.name.toLocaleLowerCase("zh-CN").replace(/\s+/g, "");
-      return normalizedName.length >= 2 && normalizedEpisodeText.includes(normalizedName);
-    });
-    const projectHint = matchedProjects.length === 1 ? matchedProjects[0] : null;
-    const primaryArchiveHint = projectHint ? "project_dominant" : "industry_dominant";
-    const canonicalDocumentId = `podcast:${job.sourceFormat || "public"}:${job.id}`;
-    const requestText = [
-      "处理一条已经由用户自己的 PLAUD 完成转写的公开播客。不要调用本地 ASR，不要重新下载音频，也不要创建临时任务工作区或 outputs 目录。",
-      `sourceKind=podcast`,
-      `transcriptProvider=plaud`,
-      `transcriptPath=${transcriptPath}`,
-      `sourceId=${job.sourceId}`,
-      `provider=${job.sourceFormat || "public-web-page"}`,
-      `episodeId=${job.id}`,
-      `episodeUrl=${job.episodeUrl}`,
-      `podcastName=${job.podcastTitle || ""}`,
-      `episodeTitle=${job.title}`,
-      `publishedAt=${job.publishedAt ? new Date(job.publishedAt).toISOString() : ""}`,
-      `description=${job.description || ""}`,
-      `canonicalDocumentId=${canonicalDocumentId}`,
-      `primaryArchiveHint=${primaryArchiveHint}`,
-      projectHint
-        ? `唯一明确项目匹配：${projectHint.name}（recordId=${projectHint.recordId}）。若正文证据一致，将主文档归入该项目的“纪要”，原始 PLAUD 文字稿归入“原始材料”。`
-        : "标题和简介未唯一匹配项目库中的单一公司；按行业趋势材料归档到对应行业研究/播客目录。若正文明确由唯一公司创始人或高管主讲，再按规则校正。",
-      "先用 asr-notes 把转写错误校正为准确结果，删去校验过程和低信息量废话；再用 investment-mgmt 完成唯一主归档。其他相关项目、人脉和行业入口仅保存 URI 与摘要引用，不复制第二份正文。",
-      "若正文证据与 primaryArchiveHint 冲突且仍无法确定，不要猜测写入错误目录：进入分类待审核，并在最终结果中明确返回待审核原因。"
-    ].join("\n");
-
-    podcastArchiveRunIdsRef.current.add(job.id);
+  async function refreshSubscriptions() {
+    if (subscriptionsLoading) return;
+    subscriptionsRefreshedAtRef.current = Date.now();
+    setSubscriptionsLoading(true);
     try {
-      const archiveRunId = createId("podcast-archive");
-      const runModelPolicy = resolveRunModelPolicy(routerWorkflow.id, {
-        runKind: "podcast-archive"
+      const result = await workbench.listRadarSources();
+      if (result.ok) setRadarSourceSnapshot(result);
+    } catch {
+      // Keep the last snapshot; the view's retry button re-runs this.
+    } finally {
+      setSubscriptionsLoading(false);
+    }
+    // 订阅日报来自资料库（12.认知库/订阅日报/），一并刷新。
+    void refreshDocumentLibrary({ silent: true, force: true });
+  }
+
+  async function syncSubscriptions() {
+    if (subscriptionsSyncing) return;
+    setSubscriptionsSyncing(true);
+    try {
+      const synced = await workbench.syncRadarSources({
+        limit: 10,
+        kinds: ["twitter", "youtube_channel", "podcast"],
+        fresh: true
       });
-      const archiveResult = await workbench.runCodex({
-        runId: archiveRunId,
-        prompt: workflowPrompt(routerWorkflow, requestText, "播客处理必须使用 PLAUD 文字稿，并遵守唯一主归档规则。", true, "programmatic"),
+      if (synced.ok || synced.partial) {
+        setRadarSourceSnapshot({
+          ok: true,
+          sources: synced.sources,
+          jobs: synced.jobs,
+          twitterItems: synced.twitterItems,
+          twitterTokenConfigured: synced.twitterTokenConfigured,
+          updatedAt: synced.updatedAt,
+          error: synced.error
+        });
+      }
+    } catch {
+      // The next automatic or manual sync retries.
+    } finally {
+      setSubscriptionsSyncing(false);
+    }
+  }
+
+  function subscriptionSourceNames() {
+    const names: Record<string, string> = {};
+    for (const source of radarSourceSnapshot?.sources || []) names[source.id] = source.name;
+    return names;
+  }
+
+  // 方案 A：入库/日报等本地库变更后，把增量镜像到飞书 Wiki（手机端可读）。
+  function syncFeishuMirrorAfterLocalChange(trigger: string) {
+    if (typeof workbench.syncFeishuWikiMirror !== "function") return;
+    void workbench.syncFeishuWikiMirror({ trigger }).catch(() => undefined);
+  }
+
+  // One-click archival for a synced episode: run it through the same
+  // intake-archive media pipeline as a forwarded video/podcast link (public
+  // subtitles or public audio + local transcription), archived into the
+  // industry cognition library like any forwarded content.
+  async function archiveSubscriptionEpisode(job: PodcastJob) {
+    const url = String(job?.episodeUrl || "");
+    if (!/^https?:\/\//i.test(url) || subscriptionArchivingJobIdsRef.current.has(job.id)) return;
+    const sourceName = subscriptionSourceNames()[job.sourceId] || job.podcastTitle || "订阅单集";
+    const requestText = intakeMediaLinkPrompt({
+      url,
+      title: job.title,
+      source: `订阅单集：${sourceName}`
+    });
+    subscriptionArchivingJobIdsRef.current.add(job.id);
+    setSubscriptionArchivingJobIds(new Set(subscriptionArchivingJobIdsRef.current));
+try {
+const runModelPolicy = await resolveReadyRunModelPolicy("domi-analyst", { runKind: "intake" });
+const result = await workbench.runCodex({
+runId: createId("subscription-episode"),
+prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
         requestText,
         requestOrigin: "programmatic",
         userInstructionText: "",
         ephemeral: true,
         background: true,
         allowUserInput: false,
-        workflowId: routerWorkflow.id,
-        webSearch: true,
+        workflowId: "domi-analyst",
+        webSearch: false,
         model: runModelPolicy.model,
         reasoningEffort: runModelPolicy.reasoningEffort,
         serviceTier: runModelPolicy.serviceTier,
@@ -5218,16 +5242,115 @@ function App() {
           || codexStatus?.workspacePath
           || activeThread.workspacePath
       });
-      if (!archiveResult.ok) {
-        throw new Error(archiveResult.error || "播客纪要整理或归档失败。");
+      if (!result.ok) {
+        throw new Error(result.error || "单集整理或入库失败。");
       }
       await Promise.all([
         refreshDomi(),
         refreshDocumentLibrary({ silent: true, force: true })
       ]);
+      if (!document.hasFocus()) {
+        await workbench.showNotification({
+          title: "domi 已整理一条订阅单集",
+          body: job.title
+        });
+      }
+    } catch (error) {
+      await workbench.showNotification({
+        title: "订阅单集整理失败",
+        body: `${job.title}：${error instanceof Error ? error.message : String(error)}`
+      }).catch(() => undefined);
     } finally {
-      podcastArchiveRunIdsRef.current.delete(job.id);
+      subscriptionArchivingJobIdsRef.current.delete(job.id);
+      setSubscriptionArchivingJobIds(new Set(subscriptionArchivingJobIdsRef.current));
     }
+  }
+
+  async function generateSubscriptionDigest(day: string, options: { automatic?: boolean } = {}) {
+    if (subscriptionDigestDay) return;
+    const group = groupSubscriptionDays(radarSourceSnapshot)
+      .find((entry) => entry.day === day);
+    if (!group || (group.tweets.length === 0 && group.episodes.length === 0)) {
+      if (!options.automatic) {
+        await workbench.showNotification({
+          title: "订阅日报",
+          body: `${day} 没有可整理的订阅内容。`
+        }).catch(() => undefined);
+      }
+      return;
+    }
+    const routerWorkflow = workflows.find((workflow) => workflow.id === "domi-router");
+    if (!routerWorkflow) return;
+    const requestText = subscriptionDigestPrompt({
+      day,
+      tweets: group.tweets,
+      episodes: group.episodes,
+      sourceNames: subscriptionSourceNames()
+    });
+    setSubscriptionDigestDay(day);
+    try {
+      const runModelPolicy = await resolveReadyRunModelPolicy(routerWorkflow.id, { runKind: "summary" });
+      const result = await workbench.runCodex({
+        runId: createId("subscription-digest"),
+        prompt: workflowPrompt(routerWorkflow, requestText, "订阅日报先写入资料库的 13.认知库/订阅日报/.drafts/ 目录并回读验证，等待 Domi 翻译校验后发布；不得下载音频或转写新内容。", true, "programmatic"),
+        requestText,
+        requestOrigin: "programmatic",
+        userInstructionText: "",
+        ephemeral: true,
+        background: true,
+        allowUserInput: false,
+        workflowId: routerWorkflow.id,
+        webSearch: false,
+        model: runModelPolicy.model,
+        reasoningEffort: runModelPolicy.reasoningEffort,
+        serviceTier: runModelPolicy.serviceTier,
+        workspacePath: appSettingsRef.current?.localRepositoryDir
+          || codexStatus?.workspacePath
+          || activeThread.workspacePath
+      });
+      if (!result.ok) {
+        throw new Error(result.error || "订阅日报生成失败。");
+      }
+      const published = await workbench.finalizeSubscriptionDigest({ day });
+      if (!published.ok) throw new Error(published.error || "订阅日报中文翻译或发布校验失败，草稿已保留。");
+      updateWeeklyNewsAutomation({
+        lastSubscriptionDigestDay: day,
+        lastSubscriptionDigestAt: Date.now()
+      });
+      await refreshDocumentLibrary({ silent: true, force: true });
+      // 日报落盘后镜像到飞书 Wiki，手机端可读。
+      syncFeishuMirrorAfterLocalChange("subscription-digest");
+      if (!options.automatic || !document.hasFocus()) {
+        await workbench.showNotification({
+          title: "domi 已生成订阅日报",
+          body: `${day} 的订阅日报已保存到 13.认知库/订阅日报/。`
+        });
+      }
+    } catch (error) {
+      await workbench.showNotification({
+        title: "订阅日报生成失败",
+        body: error instanceof Error ? error.message : String(error)
+      }).catch(() => undefined);
+    } finally {
+      setSubscriptionDigestDay("");
+    }
+  }
+
+  // Daily automation: once the scheduled source sync brings in new content,
+  // generate today's digest document once per local day (manual regeneration
+  // from the view is always possible).
+  async function maybeGenerateSubscriptionDigest(
+    tweets: TwitterItem[],
+    jobs: PodcastJob[]
+  ) {
+    const today = subscriptionDayKey(Date.now());
+    if (weeklyNewsAutomationRef.current.lastSubscriptionDigestDay === today) return;
+    const hasTodayContent = tweets.some((tweet) =>
+        subscriptionDayKey(tweet.createdAt ?? tweet.discoveredAt) === today)
+      || jobs.some((job) =>
+        subscriptionDayKey(Number(job.publishedAt) || Number(job.discoveredAt)) === today);
+    if (!hasTodayContent) return;
+    await generateSubscriptionDigest(today, { automatic: true });
   }
 
   async function notifyImportantWeeklyNews(items: DomiNewsItem[]) {
@@ -5331,6 +5454,62 @@ function App() {
         }
       }
 
+      // 订阅信源（X 大V时间线、YouTube 频道新单集）每日同步：与新闻雷达共用
+      // 同一条循环，错过的窗口只要应用开着就会补上。
+      if (!disposed && !weeklyNewsAutomationOperationRef.current) {
+        const sourceAutomation = weeklyNewsAutomationRef.current;
+        const dueSourceSyncAt = sourceAutomation.lastSourceSyncAt
+          ? Math.max(
+            sourceAutomation.nextSourceSyncAt,
+            sourceAutomation.lastSourceSyncAt + RADAR_SOURCE_AUTO_SYNC_INTERVAL_MS
+          )
+          : 0;
+        if (dueSourceSyncAt <= now) {
+          weeklyNewsAutomationOperationRef.current = true;
+          try {
+            if (appSettingsRef.current?.externalAccessMode !== "always") {
+              updateWeeklyNewsAutomation({ nextSourceSyncAt: now + RADAR_SOURCE_AUTO_SYNC_INTERVAL_MS });
+            } else {
+              const synced = await workbench.syncRadarSources({
+                limit: 10,
+                kinds: ["twitter", "youtube_channel"],
+                fresh: true
+              });
+              const completedAt = Date.now();
+              if (synced.ok || synced.partial) {
+                setRadarSourceSnapshot({
+                  ok: true,
+                  sources: synced.sources,
+                  jobs: synced.jobs,
+                  twitterItems: synced.twitterItems,
+                  updatedAt: synced.updatedAt,
+                  error: synced.error
+                });
+                updateWeeklyNewsAutomation({
+                  lastSourceSyncAt: completedAt,
+                  nextSourceSyncAt: completedAt + RADAR_SOURCE_AUTO_SYNC_INTERVAL_MS
+                });
+                void maybeGenerateSubscriptionDigest(synced.twitterItems || [], synced.jobs || []);
+                const discoveredCount = (synced.results || [])
+                  .reduce((total, item) => total + (Number(item?.discoveredCount) || 0), 0);
+                if (discoveredCount > 0 && !document.hasFocus()) {
+                  await workbench.showNotification({
+                    title: "domi 订阅信源有新内容",
+                    body: `自动同步发现 ${discoveredCount} 条新推送或单集，已进入工作台。`
+                  });
+                }
+              } else {
+                updateWeeklyNewsAutomation({ nextSourceSyncAt: completedAt + WEEKLY_NEWS_RADAR_INTERVAL_MS });
+              }
+            }
+          } catch {
+            updateWeeklyNewsAutomation({ nextSourceSyncAt: Date.now() + WEEKLY_NEWS_RADAR_INTERVAL_MS });
+          } finally {
+            weeklyNewsAutomationOperationRef.current = false;
+          }
+        }
+      }
+
       if (disposed || weeklyNewsAutomationOperationRef.current) return;
       const latestAutomation = weeklyNewsAutomationRef.current;
       const latestCheckpoint = Number(
@@ -5424,439 +5603,10 @@ function App() {
     };
   }, [weeklyNewsAutomationReady, appSettings?.onboardingComplete]);
 
-  useEffect(() => {
-    if (
-      !hasNativeWorkbench
-      || !appSettings?.onboardingComplete
-      || appSettings.plaudConnectionMode !== "enabled"
-    ) return;
-    let disposed = false;
-
-    const runPodcastSourceTick = async () => {
-      if (
-        disposed
-        || podcastSourceAutomationRef.current
-        || runContextRef.current.size > 0
-      ) return;
-      podcastSourceAutomationRef.current = true;
-      try {
-        const synced = await workbench.syncRadarSources({ limit: 10 });
-        if (disposed || (!synced.ok && !synced.partial)) return;
-        const nextSnapshot: RadarSourceSnapshot = {
-          ok: true,
-          sources: synced.sources,
-          jobs: synced.jobs,
-          updatedAt: synced.updatedAt,
-          error: synced.error
-        };
-        setRadarSourceSnapshot(nextSnapshot);
-        const sourcesById = new Map(synced.sources.map((source) => [source.id, source] as const));
-        const nextJob = [...synced.jobs]
-          .filter((job) => {
-            const source = sourcesById.get(job.sourceId);
-            if (!source?.enabled || !source.autoProcess || job.status !== "discovered") return false;
-            if (!source.keywords.length) return true;
-            const haystack = `${job.title} ${job.description}`.toLocaleLowerCase("zh-CN");
-            return source.keywords.some((keyword) => haystack.includes(keyword.toLocaleLowerCase("zh-CN")));
-          })
-          .sort((left, right) => (right.publishedAt || right.discoveredAt) - (left.publishedAt || left.discoveredAt))[0];
-        if (!nextJob) return;
-
-        const processed = await workbench.processPodcastEpisode({ jobId: nextJob.id });
-        if (!processed.ok || !processed.job) {
-          setPlaudError(processed.error || `“${nextJob.title}”没有成功交给 PLAUD。`);
-          return;
-        }
-        await archivePodcastTranscript(processed.job, processed);
-        if (!document.hasFocus()) {
-          await workbench.showNotification({
-            title: "domi 已整理一条播客",
-            body: processed.job.title
-          });
-        }
-      } catch (automationError) {
-        setPlaudError(automationError instanceof Error ? automationError.message : String(automationError));
-      } finally {
-        podcastSourceAutomationRef.current = false;
-      }
-    };
-
-    const startupTimer = window.setTimeout(() => void runPodcastSourceTick(), 30_000);
-    const interval = window.setInterval(() => void runPodcastSourceTick(), 30 * 60_000);
-    return () => {
-      disposed = true;
-      window.clearTimeout(startupTimer);
-      window.clearInterval(interval);
-    };
-  }, [appSettings?.onboardingComplete, appSettings?.plaudConnectionMode]);
-
   async function openWeeklyNews(item: DomiNewsItem) {
     if (!item.url) return;
     const result = await workbench.openResource(item.url);
     if (!result.ok) setWeeklyNewsError(result.error || "无法打开新闻原文。 ");
-  }
-
-  async function refreshPlaudQueue({ fresh = false }: { fresh?: boolean } = {}): Promise<DomiPlaudSnapshot | null> {
-    if (appSettings?.plaudConnectionMode !== "enabled") return null;
-    if (plaudListPromiseRef.current) return plaudListPromiseRef.current;
-    if (plaudSyncPromiseRef.current || plaudMutationIdsRef.current.size > 0) return null;
-    const revision = plaudSnapshotRevisionRef.current;
-    setPlaudLoading(true);
-    setPlaudError("");
-    const request = (async (): Promise<DomiPlaudSnapshot | null> => {
-      try {
-        const result = await workbench.listPlaud({ fresh, offset: 0, limit: 50 });
-        if (revision === plaudSnapshotRevisionRef.current) {
-          setPlaudSnapshot((current) => {
-            if (result.lastSuccessfulSnapshot) {
-              return {
-                ...result.lastSuccessfulSnapshot,
-                stale: true,
-                remoteStatus: result.remoteStatus,
-                retryable: result.retryable,
-                warning: result.warning
-              };
-            }
-            if (!result.ok && current) {
-              return {
-                ...current,
-                stale: true,
-                remoteStatus: result.remoteStatus,
-                retryable: result.retryable,
-                warning: result.warning || result.error
-              };
-            }
-            return result;
-          });
-          if (!result.ok) {
-            setPlaudError(result.error || result.warning || "PLAUD 队列同步失败。 ");
-            setPlaudNotice("");
-          } else if (result.stale) {
-            setPlaudError(result.warning || "PLAUD 暂时无法刷新，已显示上次成功读取的录音。");
-            setPlaudNotice("");
-          } else {
-            setPlaudError("");
-            setPlaudNotice((current) =>
-              current.startsWith("PLAUD 暂时无法刷新") ? "" : current
-            );
-          }
-        }
-        return result;
-      } catch (error) {
-        if (revision === plaudSnapshotRevisionRef.current) {
-          setPlaudError(error instanceof Error ? error.message : String(error));
-        }
-        return null;
-      } finally {
-        plaudListPromiseRef.current = null;
-        setPlaudLoading(false);
-      }
-    })();
-    plaudListPromiseRef.current = request;
-    return request;
-  }
-
-  async function loadMorePlaudQueue(): Promise<DomiPlaudSnapshot | null> {
-    if (appSettings?.plaudConnectionMode !== "enabled") return null;
-    if (!plaudSnapshot?.ok || !plaudSnapshot.hasMore) return null;
-    if (plaudListPromiseRef.current) return plaudListPromiseRef.current;
-    if (plaudSyncPromiseRef.current || plaudMutationIdsRef.current.size > 0) return null;
-    const revision = plaudSnapshotRevisionRef.current;
-    const offset = Number(plaudSnapshot.nextOffset)
-      || Number(plaudSnapshot.pageOffset || 0) + Number(plaudSnapshot.pageSize || 50);
-    setPlaudLoadingMore(true);
-    setPlaudError("");
-    const request = (async (): Promise<DomiPlaudSnapshot | null> => {
-      try {
-        const result = await workbench.listPlaud({ offset, limit: 50 });
-        if (revision !== plaudSnapshotRevisionRef.current) return result;
-        if (!result.ok || result.stale) {
-          setPlaudSnapshot((current) => current
-            ? {
-                ...current,
-                stale: true,
-                remoteStatus: result.remoteStatus,
-                retryable: result.retryable,
-                warning: result.warning || result.error
-              }
-            : current);
-          setPlaudError(result.error || result.warning || "更早的 PLAUD 录音读取失败。 ");
-          return result;
-        }
-        setPlaudSnapshot((current) => {
-          if (!current) return result;
-          const itemsById = new Map(
-            (current.items || []).map((item) => [item.fileId, item])
-          );
-          for (const item of result.items || []) {
-            itemsById.set(item.fileId, {
-              ...itemsById.get(item.fileId),
-              ...item
-            });
-          }
-          const items = [...itemsById.values()].sort((left, right) => {
-            const leftTime = Number(left.createdAt || left.editedAt) || 0;
-            const rightTime = Number(right.createdAt || right.editedAt) || 0;
-            return rightTime - leftTime || left.fileName.localeCompare(right.fileName, "zh-CN");
-          });
-          return {
-            ...current,
-            syncedAt: result.syncedAt || current.syncedAt,
-            pageOffset: 0,
-            pageSize: result.pageSize || current.pageSize,
-            hasMore: Boolean(result.hasMore),
-            nextOffset: result.nextOffset,
-            items
-          };
-        });
-        return result;
-      } catch (error) {
-        if (revision === plaudSnapshotRevisionRef.current) {
-          setPlaudError(error instanceof Error ? error.message : String(error));
-        }
-        return null;
-      } finally {
-        plaudListPromiseRef.current = null;
-        setPlaudLoadingMore(false);
-      }
-    })();
-    plaudListPromiseRef.current = request;
-    return request;
-  }
-
-  async function syncPlaudQueue(): Promise<DomiPlaudSyncResult | null> {
-    if (appSettings?.plaudConnectionMode !== "enabled") return null;
-    if (plaudSyncPromiseRef.current) return plaudSyncPromiseRef.current;
-    if (plaudListPromiseRef.current) return null;
-    if (plaudMutationIdsRef.current.size > 0) return null;
-    plaudSnapshotRevisionRef.current += 1;
-    setPlaudSyncing(true);
-    setPlaudError("");
-    setPlaudNotice("");
-    const request = (async (): Promise<DomiPlaudSyncResult | null> => {
-      try {
-        const result = await workbench.syncPlaud();
-        if (result.snapshot) setPlaudSnapshot(result.snapshot);
-        if (!result.ok) {
-          setPlaudError(result.error || "PLAUD 同步或文字稿生成失败。 ");
-          return result;
-        }
-        const generated = result.generatedCount || 0;
-        const recovered = result.recoveredCount || 0;
-        const failed = result.failedCount || 0;
-        const completed: string[] = [];
-        if (recovered) completed.push(`同步 ${recovered} 份已生成文字稿`);
-        if (generated) completed.push(`生成 ${generated} 份文字稿`);
-        setPlaudNotice(completed.length
-          ? `已${completed.join("并")}${failed ? `，${failed} 份需要重试` : ""}`
-          : failed
-            ? `同步完成，${failed} 份文字稿仍需重试`
-            : "已同步到最新 PLAUD 队列");
-        return result;
-      } catch (error) {
-        setPlaudError(error instanceof Error ? error.message : String(error));
-        return null;
-      } finally {
-        plaudSyncPromiseRef.current = null;
-        setPlaudSyncing(false);
-      }
-    })();
-    plaudSyncPromiseRef.current = request;
-    return request;
-  }
-
-  async function runPlaudNotesWorkflow(item: DomiPlaudItem) {
-    if (appSettings?.plaudConnectionMode !== "enabled") {
-      setSettingsInitialTab("plaud");
-      setSettingsOpen(true);
-      return;
-    }
-    if (launchingPlaudIdsRef.current.has(item.fileId)) return;
-    const workflow = workflows.find((entry) => entry.id === "domi-router");
-    if (!workflow) {
-      setPlaudError("未找到 domi 录音主工作流。 ");
-      return;
-    }
-
-    setPlaudLaunching(item.fileId, true);
-    setPlaudError("");
-    setPlaudNotice("");
-    let handedOff = false;
-    try {
-      const projectId = `plaud-${item.fileId}`;
-      let targetThread = threads.find((thread) => thread.projectId === projectId);
-      if (!targetThread) {
-        const workspaceResult = await workbench.createProjectWorkspace({
-          projectId,
-          projectName: NEW_THREAD_PROJECT
-        });
-        targetThread = {
-          id: createId("thread"),
-          projectId,
-          plaudFileId: item.fileId,
-          workspacePath: workspaceResult.ok ? workspaceResult.workspacePath : codexStatus?.workspacePath,
-          title: `${item.fileName} 纪要`,
-          project: "PLAUD · 纪要入库",
-          updatedAt: nowLabel(),
-          lastActiveAt: Date.now(),
-          pinned: false,
-          manualTitle: true,
-          messages: [],
-          timeline: [],
-          lastUsage: null
-        };
-        // Programmatic submission follows immediately in this same tick. Make
-        // the new owner visible to fail-closed submission checks before React
-        // commits the state update.
-        threadsRef.current = [
-          targetThread as Thread,
-          ...threadsRef.current.filter((thread) => thread.id !== targetThread!.id)
-        ];
-        setThreads((current) => [
-          targetThread as Thread,
-          ...current.filter((thread) => thread.id !== targetThread!.id)
-        ]);
-      } else if (targetThread.plaudFileId !== item.fileId) {
-        targetThread = { ...targetThread, plaudFileId: item.fileId };
-        patchThread(targetThread.id, { plaudFileId: item.fileId });
-      }
-
-      const targetAlreadyRunning = Boolean(activeRunsByThread[targetThread.id])
-        || [...runContextRef.current.values()].some((context) => context.threadId === targetThread.id);
-      if (targetAlreadyRunning) {
-        setPlaudNotice(`“${item.fileName}”的纪要入库任务正在执行`);
-        return;
-      }
-
-      activateThreadNow(targetThread.id);
-      setDomiPluginEnabled(true);
-      setPlaudNotice(`已启动“${item.fileName}”的 domi 纪要入库任务`);
-      const execution = submitToCodex(workflow, plaudNotesWorkflowRequest(item), {
-        thread: targetThread,
-        useDomiPlugin: true,
-        activeDocumentPath: undefined,
-        requestOrigin: "programmatic",
-        userInstructionText: "",
-        displayText: `生成“${item.fileName}”的纪要并按 domi 工作流入库`
-      });
-      handedOff = true;
-      void execution
-        .catch((error) => {
-          setPlaudError(error instanceof Error ? error.message : String(error));
-        })
-        .finally(() => {
-          setPlaudLaunching(item.fileId, false);
-          void refreshPlaudQueue({ fresh: true });
-        });
-    } catch (error) {
-      setPlaudError(error instanceof Error ? error.message : String(error));
-    } finally {
-      if (!handedOff) setPlaudLaunching(item.fileId, false);
-    }
-  }
-
-  function beginPlaudRename(item: DomiPlaudItem) {
-    if (
-      plaudListPromiseRef.current
-      || plaudSyncPromiseRef.current
-      || plaudMutationIdsRef.current.size > 0
-      || launchingPlaudIdsRef.current.has(item.fileId)
-    ) return;
-    setEditingPlaudId(item.fileId);
-    setPlaudTitleDraft(item.fileName);
-    setPlaudError("");
-    setPlaudNotice("");
-  }
-
-  function cancelPlaudRename() {
-    setEditingPlaudId(null);
-    setPlaudTitleDraft("");
-  }
-
-  async function savePlaudTitle(item: DomiPlaudItem) {
-    if (plaudMutationIdsRef.current.has(item.fileId)) return;
-    const fileName = plaudTitleDraft.trim();
-    if (!fileName) {
-      setPlaudError("录音标题不能为空。 ");
-      return;
-    }
-    if (fileName === item.fileName) {
-      cancelPlaudRename();
-      return;
-    }
-    plaudMutationIdsRef.current.add(item.fileId);
-    plaudSnapshotRevisionRef.current += 1;
-    setRenamingPlaudId(item.fileId);
-    setPlaudError("");
-    setPlaudNotice("");
-    try {
-      const result = await workbench.renamePlaud({ fileId: item.fileId, fileName });
-      if (!result.ok || !result.fileName) {
-        setPlaudError(result.error || "PLAUD 标题修改失败。 ");
-        return;
-      }
-      setPlaudSnapshot((current) => current ? {
-        ...current,
-        syncedAt: Date.now(),
-        items: (current.items || []).map((entry) =>
-          entry.fileId === item.fileId ? { ...entry, fileName: result.fileName || fileName } : entry
-        )
-      } : current);
-      setPlaudNotice("录音标题已同步到 PLAUD");
-      cancelPlaudRename();
-    } catch (error) {
-      setPlaudError(error instanceof Error ? error.message : String(error));
-    } finally {
-      plaudMutationIdsRef.current.delete(item.fileId);
-      setRenamingPlaudId(null);
-    }
-  }
-
-  async function deletePlaudRecording(item: DomiPlaudItem) {
-    if (
-      plaudListPromiseRef.current
-      || plaudSyncPromiseRef.current
-      || plaudMutationIdsRef.current.size > 0
-      || launchingPlaudIdsRef.current.has(item.fileId)
-    ) return;
-    const approved = await requestConfirmation({
-      title: "将这条 PLAUD 录音移入回收站？",
-      message: `“${item.fileName}”将从 PLAUD 最近录音列表中移除。`,
-      detail: "domi 本地已生成的文字稿和纪要不会删除。",
-      confirmLabel: "移入回收站",
-      tone: "danger"
-    });
-    if (!approved) return;
-
-    plaudMutationIdsRef.current.add(item.fileId);
-    plaudSnapshotRevisionRef.current += 1;
-    setDeletingPlaudId(item.fileId);
-    setPlaudError("");
-    setPlaudNotice("");
-    if (editingPlaudId === item.fileId) cancelPlaudRename();
-    try {
-      const result = await workbench.deletePlaud({ fileId: item.fileId });
-      if (!result.ok || !result.trashed) {
-        setPlaudError(result.error || "PLAUD 录音删除失败。 ");
-        return;
-      }
-      setPlaudSnapshot((current) => current ? {
-        ...current,
-        syncedAt: Date.now(),
-        pendingCount: Math.max(
-          0,
-          (current.pendingCount || 0) - (!item.hasTranscript && !item.hasSummary ? 1 : 0)
-        ),
-        queueCount: Math.max(0, (current.queueCount || 0) - (item.queueStage ? 1 : 0)),
-        items: (current.items || []).filter((entry) => entry.fileId !== item.fileId)
-      } : current);
-      setPlaudNotice(`已将“${item.fileName}”移入 PLAUD 回收站`);
-    } catch (error) {
-      setPlaudError(error instanceof Error ? error.message : String(error));
-    } finally {
-      plaudMutationIdsRef.current.delete(item.fileId);
-      setDeletingPlaudId(null);
-    }
   }
 
   function selectModel(modelId: string) {
@@ -5864,14 +5614,41 @@ function App() {
     if (!nextModel) return;
 
     setModel(modelId);
-    if (!nextModel.supportedReasoningEfforts.some((option) => option.id === effectiveReasoningEffort)) {
+    if (!nextModel.supportedReasoningEfforts.some((option) => option.id === preferredReasoningEffort)) {
       setReasoningEffort(nextModel.defaultReasoningEffort);
     }
     if (
-      effectiveServiceTier !== "standard"
-      && !nextModel.serviceTiers.some((tier) => tier.id === effectiveServiceTier)
+      preferredServiceTier !== "standard"
+      && !nextModel.serviceTiers.some((tier) => tier.id === preferredServiceTier)
     ) {
       setServiceTier("standard");
+    }
+  }
+
+  function openModelMenu() {
+    setModelMenuOpen((open) => {
+      const next = !open;
+      // Opening the picker re-reads Codex's current model list so newly
+      // enabled models appear without waiting for the 60s status cache.
+      if (next && !modelMenuRefreshing) {
+        setModelMenuRefreshing(true);
+        refreshCodex(undefined, { refreshModels: true })
+          .catch(() => undefined)
+          .finally(() => setModelMenuRefreshing(false));
+      }
+      return next;
+    });
+  }
+
+  async function refreshModelMenu() {
+    if (modelMenuRefreshing) return;
+    setModelMenuRefreshing(true);
+    try {
+      await refreshCodex(undefined, { refreshModels: true });
+    } catch {
+      // Keep the last known list; the trigger button already reflects errors.
+    } finally {
+      setModelMenuRefreshing(false);
     }
   }
 
@@ -5895,7 +5672,7 @@ function App() {
     const result = await workbench.saveSettings(request);
     if (result.ok && result.settings) {
       setAppSettings(result.settings);
-      if (result.codex) setCodexStatus(result.codex);
+      if (result.codex) codexModelReadinessRef.current!.update(result.codex);
       const documentLibraryLocationChanged = [
         "storageBackend",
         "localLibraryDir",
@@ -5945,9 +5722,17 @@ function App() {
     return workbench.startChatGPTLogin();
   }
 
-  async function refreshCodex(verifiedStatus?: CodexCheckResult) {
-    const status = verifiedStatus || await workbench.checkCodex();
-    setCodexStatus(status);
+  async function refreshCodex(
+    verifiedStatus?: CodexCheckResult,
+    options: { refreshModels?: boolean } = {}
+  ): Promise<void> {
+    if (verifiedStatus) {
+      codexModelReadinessRef.current!.update(verifiedStatus);
+    } else {
+      await codexModelReadinessRef.current!.refresh(
+        options.refreshModels ? { refreshModels: true } : undefined
+      );
+    }
   }
 
   async function chooseWorkflow(workflow: Workflow) {
@@ -6213,7 +5998,7 @@ function App() {
         currentSnapshot?.people
       );
       updateSyncPhase("generating", "Todo Skill 正在排序并维护待办事项文档");
-      const runModelPolicy = resolveRunModelPolicy(todoWorkflow.id);
+      const runModelPolicy = await resolveReadyRunModelPolicy(todoWorkflow.id);
       const runPromise = workbench.runCodex({
           runId,
           prompt: workflowPrompt(todoWorkflow, requestText, recentEntriesContext, true, "programmatic"),
@@ -6434,6 +6219,15 @@ function App() {
       return;
     }
     void openDomiDocumentSearchResult(option.record);
+  }
+
+  function attachDomiDocumentToComposer(result: DocumentLibrarySearchMatch) {
+    cancelPendingDomiEntityOpen();
+    setDomiSearchError("");
+    setAttachments((current) => {
+      if (current.some((attachment) => attachment.path === result.path)) return current;
+      return [...current, { name: result.name, path: result.path, size: result.size }];
+    });
   }
 
   async function openDomiDocumentSearchResult(result: DocumentLibrarySearchMatch) {
@@ -6831,7 +6625,7 @@ function App() {
   ) {
     // A task may finish while every domi window is closed. Only replay a persisted,
     // machine-verifiable entity marker; never guess an entity from stale free text here.
-    if (!parseDomiEntityResult(output)) return;
+    if (assistantMessage.sourceScopeIsolated || !parseDomiEntityResult(output)) return;
     const assistantIndex = thread.messages.findIndex((message) => message.id === assistantMessage.id);
     const userMessage = assistantIndex > 0
       ? [...thread.messages.slice(0, assistantIndex)].reverse().find((message) => message.role === "user")
@@ -6859,6 +6653,7 @@ function App() {
   }
 
   async function finalizeEntityBinding(context: RunContext, output: string) {
+    if (context.sourceScopeIsolated || isRestrictedScope(context.sourceScope)) return;
     const stableResult = parseDomiEntityResult(output);
     if (!stableResult && (!context.workflowId || !ENTITY_RESULT_WORKFLOW_IDS.has(context.workflowId))) {
       return;
@@ -7085,7 +6880,7 @@ function App() {
               && recoveryCodexThreadId(
                 thread.codexThreadId,
                 candidate.executionCodexThreadId,
-                candidate.entityExecutionIsolated === true
+                candidate.entityExecutionIsolated === true || candidate.sourceScopeIsolated === true
               ) === payload.threadId
           );
         return message ? [{ thread, message }] : [];
@@ -7123,6 +6918,8 @@ function App() {
           assistantMessageId: recoveredMessage.id,
           entityFinalizationMode: recoveredMessage.entityFinalizationMode,
           entityExecutionIsolated: recoveredMessage.entityExecutionIsolated,
+        sourceScope: recoveredMessage.sourceScope,
+        sourceScopeIsolated: recoveredMessage.sourceScopeIsolated,
           executionCodexThreadId: recoveredMessage.executionCodexThreadId
         };
         runContextRef.current.set(payload.runId, context);
@@ -7196,16 +6993,18 @@ function App() {
         });
         return;
       }
-      if (context.entityExecutionIsolated) {
+      if (payload.sourceScopeIsolated || context.sourceScopeIsolated || context.entityExecutionIsolated) {
+        context.sourceScopeIsolated = payload.sourceScopeIsolated || context.sourceScopeIsolated;
         context.executionCodexThreadId = payload.threadId;
         runContextRef.current.set(payload.runId, context);
         patchMessage(context.assistantMessageId, {
-          executionCodexThreadId: payload.threadId
+          executionCodexThreadId: payload.threadId,
+          sourceScopeIsolated: context.sourceScopeIsolated
         });
       }
       // One local task always owns one continuous Codex conversation. Entity
       // isolation constrains files and finalization, not conversational memory.
-      patchThread(context.threadId, { codexThreadId: payload.threadId });
+      if (!context.sourceScopeIsolated && !payload.sourceScopeIsolated) patchThread(context.threadId, { codexThreadId: payload.threadId });
       addTimeline(context.threadId, {
         runId: payload.runId,
         title: payload.summary || "Codex 对话已连接",
@@ -7265,6 +7064,11 @@ function App() {
 
     if (payload.type === "usage" && payload.usage) {
       patchThread(context.threadId, { lastUsage: payload.usage });
+      return;
+    }
+
+    if (payload.type === "library-usage" && payload.libraryUsage) {
+      patchMessage(context.assistantMessageId, { libraryUsage: payload.libraryUsage });
       return;
     }
 
@@ -7336,7 +7140,8 @@ function App() {
             : payload.error || "Codex 执行失败。"),
         status: payload.type === "failed" ? "error" : "done",
         runCompletedAt,
-        runEventCount: payload.eventCount
+        runEventCount: payload.eventCount,
+        ...(payload.libraryUsage ? { libraryUsage: payload.libraryUsage } : {})
       });
 
       patchThread(context.threadId, {
@@ -7750,7 +7555,6 @@ function App() {
   ) {
     const sourceThread = options.thread || activeThread;
     let targetThread = sourceThread;
-    const useDomiPlugin = options.useDomiPlugin ?? domiPluginEnabled;
     const submittedInput = overrideInput ?? input;
     const submittedComposerInput = options.workflowContinuation
       ? options.displayText || submittedInput
@@ -7761,12 +7565,25 @@ function App() {
       ? String(options.userInstructionText ?? submittedInput).trim()
       : "";
     const submittedAttachments = options.attachments ?? attachments;
+    const submittedScope = Object.prototype.hasOwnProperty.call(options, "sourceScope")
+      ? options.sourceScope : requestOrigin === "user" ? sourceScope : undefined;
+    validateSourceSelection(submittedScope, submittedAttachments);
+    const restrictedSources = isRestrictedScope(submittedScope);
+    if (restrictedSources) workflow = undefined;
+    const useDomiPlugin = !restrictedSources && (options.useDomiPlugin ?? domiPluginEnabled);
     let selectedAttachments = submittedAttachments;
     const messageText = rawInput || workflow?.defaultPrompt || (selectedAttachments.length ? "请分析所附材料" : "");
     if (!messageText) {
       return;
     }
-    const runModelPolicy = resolveRunModelPolicy(workflow?.id, {
+    const bareIntake = !restrictedSources && requestOrigin === "user"
+      && !workflow
+      && useDomiPlugin
+      && targetThread.messages.length === 0
+      ? bareIntakeInput(rawInput, selectedAttachments)
+      : null;
+    const runModelPolicy = await resolveReadyRunModelPolicy(workflow?.id, {
+      runKind: options.runKind ?? (bareIntake ? "intake" : undefined),
       useDomiPlugin,
       requestText: messageText,
       model: options.model,
@@ -7797,14 +7614,17 @@ function App() {
       throw new Error("发送前原任务已被删除，本次消息未发送。");
     }
     targetThread = latestSourceThread;
-    const binding = await bindThreadToMentionedProject(
-      targetThread,
-      messageText,
-      selectedAttachments,
-      useDomiPlugin,
-      effectiveDomiSnapshot,
-      workflow
-    );
+    const binding: ProjectBindingResult = restrictedSources
+      ? { thread: targetThread, attachments: selectedAttachments,
+          execution: { entityFinalizationMode: "archive-only", isolated: false } }
+      : await bindThreadToMentionedProject(
+        targetThread,
+        messageText,
+        selectedAttachments,
+        useDomiPlugin,
+        effectiveDomiSnapshot,
+        workflow
+      );
     if (binding.canceled) return;
     targetThread = binding.thread;
     if (targetThread.id !== sourceThread.id) {
@@ -7818,11 +7638,9 @@ function App() {
       entityFinalizationMode: entityFinalizationModeForSourceConversation(targetThread),
       isolated: false
     };
-    const recoveredEntityWorkspace = await recoverBoundEntityWorkspaceForSubmission(
-      targetThread,
-      execution,
-      effectiveDomiSnapshot
-    );
+    const recoveredEntityWorkspace = restrictedSources
+      ? { thread: targetThread, execution, snapshot: effectiveDomiSnapshot }
+      : await recoverBoundEntityWorkspaceForSubmission(targetThread, execution, effectiveDomiSnapshot);
     targetThread = recoveredEntityWorkspace.thread;
     execution = recoveredEntityWorkspace.execution;
     effectiveDomiSnapshot = recoveredEntityWorkspace.snapshot;
@@ -7876,6 +7694,7 @@ function App() {
         resumeCodexThreadId: options.resumeCodexThreadId,
         privateCodexContinuation: options.privateCodexContinuation,
         attachments: selectedAttachments,
+        sourceScope: submittedScope,
         activeDocumentPath: options.activeDocumentPath,
         requestOrigin,
         userInstructionText,
@@ -7899,7 +7718,8 @@ function App() {
           sourceThread.id,
           submittedComposerInput,
           selectedAttachments,
-          options.workflowContinuation ? undefined : workflow?.id
+          options.workflowContinuation ? undefined : workflow?.id,
+          submittedScope
         );
       }
       return;
@@ -7925,7 +7745,7 @@ function App() {
         message: `检测到 ${quarantinedOwnership.quarantinedThreadIds.length} 个本地任务共用 Codex 对话；已隔离旧对话，本轮将新建独立会话。`
       });
     }
-    const resumeCodexThreadId = String(options.resumeCodexThreadId || "").trim();
+    const resumeCodexThreadId = restrictedSources ? "" : String(options.resumeCodexThreadId || "").trim();
     if (resumeCodexThreadId) {
       if (targetThread.quarantinedCodexThreadIds?.includes(resumeCodexThreadId)) {
         throw new Error("等待补充信息的 Codex 会话已被安全隔离，无法续接；本次输入已保留。");
@@ -7956,6 +7776,7 @@ function App() {
         ? `启动「${workflow.title}」：${displayText}`
         : displayText,
       workflowId: workflow?.id,
+      sourceScope: submittedScope,
       attachments: selectedAttachments
     };
 
@@ -7969,6 +7790,8 @@ function App() {
       content: "",
       runId,
       runStartedAt,
+      sourceScope: submittedScope,
+      sourceScopeIsolated: restrictedSources,
       entityFinalizationMode: execution.entityFinalizationMode,
       entityExecutionIsolated: privateCodexExecution
     };
@@ -7980,7 +7803,8 @@ function App() {
         sourceThread.id,
         submittedComposerInput,
         selectedAttachments,
-        options.workflowContinuation ? undefined : workflow?.id
+        options.workflowContinuation ? undefined : workflow?.id,
+        submittedScope
       );
     }
     patchThread(targetThread.id, { timeline: [], lastUsage: null, hasUnreadCompletion: false });
@@ -7991,6 +7815,8 @@ function App() {
       workflowId: workflow?.id,
       requestText: messageText,
       attachments: selectedAttachments,
+      sourceScope: submittedScope,
+      sourceScopeIsolated: restrictedSources,
       knownProjectIds: effectiveDomiSnapshot?.projects.map((project) => project.recordId),
       knownPersonIds: effectiveDomiSnapshot?.people.map((person) => person.recordId),
       queuedSubmission: routedQueuedSubmission,
@@ -8016,18 +7842,38 @@ function App() {
           "- 仅当用户明确更换主题或主动选择新的工作流时，才按新任务意图转向；不要要求用户重复已经在本任务中提供的信息。"
         ].join("\n")
       : "";
-    const basePrompt = workflowPrompt(
-      workflow,
-      messageText,
-      [
+    const basePrompt = (() => {
+      if (restrictedSources) return messageText;
+      // A bare link or a lone PDF dropped into a fresh task means "archive
+      // this": route it through the same intake-archive pipeline as Feishu
+      // inbox forwards instead of the generic analyst prompt. Any explicit
+      // wording keeps the normal conversational routing; programmatic intake
+      // submissions carry their own full prompt and never match here.
+      const intakeInstruction = bareIntake?.kind === "url"
+        ? intakeLinkPrompt({ url: bareIntake.url })
+        : bareIntake?.kind === "file"
+          ? intakeFilePrompt({ fileName: bareIntake.fileName })
+          : "";
+      if (!intakeInstruction) {
+        return workflowPrompt(
+          workflow,
+          messageText,
+          [
+            domiContextForThread(effectiveDomiSnapshot, targetThread),
+            conversationContinuationNotice,
+            executionNotice
+          ].filter(Boolean).join("\n\n"),
+          useDomiPlugin,
+          requestOrigin
+        );
+      }
+      return [
+        intakeInstruction,
         domiContextForThread(effectiveDomiSnapshot, targetThread),
-        conversationContinuationNotice,
         executionNotice
-      ].filter(Boolean).join("\n\n"),
-      useDomiPlugin,
-      requestOrigin
-    );
-    const prompt = selectedAttachments.length
+      ].filter(Boolean).join("\n\n");
+    })();
+    const prompt = restrictedSources ? basePrompt : selectedAttachments.length
       ? `${basePrompt}\n\n本次任务附带以下本地材料，请直接读取并使用：\n${selectedAttachments
           .map((file) => `- ${JSON.stringify(file.path)}`)
           .join("\n")}`
@@ -8042,11 +7888,12 @@ function App() {
         userInstructionText,
         activeDocumentPath: options.activeDocumentPath,
         attachmentPaths: selectedAttachments.map((attachment) => attachment.path),
+        sourceScope: submittedScope,
         // A left-sidebar task is one continuous conversation. Filesystem and
         // entity finalization may be isolated without splitting model context.
-        threadId: resumeCodexThreadId || existingTaskConversationId,
+        threadId: restrictedSources ? undefined : resumeCodexThreadId || existingTaskConversationId,
         workflowId: workflow?.id || (useDomiPlugin ? "domi-analyst" : undefined),
-        webSearch: Boolean(workflow?.webSearch),
+        webSearch: submittedScope === "research" ? true : restrictedSources ? false : Boolean(workflow?.webSearch),
         model: runModelPolicy.model,
         reasoningEffort: runModelPolicy.reasoningEffort,
         serviceTier: runModelPolicy.serviceTier,
@@ -8093,7 +7940,7 @@ function App() {
           message: "Codex 启动结果命中了另一任务持有的对话标识；已拒绝重新绑定。"
         });
       } else {
-        if (privateCodexExecution) {
+        if (privateCodexExecution || restrictedSources) {
           patchMessage(assistantId, { executionCodexThreadId: result.threadId });
           const context = runContextRef.current.get(runId);
           if (context) {
@@ -8101,7 +7948,7 @@ function App() {
             runContextRef.current.set(runId, context);
           }
         }
-        patchThread(targetThread.id, { codexThreadId: result.threadId });
+        if (!restrictedSources && !result.sourceScopeIsolated) patchThread(targetThread.id, { codexThreadId: result.threadId });
       }
     }
 
@@ -8110,7 +7957,8 @@ function App() {
       patchMessage(assistantId, {
         content: result.output,
         status: "done",
-        runCompletedAt
+        runCompletedAt,
+        ...(result.libraryUsage ? { libraryUsage: result.libraryUsage } : {})
       });
       patchThread(targetThread.id, {
         updatedAt: nowLabel(),
@@ -8163,27 +8011,12 @@ function App() {
     const sourceThreadId = sourceThread.id;
     const submittedInput = input;
     const submittedAttachments = [...attachments];
+    const submittedScope = sourceScope;
+    try { validateSourceSelection(submittedScope, submittedAttachments); }
+    catch (error) { setThreadAttachmentError(sourceThreadId, error instanceof Error ? error.message : String(error)); return; }
     const submittedActiveDocumentPath = selectedDocumentLibraryPath || undefined;
-    const plaudContinuation = !selectedWorkflow
-      ? pendingPlaudContinuation(sourceThread, plaudSnapshot?.items || [])
-      : null;
-    const submittedWorkflow = plaudContinuation
-      ? workflows.find((workflow) => workflow.id === "domi-router")
-      : selectedWorkflow;
-    const submittedRequest = plaudContinuation
-      ? plaudContinuationPrompt(
-          plaudNotesWorkflowRequest(plaudContinuation.item),
-          submittedInput
-        )
-      : submittedInput;
-    const continuationOptions = plaudContinuation
-      ? {
-          displayText: submittedInput,
-          workflowContinuation: true,
-          resumeCodexThreadId: plaudContinuation.executionCodexThreadId,
-          privateCodexContinuation: Boolean(plaudContinuation.executionCodexThreadId)
-        }
-      : {};
+    const submittedWorkflow = selectedWorkflow;
+    const submittedRequest = submittedInput;
     if (attachmentImportCount > 0) {
       setThreadAttachmentError(sourceThreadId, "附件仍在导入，请等待完成后再发送。");
       return;
@@ -8195,10 +8028,10 @@ function App() {
       enqueueSubmission(submittedWorkflow, submittedRequest, {
         thread: sourceThread,
         attachments: submittedAttachments,
+        sourceScope: submittedScope,
         activeDocumentPath: submittedActiveDocumentPath,
         requestOrigin: "user",
         userInstructionText: submittedInput.trim(),
-        ...continuationOptions
       });
       return;
     }
@@ -8209,10 +8042,10 @@ function App() {
     void submitToCodex(submittedWorkflow, submittedRequest, {
       thread: sourceThread,
       attachments: submittedAttachments,
+      sourceScope: submittedScope,
       activeDocumentPath: submittedActiveDocumentPath,
       requestOrigin: "user",
       userInstructionText: submittedInput.trim(),
-      ...continuationOptions,
       useDomiPlugin: domiPluginEnabled,
       model,
       reasoningEffort,
@@ -8234,6 +8067,7 @@ function App() {
     options: {
       thread?: Thread;
       attachments?: LocalAttachment[];
+      sourceScope?: SourceScope;
       activeDocumentPath?: string;
       requestOrigin?: "user" | "programmatic";
       userInstructionText?: string;
@@ -8250,6 +8084,11 @@ function App() {
     const queueThread = options.thread || activeThread;
     const queuedAttachments = options.attachments ?? attachments;
     const queuedRequestOrigin = options.requestOrigin === "user" ? "user" : "programmatic";
+    const queuedScope = Object.prototype.hasOwnProperty.call(options, "sourceScope")
+      ? options.sourceScope : queuedRequestOrigin === "user" ? sourceScope : undefined;
+    try { validateSourceSelection(queuedScope, queuedAttachments); }
+    catch (error) { setThreadAttachmentError(queueThread.id, error instanceof Error ? error.message : String(error)); return; }
+    if (isRestrictedScope(queuedScope)) workflow = undefined;
     const queuedUserInstructionText = queuedRequestOrigin === "user"
       ? String(options.userInstructionText ?? overrideInput ?? input).trim()
       : "";
@@ -8266,6 +8105,12 @@ function App() {
     const runModelPolicy = (() => {
       try {
         return resolveRunModelPolicy(workflow?.id, {
+          runKind: queuedRequestOrigin === "user"
+            && !workflow
+            && domiPluginEnabled
+            && queueThread.messages.length === 0
+            && bareIntakeInput(rawInput, queuedAttachments)
+            ? "intake" : undefined,
           useDomiPlugin: domiPluginEnabled,
           requestText: messageText
         });
@@ -8289,10 +8134,11 @@ function App() {
       resumeCodexThreadId: options.resumeCodexThreadId,
       privateCodexContinuation: options.privateCodexContinuation,
       attachments: [...queuedAttachments],
+      sourceScope: queuedScope,
       activeDocumentPath: queuedActiveDocumentPath,
       requestOrigin: queuedRequestOrigin,
       userInstructionText: queuedUserInstructionText,
-      useDomiPlugin: domiPluginEnabled,
+      useDomiPlugin: !isRestrictedScope(queuedScope) && domiPluginEnabled,
       model: runModelPolicy.model,
       reasoningEffort: runModelPolicy.reasoningEffort,
       serviceTier: runModelPolicy.serviceTier,
@@ -8307,7 +8153,8 @@ function App() {
       queuedSubmissionsByThreadRef.current = next;
       return next;
     });
-    clearComposerDraft(queueThread.id);
+    clearSubmittedComposerDraft(queueThread.id, options.displayText || overrideInput || input, queuedAttachments,
+      options.workflowContinuation ? undefined : workflow?.id, queuedScope);
     patchThread(queueThread.id, { updatedAt: nowLabel(), lastActiveAt: Date.now() });
   }
 
@@ -8575,6 +8422,151 @@ function App() {
     }
   }
 
+  function handleIntakeItem(item: IntakeItem) {
+    if (item?.kind === "file") {
+      handleIntakeFileItem(item);
+      return;
+    }
+    const url = String(item?.url || "").trim();
+    if (!url) return;
+    const title = String(item?.title || "").trim();
+    const source = String(item?.source || "").trim();
+    const excerpt = String(item?.text || "").trim();
+    // Video / podcast platform links (B站、YouTube、小宇宙) run the same
+    // intake-archive skill but with the media variant: public subtitles or
+    // public-audio local transcription instead of article text extraction.
+    const prompt = intakeLinkPrompt({ url, title, source, excerpt });
+
+    const threadId = createId("thread");
+    const projectId = createId("project");
+    let displayTitle = title;
+    if (!displayTitle) {
+      try {
+        displayTitle = new URL(url).hostname;
+      } catch {
+        displayTitle = "";
+      }
+    }
+    const intakeThread: Thread = {
+      id: threadId,
+      projectId,
+      // Forwarded articles start in the shared runtime workspace, exactly
+      // like a blank task; entity binding happens during the run.
+      workspacePath: codexStatus?.workspacePath,
+      title: displayTitle ? `转发：${displayTitle}`.slice(0, 60) : NEW_THREAD_TITLE,
+      project: NEW_THREAD_PROJECT,
+      updatedAt: nowLabel(),
+      lastActiveAt: Date.now(),
+      pinned: false,
+      manualTitle: false,
+      timeline: [],
+      lastUsage: null,
+      messages: []
+    };
+    threadsRef.current = [
+      intakeThread,
+      ...threadsRef.current.filter((thread) => thread.id !== intakeThread.id)
+    ];
+    setThreads((current) => [
+      intakeThread,
+      ...current.filter((thread) => thread.id !== intakeThread.id)
+    ]);
+    updateComposerDraft(threadId, (draft) => ({ ...draft, input: prompt }));
+    activateThreadNow(threadId);
+    applyNewThreadAgentDefaults();
+    setThreadMenuId(null);
+    void navigateWorkspace("conversation");
+    void submitToCodex(undefined, prompt, {
+      thread: intakeThread,
+      attachments: [],
+      activeDocumentPath: undefined,
+      requestOrigin: "user",
+      userInstructionText: prompt,
+      useDomiPlugin: true,
+      runKind: "intake"
+    }).then(() => {
+      // 转发的入库任务在后台还需几分钟完成，延迟一拍再镜像，新文档
+      // 能赶上；赶不上也无妨——下次启动的自动增量会补上。
+      window.setTimeout(() => syncFeishuMirrorAfterLocalChange("intake-link"), 4 * 60_000);
+    }).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      setThreadAttachmentError(threadId, `转发内容未能开始处理：${message}`);
+      workbench.reportRendererIssue({
+        kind: "codex-run",
+        message: `转发任务提交失败：${message}`
+      });
+    });
+  }
+
+  function handleIntakeFileItem(item: IntakeItem) {
+    const filePath = String(item?.filePath || "").trim();
+    if (!filePath) return;
+    const fileName = String(item?.fileName || item?.title || "").trim() || "转发文件";
+    const fileSize = Number(item?.fileSize) || 0;
+    // Same intake-archive pipeline as forwarded links: the local file (PDF,
+    // spreadsheet, image, media or document) replaces the "fetch original
+    // article" step; everything downstream (summary card, classification,
+    // library upsert with idempotent eventId, read-back) is identical. See
+    // intakeFilePrompt for the per-category input-variant rules.
+    const prompt = intakeFilePrompt({ fileName });
+
+    const threadId = createId("thread");
+    const projectId = createId("project");
+    const intakeThread: Thread = {
+      id: threadId,
+      projectId,
+      // Forwarded files start in the shared runtime workspace, exactly like
+      // a forwarded article; the PDF itself is attached from the intake drop
+      // folder so the agent can read it directly.
+      workspacePath: codexStatus?.workspacePath,
+      title: `转发文件：${fileName}`.slice(0, 60),
+      project: NEW_THREAD_PROJECT,
+      updatedAt: nowLabel(),
+      lastActiveAt: Date.now(),
+      pinned: false,
+      manualTitle: false,
+      timeline: [],
+      lastUsage: null,
+      messages: []
+    };
+    threadsRef.current = [
+      intakeThread,
+      ...threadsRef.current.filter((thread) => thread.id !== intakeThread.id)
+    ];
+    setThreads((current) => [
+      intakeThread,
+      ...current.filter((thread) => thread.id !== intakeThread.id)
+    ]);
+    updateComposerDraft(threadId, (draft) => ({
+      ...draft,
+      input: prompt,
+      attachments: [{ name: fileName, path: filePath, size: fileSize }]
+    }));
+    activateThreadNow(threadId);
+    applyNewThreadAgentDefaults();
+    setThreadMenuId(null);
+    void navigateWorkspace("conversation");
+    void submitToCodex(undefined, prompt, {
+      thread: intakeThread,
+      attachments: [{ name: fileName, path: filePath, size: fileSize }],
+      activeDocumentPath: undefined,
+      requestOrigin: "user",
+      userInstructionText: prompt,
+      useDomiPlugin: true,
+      runKind: "intake"
+    }).then(() => {
+      // 同 intake-link：入库任务在后台完成，延迟一拍再镜像。
+      window.setTimeout(() => syncFeishuMirrorAfterLocalChange("intake-file"), 4 * 60_000);
+    }).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      setThreadAttachmentError(threadId, `转发文件未能开始处理：${message}`);
+      workbench.reportRendererIssue({
+        kind: "codex-run",
+        message: `转发文件任务提交失败：${message}`
+      });
+    });
+  }
+
   async function stopRun() {
     if (!activeRunId) {
       return;
@@ -8636,7 +8628,7 @@ function App() {
 
   function activateThreadNow(threadId: string, expectedSelectionIntent?: number) {
     if (expectedSelectionIntent === undefined) {
-      // Any direct activation (new task, PLAUD, suggestion, entity opening or
+      // Any direct activation (new task, suggestion, entity opening or
       // deletion fallback) supersedes an older async sidebar selection.
       threadSelectionIntentRef.current += 1;
     } else if (expectedSelectionIntent !== threadSelectionIntentRef.current) {
@@ -8756,11 +8748,7 @@ function App() {
   }
 
   function toggleSection(section: keyof typeof openSections) {
-    const opening = !openSections[section];
     setOpenSections((current) => ({ ...current, [section]: !current[section] }));
-    if (section === "domi" && opening && plaudEnabled && !plaudSnapshot) {
-      void refreshPlaudQueue();
-    }
   }
 
   async function refreshDocumentLibrary(options: { silent?: boolean; force?: boolean } = {}) {
@@ -8808,7 +8796,7 @@ function App() {
     }
   }
 
-  async function openPrimaryWorkspace(view: "tasks" | "news" | "data") {
+  async function openPrimaryWorkspace(view: "tasks" | "news" | "subscriptions" | "data") {
     if (!await navigateWorkspace(view)) return;
     setDocumentLibrarySidebarExpanded(false);
     setThreadMenuId(null);
@@ -9111,6 +9099,7 @@ function App() {
 
   function openDocument(resource: string, initialSearchQuery = "") {
     if (isLocalPdfResource(resource)) {
+      setPdfTargetPage(Math.max(1, Number(resource.match(/#page=(\d+)/i)?.[1]) || 1));
       void openPdf(resource);
       return;
     }
@@ -9447,7 +9436,10 @@ function App() {
                   title="点击修改文件名"
                   aria-label={`修改文件名：${markdownDocument.name}`}
                 >
-                  <strong>{markdownDocument.name}</strong>
+                  <strong>{/<!-- domi:(?:managed|translation):start -->/.test(markdownDocument.content.slice(0, 16384))
+                    && /[\u3400-\u9fff]/.test(markdownDocument.content.slice(0, 16384).match(/^#\s+(.+)$/m)?.[1] || "")
+                    ? markdownDocument.content.slice(0, 16384).match(/^#\s+(.+)$/m)?.[1]
+                    : markdownDocument.name}</strong>
                   <Pencil size={12} aria-hidden="true" />
                 </button>
               ) : (
@@ -9545,7 +9537,7 @@ function App() {
 
   function renderPdfPanel() {
     const previewSrc = pdfDocument
-      ? `${pdfDocument.previewUrl}#toolbar=1&navpanes=0&view=FitH`
+      ? `${pdfDocument.previewUrl}#page=${pdfTargetPage}&toolbar=1&navpanes=0&view=FitH`
       : "";
 
     return (
@@ -9597,7 +9589,7 @@ function App() {
           ) : (
             <>
               <iframe
-                key={`${pdfDocument.path}:${pdfDocument.mtimeMs}`}
+                key={`${pdfDocument.path}:${pdfDocument.mtimeMs}:${pdfTargetPage}`}
                 className="pdf-preview-frame"
                 src={previewSrc}
                 title={`${pdfDocument.name} PDF 预览`}
@@ -9658,7 +9650,7 @@ function App() {
               ? expanded ? <FolderOpen size={16} /> : <Folder size={16} />
               : node.kind === "pdf" ? <FileType2 size={16} /> : <FileText size={16} />}
           </span>
-          <span className="document-library-node-name">{node.name}</span>
+          <span className="document-library-node-name">{node.displayName || node.name}</span>
           {node.kind !== "folder" && (
             <small>{formatFileSize(node.size)}</small>
           )}
@@ -10643,7 +10635,7 @@ function App() {
           </section>
 
           <section className="new-task-suggestions" aria-label="推荐工作流">
-            {visibleQuickStartWorkflows.map((workflow) => {
+            {quickStartWorkflows.map((workflow) => {
               const Icon = workflowIconMap[workflow.id] || FileText;
               const selected = selectedWorkflowId === workflow.id;
               return (
@@ -10677,6 +10669,43 @@ function App() {
     return (
       <div className="news-stage">
         <div className="news-content">{renderWeeklyNews()}</div>
+      </div>
+    );
+  }
+
+  function renderSubscriptionsWorkspace() {
+    return (
+      <div className="news-stage subscriptions-stage">
+        <div className="news-content">
+          <Suspense fallback={<div className="lazy-overlay"><RefreshCw className="spinning" size={20} />正在加载订阅</div>}>
+            <SubscriptionsView
+              snapshot={radarSourceSnapshot}
+              loading={subscriptionsLoading}
+              syncing={subscriptionsSyncing}
+              archivingJobIds={subscriptionArchivingJobIds}
+              digestDay={subscriptionDigestDay}
+              digestedDay={weeklyNewsAutomation.lastSubscriptionDigestDay}
+              lastDigestAt={weeklyNewsAutomation.lastSubscriptionDigestAt}
+              autoSyncEnabled={appSettings?.externalAccessMode === "always"}
+              digestDocuments={subscriptionDigestDocuments}
+              mirrorSyncing={feishuMirrorSyncing}
+              onSyncMirror={() => {
+                if (typeof workbench.syncFeishuWikiMirror !== "function") return;
+                setFeishuMirrorSyncing(true);
+                void workbench.syncFeishuWikiMirror({ trigger: "subscriptions-view" })
+                  .catch(() => undefined)
+                  .finally(() => setFeishuMirrorSyncing(false));
+              }}
+              onSync={() => void syncSubscriptions()}
+              onRefresh={() => void refreshSubscriptions()}
+              onOpenSourceManager={() => setRadarSourceManagerOpen(true)}
+              onArchiveEpisode={(job) => void archiveSubscriptionEpisode(job)}
+              onGenerateDigest={(day) => void generateSubscriptionDigest(day)}
+              onOpenUrl={(url) => void workbench.openResource(url)}
+              onOpenDigest={(path) => void openMarkdown(path)}
+            />
+          </Suspense>
+        </div>
       </div>
     );
   }
@@ -10989,8 +11018,20 @@ function App() {
     ];
 
     const newsGridColumns: DatabaseGridColumn<DomiNewsItem>[] = [
-      { key: "title", label: "新闻标题", kind: "longtext", width: 300, minWidth: 200, required: true },
-      { key: "summary", label: "核心事实", kind: "longtext", width: 360, minWidth: 240 },
+      { key: "title", label: "标题", kind: "longtext", width: 300, minWidth: 200, required: true },
+      {
+        key: "articleType",
+        label: "类型",
+        kind: "single",
+        width: 110,
+        editable: false,
+        options: [
+          { value: "event", label: "行业事件", tone: "gray" },
+          { value: "article", label: "认知文章", tone: "cyan" }
+        ],
+        getValue: (item) => item.articleType || "event"
+      },
+      { key: "summary", label: "核心内容", kind: "longtext", width: 360, minWidth: 240 },
       { key: "publishedAt", label: "发布时间", kind: "date", width: 126 },
       {
         key: "domains",
@@ -11017,6 +11058,7 @@ function App() {
         allowCustomOptions: true
       },
       { key: "source", label: "来源", kind: "text", width: 150 },
+      { key: "companies", label: "公司", kind: "text", width: 170 },
       { key: "importance", label: "重要性", kind: "number", width: 100, align: "right" },
       { key: "confidence", label: "置信度", kind: "number", width: 100, align: "right" },
       {
@@ -11033,9 +11075,11 @@ function App() {
         key: "url",
         label: "原文",
         kind: "link",
-        width: 100,
+        width: 110,
         editable: false,
-        getValue: (item) => item.url ? "原文" : ""
+        getValue: (item) => item.articleType === "article"
+          ? (item.contentLink || item.url ? "原文" : "")
+          : (item.url ? "原文" : "")
       }
     ];
 
@@ -11434,7 +11478,17 @@ function App() {
                 height="min(68vh, 760px)"
                 onPatch={(record, patch, context) =>
                   patchDatabaseGridRecord("news", record, patch, context)}
-                onPreview={(record) => void previewDatabaseRecord("news", record)}
+                onPreview={(record) => {
+                  if (record.articleType === "article" && record.contentLink) {
+                    openDocument(record.contentLink);
+                    return;
+                  }
+                  if (record.articleType === "article" && record.documentLink) {
+                    openDocument(record.documentLink);
+                    return;
+                  }
+                  void previewDatabaseRecord("news", record);
+                }}
                 onDelete={(record) => requestDatabaseGridDelete("news", record)}
               />
             )}
@@ -12029,6 +12083,7 @@ function App() {
                           ? "上次未启动或执行中断 · 点击重试"
                           : `排队中 · 第 ${index + 1} 项`}
                       {queued.attachments.length > 0 ? ` · ${queued.attachments.length} 个附件` : ""}
+                      {queued.sourceScope ? ` · ${SOURCE_SCOPE_LABELS[queued.sourceScope]}` : ""}
                     </span>
                   </div>
                   {pausedQueuedSubmissionIds.has(queued.id) && (
@@ -12142,10 +12197,20 @@ function App() {
               ))}
             </div>
           )}
+          {isRestrictedScope(sourceScope) && <div className="composer-source-notice" role="status">
+            只读资料问答 · 不联网、不入库 · 本轮不复用历史回答{sourceScope === "selected" ? ` · 已选 ${attachments.length} 份材料` : ""}
+          </div>}
           {attachmentImportCount > 0 && (
             <div className="attachment-error" role="status">正在安全导入附件，完成后即可发送…</div>
           )}
           {attachmentError && <div className="attachment-error">{attachmentError}</div>}
+          {submissionBusyThreadIds.has(activeThread.id) && !isRunning && (
+            <div className="composer-preflight-status" role="status">
+              {codexStatus?.models.length
+                ? "正在准备任务…"
+                : "正在连接 AI 引擎并加载模型，任务就绪后会自动开始…"}
+            </div>
+          )}
 
           <div className="composer-toolbar">
             <div className="composer-tools-left">
@@ -12159,7 +12224,15 @@ function App() {
               >
                 <Plus size={20} />
               </button>
-              {selectedWorkflow ? (
+              <label className="composer-source-scope">
+                <LibraryBig size={14} aria-hidden="true" />
+                <select aria-label="资料来源范围" value={sourceScope} onChange={(event) => setSourceScope(event.target.value as SourceScope)}>
+                  <option value="selected">仅选定材料</option>
+                  <option value="library">全库资料 · 不联网</option>
+                  <option value="research">全库＋联网研究</option>
+                </select>
+              </label>
+              {isRestrictedScope(sourceScope) ? <span className="composer-source-readonly">资料问答</span> : selectedWorkflow ? (
                 <button
                   className="selected-workflow"
                   type="button"
@@ -12193,13 +12266,13 @@ function App() {
                 <button
                   className="model-picker-trigger"
                   type="button"
-                  onClick={() => setModelMenuOpen((open) => !open)}
+                  onClick={openModelMenu}
                   aria-label="选择模型、推理强度和速度"
                   aria-expanded={modelMenuOpen}
                   disabled={!codexStatus?.ok}
                 >
                   <Zap className="model-picker-zap" size={14} />
-                  <span>{selectedModel?.name.replace("GPT-5.6-", "") || "推荐模型"}</span>
+                  <span>{selectedModel?.name || "推荐模型"}</span>
                   <small>{reasoningLabel(effectiveReasoningEffort)} · {speedLabel(effectiveServiceTier)}</small>
                   <ChevronDown size={14} />
                 </button>
@@ -12218,6 +12291,15 @@ function App() {
                       >
                         跟随 Codex
                       </button>
+                      <button
+                        type="button"
+                        className="model-menu-refresh"
+                        onClick={refreshModelMenu}
+                        disabled={modelMenuRefreshing}
+                        title="重新读取 Codex 当前可用的模型、推理强度和速度"
+                      >
+                        {modelMenuRefreshing ? "同步中…" : "同步模型"}
+                      </button>
                     </div>
 
                     <section className="model-menu-section">
@@ -12235,6 +12317,9 @@ function App() {
                           </button>
                         ))}
                       </div>
+                      <p className="model-menu-note">
+                        列表来自 Codex App Server，与 ChatGPT 网页端可用模型可能不同；点“同步模型”获取最新。
+                      </p>
                     </section>
 
                     <section className="model-menu-section">
@@ -12286,6 +12371,7 @@ function App() {
                 title={isRunning ? "加入当前对话的待执行队列" : "发送给 Codex"}
                 disabled={
                   attachmentImportCount > 0
+                  || (!isRunning && submissionBusyThreadIds.has(activeThread.id))
                   || !codexStatus?.ok
                   || (!input.trim() && attachments.length === 0)
                 }
@@ -12405,6 +12491,17 @@ function App() {
           </div>
 
           {domiQuery.trim() && (
+            <label className="domi-search-transcript-toggle">
+              <input
+                type="checkbox"
+                checked={domiSearchExcludeTranscripts}
+                onChange={(event) => setDomiSearchExcludeTranscripts(event.target.checked)}
+              />
+              <span>隐藏转写文字稿</span>
+            </label>
+          )}
+
+          {domiQuery.trim() && (
             <div
               className="domi-search-results sidebar-domi-search-results"
               id="sidebar-domi-search-results"
@@ -12487,29 +12584,38 @@ function App() {
                       + index;
                     const optionKey = `document:${document.path}`;
                     return (
-                      <button
-                        type="button"
-                        key={document.path}
-                        id={`sidebar-domi-search-option-${optionIndex}`}
-                        role="option"
-                        aria-selected={domiSearchResolvedActiveKey === optionKey}
-                        tabIndex={-1}
-                        ref={(element) => {
-                          if (element) domiSearchOptionRefs.current.set(optionKey, element);
-                          else domiSearchOptionRefs.current.delete(optionKey);
-                        }}
-                        onPointerEnter={() => setDomiSearchActiveKey(optionKey)}
-                        onClick={() => void openDomiDocumentSearchResult(document)}
-                        title={document.relativePath}
-                      >
-                        <strong>{document.name}</strong>
-                        <small className="domi-document-result-snippet">{document.snippet}</small>
-                        <small className="domi-document-result-path">
-                          {[document.kind === "pdf" ? "PDF" : "Markdown", document.line ? `第 ${document.line} 行` : "", document.relativePath]
-                            .filter(Boolean)
-                            .join(" · ")}
-                        </small>
-                      </button>
+                      <div className="domi-document-result-item" key={document.path}>
+                        <button
+                          type="button"
+                          id={`sidebar-domi-search-option-${optionIndex}`}
+                          role="option"
+                          aria-selected={domiSearchResolvedActiveKey === optionKey}
+                          tabIndex={-1}
+                          ref={(element) => {
+                            if (element) domiSearchOptionRefs.current.set(optionKey, element);
+                            else domiSearchOptionRefs.current.delete(optionKey);
+                          }}
+                          onPointerEnter={() => setDomiSearchActiveKey(optionKey)}
+                          onClick={() => void openDomiDocumentSearchResult(document)}
+                          title={document.relativePath}
+                        >
+                          <strong>{document.name}</strong>
+                          <small className="domi-document-result-snippet">{document.snippet}</small>
+                          <small className="domi-document-result-path">
+                            {[document.kind === "pdf" ? "PDF" : "Markdown", document.line ? `第 ${document.line} 行` : "", document.relativePath]
+                              .filter(Boolean)
+                              .join(" · ")}
+                          </small>
+                        </button>
+                        <button
+                          type="button"
+                          className="domi-document-result-attach"
+                          onClick={() => attachDomiDocumentToComposer(document)}
+                          title="把这个文件作为附件加入当前对话的下一轮提问"
+                        >
+                          ＋加入提问
+                        </button>
+                      </div>
                     );
                   })}
                 </div>
@@ -12517,6 +12623,16 @@ function App() {
               {domiDocumentSearch.indexing && (
                 <div className="domi-search-indexing" role="status">
                   正在后台建立文档索引，当前结果会自动补充
+                </div>
+              )}
+              {!domiDocumentSearch.indexing && domiDocumentSearch.degraded && (
+                <div className="domi-search-indexing" role="status">
+                  资料库较大，两字以内的关键词仅搜索文件名；使用更长的关键词可同时搜索正文。
+                </div>
+              )}
+              {domiDocumentSearch.partial && (
+                <div className="domi-search-indexing" role="status">
+                  索引暂不完整（部分目录无法读取），结果可能缺少部分文档或包含已删除文件。
                 </div>
               )}
               {domiSearchResults.projects.length === 0
@@ -12560,6 +12676,18 @@ function App() {
           >
             <Newspaper className="sidebar-nav-icon" size={19} strokeWidth={1.9} />
             <strong>行业动态</strong>
+            <span className="sidebar-nav-meta" />
+          </button>
+          <button
+            className={`sidebar-nav-item ${workspaceView === "subscriptions" ? "active" : ""}`}
+            type="button"
+            onClick={() => {
+              void openPrimaryWorkspace("subscriptions");
+            }}
+            aria-label="订阅：X 大V、YouTube 频道与播客的每日同步和订阅日报"
+          >
+            <Radio className="sidebar-nav-icon" size={19} strokeWidth={1.9} />
+            <strong>订阅</strong>
             <span className="sidebar-nav-meta" />
           </button>
           <button
@@ -12869,10 +12997,7 @@ function App() {
               type="button"
               className="icon-button"
               onClick={() => void (workspaceView === "tasks"
-                ? Promise.all([
-                    refreshDomi(),
-                    ...(plaudEnabled ? [refreshPlaudQueue({ fresh: true })] : [])
-                  ])
+                ? refreshDomi()
                 : workspaceView === "news"
                   ? scanWeeklyNews()
                   : workspaceView === "data"
@@ -12886,7 +13011,7 @@ function App() {
                   ? databaseLoading || databaseSaving
                 : workspaceView === "documents"
                   ? documentLibraryLoading
-                : domiSyncing || (workspaceView === "tasks" && plaudEnabled && (plaudLoading || plaudSyncing))}
+                : domiSyncing}
               title={workspaceView === "tasks"
                 ? "刷新待办事项来源"
                 : workspaceView === "news"
@@ -12913,7 +13038,7 @@ function App() {
                     ? databaseLoading || databaseSaving ? "spinning" : ""
                   : workspaceView === "documents"
                     ? documentLibraryLoading ? "spinning" : ""
-                  : domiSyncing || (workspaceView === "tasks" && plaudEnabled && (plaudLoading || plaudSyncing)) ? "spinning" : ""}
+                  : domiSyncing ? "spinning" : ""}
                 size={18}
               />
             </button>
@@ -12931,11 +13056,11 @@ function App() {
           </div>
         </header>
 
-        <div
-          className={`main-grid ${rightPanelOpen ? "right-open" : "right-closed"} ${documentPanelActive ? "document-open" : ""} ${workspaceView === "tasks" ? "task-view" : workspaceView === "news" ? "news-view" : workspaceView === "data" ? "data-view" : workspaceView === "documents" ? "document-library-view" : ""}`}
+<div
+className={`main-grid ${rightPanelOpen ? "right-open" : "right-closed"} ${documentPanelActive ? "document-open" : ""} ${workspaceView === "tasks" ? "task-view" : workspaceView === "news" ? "news-view" : workspaceView === "subscriptions" ? "subscriptions-view" : workspaceView === "data" ? "data-view" : workspaceView === "documents" ? "document-library-view" : ""}`}
           style={{ "--right-panel-width": `${activeRightPanelWidth}px` } as CSSProperties}
         >
-          <section className={`chat-pane ${workspaceView === "tasks" ? "task-mode" : workspaceView === "news" ? "news-mode" : workspaceView === "data" ? "data-mode" : workspaceView === "documents" ? "document-library-mode" : hasConversation ? "has-conversation" : "is-home"}`}>
+          <section className={`chat-pane ${workspaceView === "tasks" ? "task-mode" : workspaceView === "news" ? "news-mode" : workspaceView === "subscriptions" ? "subscriptions-mode" : workspaceView === "data" ? "data-mode" : workspaceView === "documents" ? "document-library-mode" : hasConversation ? "has-conversation" : "is-home"}`}>
             <SectionErrorBoundary
               resetKey={`${workspaceView}:${activeThread.id}:${visibleMessages.length}:${visibleMessages[visibleMessages.length - 1]?.content.length || 0}:${weeklyNews?.syncedAt || 0}`}
               title="工作区暂时无法显示"
@@ -12946,11 +13071,13 @@ function App() {
                 ? renderTaskBoard()
                 : workspaceView === "news"
                   ? renderNewsWorkspace()
-                  : workspaceView === "data"
-                    ? renderDatabaseWorkspace()
-                  : workspaceView === "documents"
-                    ? renderDocumentLibrary()
-                    : hasConversation ? (
+                  : workspaceView === "subscriptions"
+                    ? renderSubscriptionsWorkspace()
+                    : workspaceView === "data"
+                      ? renderDatabaseWorkspace()
+                      : workspaceView === "documents"
+                        ? renderDocumentLibrary()
+                        : hasConversation ? (
               <>
                 <div
                   className="chat-scroll"
@@ -13044,6 +13171,22 @@ function App() {
                                 </div>
                               )
                             )}
+                            {message.sourceScope && <div className="message-source-mode">{SOURCE_SCOPE_LABELS[message.sourceScope]}{message.sourceScopeIsolated ? " · 来源隔离" : ""}</div>}
+{message.libraryUsage && (message.libraryUsage.readCount > 0 || message.libraryUsage.warnings.length > 0 || message.libraryUsage.sourceScope) && (
+                              <details className="message-library-usage">
+                                <summary>本轮资料：{message.libraryUsage.candidateCount} 篇候选，已提供 {message.libraryUsage.readCount} 份原文 · {message.libraryUsage.fullCount} 份全文</summary>
+                                <div className="message-library-sources">
+                                  {message.libraryUsage.sources.map((source) => (
+                                    <button key={source.sourceId} type="button" onClick={() => void openDocument(source.pages.length ? `${source.path}#page=${source.pages[0]}` : `${source.path}:${source.line}`)}>
+                                      <strong>{source.title}</strong>
+                                      <span>{[source.date, source.fullDocument ? "全文" : "部分原文", source.pages.length ? `第 ${source.pages.join("、")} 页` : source.fullDocument ? "" : source.sections.join("、")].filter(Boolean).join(" · ")}</span>
+                                    </button>
+                                  ))}
+                                  {message.libraryUsage.warnings.map((warning) => <p key={warning}>{warning}</p>)}
+                                  <small>记录的是实际提供给模型的原文范围；摘要及检索片段不计入全文阅读。</small>
+                                </div>
+                              </details>
+                            )}
                             {message.status === "running" ? (
                               <>
                                 {message.content && (
@@ -13119,7 +13262,7 @@ function App() {
 
           <aside className={`right-panel ${documentPanelActive ? "document-panel" : ""}`}>
             <SectionErrorBoundary
-              resetKey={`${documentPanelActive ? "document" : "context"}:${markdownDocument?.path || pdfDocument?.path || "none"}:${markdownDocument?.mtimeMs || pdfDocument?.mtimeMs || plaudSnapshot?.syncedAt || 0}`}
+              resetKey={`${documentPanelActive ? "document" : "context"}:${markdownDocument?.path || pdfDocument?.path || "none"}:${markdownDocument?.mtimeMs || pdfDocument?.mtimeMs || 0}`}
               title={documentPanelActive ? "文档栏暂时无法显示" : "今日工作暂时无法显示"}
               description="主任务没有受到影响，可以重试加载右侧内容。"
             >
@@ -13142,7 +13285,7 @@ function App() {
 
             <section className={`panel-section ${openSections.domi ? "open" : ""}`}>
               <button className="panel-title" type="button" onClick={() => toggleSection("domi")}>
-                <span><Mic size={17} />录音交流</span>
+                <span><Gauge size={17} />domi 状态</span>
                 {openSections.domi ? <ChevronDown size={17} /> : <ChevronRight size={17} />}
               </button>
               <div className="panel-content">
@@ -13157,211 +13300,6 @@ function App() {
                     >
                       {domiSyncing ? "重试中" : "重试"}
                     </button>
-                  </div>
-                )}
-                {plaudEnabled ? (
-                  <>
-                    {plaudError && (
-                      <div className="domi-inline-error actionable" role="status">
-                        <AlertCircle size={14} />
-                        <span>{plaudError}</span>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (plaudSnapshot?.remoteStatus === "auth_required") {
-                              setSettingsInitialTab("plaud");
-                              setSettingsOpen(true);
-                              return;
-                            }
-                            void refreshPlaudQueue({ fresh: true });
-                          }}
-                          disabled={plaudLoading || plaudLoadingMore || plaudSyncing}
-                        >
-                          {plaudSnapshot?.remoteStatus === "auth_required" ? "重新登录" : "重试"}
-                        </button>
-                      </div>
-                    )}
-                    {plaudNotice && <div className="plaud-inline-notice">{plaudNotice}</div>}
-                    <div className="plaud-queue-header">
-                      <strong>最近录音</strong>
-                      <span>
-                        <small>
-                          {plaudLoading
-                            ? "正在读取"
-                            : plaudSnapshot?.syncedAt
-                              ? new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" }).format(plaudSnapshot.syncedAt)
-                              : "按刷新读取"}
-                        </small>
-                        <button
-                          type="button"
-                          title="刷新 PLAUD 最近录音"
-                          aria-label="刷新 PLAUD 最近录音"
-                          disabled={plaudLoading || plaudLoadingMore || plaudSyncing}
-                          onClick={() => void refreshPlaudQueue({ fresh: true })}
-                        >
-                          <RefreshCw className={plaudLoading ? "spinning" : ""} size={13} />
-                        </button>
-                      </span>
-                    </div>
-                    <div
-                      className="plaud-queue-list"
-                      onScroll={(event) => {
-                        const list = event.currentTarget;
-                        if (
-                          list.scrollHeight - list.scrollTop - list.clientHeight < 72
-                          && plaudSnapshot?.hasMore
-                          && !plaudLoadingMore
-                        ) {
-                          void loadMorePlaudQueue();
-                        }
-                      }}
-                    >
-                      {plaudLoading && !plaudSnapshot && (
-                        <div className="empty-state">正在读取 PLAUD 最近录音</div>
-                      )}
-                      {!plaudLoading && plaudSnapshot?.ok && !(plaudSnapshot.items || []).length && (
-                        <div className="empty-state">PLAUD 中暂无录音</div>
-                      )}
-                      {(plaudSnapshot?.items || []).map((item) => {
-                    const editing = editingPlaudId === item.fileId;
-                    const renaming = renamingPlaudId === item.fileId;
-                    const launchingNotes = launchingPlaudIds.has(item.fileId);
-                    const notesThread = threads.find((thread) => thread.projectId === `plaud-${item.fileId}`);
-                    const notesRunning = launchingNotes || Boolean(
-                      notesThread && activeRunsByThread[notesThread.id]
-                    );
-                    const deleting = deletingPlaudId === item.fileId;
-                    const status = plaudItemStatus(item);
-                    const showNotesAction = canGeneratePlaudNotes(item);
-                    const notesComplete = ["managed", "notes_non_project"].includes(item.queueStage);
-                    return (
-                      <div className="plaud-queue-row" key={item.fileId}>
-                        <div className="plaud-title-line">
-                          {editing ? (
-                            <>
-                              <input
-                                value={plaudTitleDraft}
-                                maxLength={255}
-                                autoFocus
-                                disabled={renaming || deleting}
-                                aria-label="录音标题"
-                                onChange={(event) => setPlaudTitleDraft(event.target.value)}
-                                onKeyDown={(event) => {
-                                  if (event.key === "Enter") void savePlaudTitle(item);
-                                  if (event.key === "Escape") cancelPlaudRename();
-                                }}
-                              />
-                              <button
-                                className="plaud-title-action"
-                                type="button"
-                                title="保存标题"
-                                disabled={renaming || deleting}
-                                onClick={() => void savePlaudTitle(item)}
-                              >
-                                {renaming ? <RefreshCw className="spinning" size={13} /> : <Check size={13} />}
-                              </button>
-                              <button
-                                className="plaud-title-action"
-                                type="button"
-                                title="取消修改"
-                                disabled={renaming || deleting}
-                                onClick={cancelPlaudRename}
-                              >
-                                <X size={13} />
-                              </button>
-                            </>
-                          ) : (
-                            <button
-                              className="plaud-title-button"
-                              type="button"
-                              title="修改录音标题"
-                              disabled={plaudSyncing || Boolean(renamingPlaudId) || Boolean(deletingPlaudId)}
-                              onClick={() => beginPlaudRename(item)}
-                            >
-                              <span>{item.fileName}</span>
-                              <Pencil size={12} />
-                            </button>
-                          )}
-                        </div>
-                        <div className="plaud-queue-meta">
-                          <span>{formatPlaudDuration(item.duration)}</span>
-                          {showNotesAction ? (
-                            <button
-                              className="plaud-notes-action"
-                              type="button"
-                              title="使用 domi 插件生成纪要并完成符合条件的项目入库"
-                              disabled={notesRunning || plaudSyncing || plaudLoading || Boolean(deletingPlaudId)}
-                              onClick={() => void runPlaudNotesWorkflow(item)}
-                            >
-                              {notesRunning
-                                ? <RefreshCw className="spinning" size={12} />
-                                : <Sparkles size={12} />}
-                              <span>{launchingNotes ? "正在启动" : notesRunning ? "正在执行" : "生成纪要并入库"}</span>
-                            </button>
-                          ) : (
-                            <span className={`plaud-item-status ${notesComplete ? "complete" : ""} ${status === "未生成文字稿" || status === "需要重试" ? "attention" : ""}`}>
-                              {notesComplete && <CheckCircle2 size={12} />}
-                              {status}
-                            </span>
-                          )}
-                          {item.transcriptPath && (
-                            <button
-                              className="plaud-transcript-action"
-                              type="button"
-                              title="打开文字稿"
-                              disabled={Boolean(deletingPlaudId)}
-                              onClick={() => void openMarkdown(item.transcriptPath)}
-                            >
-                              <FileText size={12} />
-                            </button>
-                          )}
-                          <button
-                            className="plaud-delete-action"
-                            type="button"
-                            title="删除 PLAUD 录音"
-                            aria-label={`删除 PLAUD 录音“${item.fileName}”`}
-                            disabled={plaudSyncing || plaudLoading || Boolean(renamingPlaudId) || Boolean(deletingPlaudId) || launchingNotes}
-                            onClick={() => void deletePlaudRecording(item)}
-                          >
-                            {deleting
-                              ? <RefreshCw className="spinning" size={12} />
-                              : <Trash2 size={12} />}
-                          </button>
-                        </div>
-                      </div>
-                    );
-                      })}
-                      {plaudSnapshot?.ok && (plaudSnapshot.items || []).length > 0 && (
-                        <div className="plaud-pagination-status" role="status">
-                          {plaudLoadingMore
-                            ? <><RefreshCw className="spinning" size={12} />正在加载更早录音</>
-                            : plaudSnapshot.hasMore
-                              ? "继续下滑加载更早录音"
-                              : "已加载全部录音"}
-                        </div>
-                      )}
-                    </div>
-                    <button
-                      className="domi-run-button"
-                      type="button"
-                      onClick={() => void syncPlaudQueue()}
-                      disabled={plaudSyncing || plaudLoading || plaudLoadingMore || Boolean(renamingPlaudId) || Boolean(deletingPlaudId)}
-                    >
-                      <RefreshCw className={plaudSyncing || plaudLoading || plaudLoadingMore ? "spinning" : ""} size={14} />
-                      {plaudSyncing ? "正在同步并生成文字稿" : "同步 PLAUD 并生成文字稿"}
-                    </button>
-                  </>
-                ) : (
-                  <div className="plaud-disabled-card">
-                    <Mic size={17} />
-                    <span>
-                      <strong>PLAUD 未启用</strong>
-                      <small>domi 不会连接或读取录音，需要时可随时开启。</small>
-                    </span>
-                    <button type="button" onClick={() => {
-                      setSettingsInitialTab("plaud");
-                      setSettingsOpen(true);
-                    }}>去设置</button>
                   </div>
                 )}
                 <div className="domi-health-list">
@@ -13379,18 +13317,6 @@ function App() {
                       ? domiSnapshot.backend === "local" ? "本地已同步" : "已同步"
                       : "未连接"}</strong>
                   </div>
-                  {plaudEnabled && (
-                    <div>
-                      <span>PLAUD 队列</span>
-                      <strong>
-                        {plaudSnapshot?.ok
-                          ? plaudQueueSummary(plaudSnapshot)
-                          : domiSnapshot?.health.plaud.ok
-                            ? `${domiSnapshot.health.plaud.queueCount} 个待恢复`
-                            : "未就绪"}
-                      </strong>
-                    </div>
-                  )}
                 </div>
               </div>
             </section>
@@ -13475,7 +13401,6 @@ function App() {
           open
           onClose={() => setRadarSourceManagerOpen(false)}
           onSnapshot={setRadarSourceSnapshot}
-          onPodcastTranscript={archivePodcastTranscript}
         />
       </Suspense>
     )}

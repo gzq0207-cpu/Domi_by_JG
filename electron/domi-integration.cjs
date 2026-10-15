@@ -1056,6 +1056,23 @@ function larkCliNotConfiguredMessage() {
   return "这台 Mac 尚未完成首次飞书连接。点击“连接飞书”后，domi 会在浏览器初始化专属飞书应用；应用凭据只保存在 macOS 钥匙串，不会写入安装包、GitHub 或诊断报告。Base Token、Table ID 和 Wiki Space ID 均不需要手工填写。";
 }
 
+// lark-cli >= the per-identity era reports auth status per identity. The user
+// identity is the one domi actually runs on (base/wiki/inbox); the bot
+// identity alone can answer "verified" while the user token is gone from the
+// keychain. A missing identity is always reported explicitly (available:false
+// / status:"missing"), so only explicit negative signals count — outputs from
+// older CLI builds that carry just userName/tokenStatus stay "ready".
+function larkUserIdentityReady(auth) {
+  const identities = auth?.identities;
+  if (!identities || typeof identities !== "object") return true;
+  const user = identities.user;
+  if (!user || typeof user !== "object") return true;
+  if (user.available === false) return false;
+  if (user.status && user.status !== "ready") return false;
+  if (user.verified === false) return false;
+  return true;
+}
+
 function feishuConfigurationVerificationUrl(value) {
   const text = String(value || "");
   const match = text.match(/https:\/\/[^\s\u001b"'<>\\]+/i);
@@ -1166,6 +1183,19 @@ class DomiIntegration {
     this.configProvider = configProvider || (() => ({}));
     this.sleep = sleep || ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
     this.execFileFactory = execFileFactory || execFile;
+    // 与 promisify(execFile) 语义一致（成功返回 { stdout, stderr }，
+    // 失败携带 error.stdout / error.stderr），但允许测试注入执行器。
+    this.execFilePromise = (command, args, options) => new Promise((resolve, reject) => {
+      this.execFileFactory(command, args, options, (error, stdout, stderr) => {
+        if (error) {
+          if (error.stdout === undefined) error.stdout = stdout;
+          if (error.stderr === undefined) error.stderr = stderr;
+          reject(error);
+        } else {
+          resolve({ stdout, stderr });
+        }
+      });
+    });
     this.larkCli = this.resolveLarkCli();
     this.materialIndexCache = new Map();
     this.databaseMaterializationQueues = new Map();
@@ -1435,7 +1465,13 @@ class DomiIntegration {
       path.join(os.homedir(), ".npm-global", "bin", "lark-cli"),
       "/opt/homebrew/bin/lark-cli",
       "/usr/local/bin/lark-cli",
-      executableFromPath("lark-cli")
+      executableFromPath("lark-cli"),
+      ...(process.platform === "win32" ? [
+        // Windows：npm 全局目录的原生可执行文件与 PATH 中的 lark-cli.exe。
+        path.join(process.env.APPDATA || "", "npm", "lark-cli.exe"),
+        path.join(os.homedir(), ".local", "bin", "lark-cli.exe"),
+        executableFromPath("lark-cli.exe")
+      ] : [])
     ].filter(Boolean);
     for (const candidate of candidates) {
       const executable = resolveLarkCliExecutable(candidate);
@@ -1602,9 +1638,9 @@ class DomiIntegration {
             ...(options.env || {})
           }
         };
-        ({ stdout } = options.queue === "plaud"
-          ? await this.execTrackedPlaudFile(binary, args, commandOptions)
-          : await execFileAsync(binary, args, commandOptions));
+      ({ stdout } = options.queue === "plaud"
+        ? await this.execTrackedPlaudFile(binary, args, commandOptions)
+        : await this.execFilePromise(binary, args, commandOptions));
       } catch (error) {
         throw new Error(commandErrorMessage(error, binary, options));
       }
@@ -2455,7 +2491,12 @@ class DomiIntegration {
           )
         );
         result = {
-          ok: Boolean(auth?.verified),
+          // lark-cli's top-level "verified" reflects the BOT identity. Every
+          // domi workload (base reads, wiki sync, inbox polling, replies)
+          // runs as the USER identity, so a missing user token must surface
+          // as disconnected here — otherwise the setup page keeps showing
+          // "已连接" while all user APIs fail with 230027 for days.
+          ok: Boolean(auth?.verified) && larkUserIdentityReady(auth),
           cliPath: this.larkCli,
           userName: auth?.identities?.user?.userName || "",
           appName: auth?.identities?.bot?.appName || "",

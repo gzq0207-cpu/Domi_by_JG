@@ -109,7 +109,10 @@ test("project research cache reuses unchanged local evidence and invalidates cha
       workspacePath: projectRoot
     });
     assert.equal(sameThread.cacheHit, false);
-    assert.equal(sameThread.context, "");
+    // Same-thread turns now re-inject a compact backup instead of nothing:
+    // Codex may compress earlier turns out of the model context.
+    assert.match(sameThread.context, /精简备份/);
+    assert.ok(sameThread.context.length <= 600);
 
     const resumedAsNewThread = preparedProjectResearchCacheContext(sameThread, "thread-recovered");
     assert.equal(resumedAsNewThread.cacheHit, true);
@@ -132,12 +135,12 @@ test("project research cache reuses unchanged local evidence and invalidates cha
 test("truncated inventories never produce a cache hit", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-research-cache-large-"));
   try {
-    for (let index = 0; index < 501; index += 1) {
-      fs.writeFileSync(path.join(root, `${String(index).padStart(3, "0")}.md`), `${index}`, "utf8");
+    for (let index = 0; index < 2001; index += 1) {
+      fs.writeFileSync(path.join(root, `${String(index).padStart(4, "0")}.md`), `${index}`, "utf8");
     }
     const inventory = await projectInventory(root);
     assert.equal(inventory.truncated, true);
-    assert.equal(inventory.files.length, 500);
+    assert.equal(inventory.files.length, 2000);
     const stateStore = memoryStateStore();
     stateStore.saveCache(`${CACHE_PREFIX}local-test:project-large`, {
       version: 1,
@@ -170,7 +173,7 @@ test("truncated inventories never produce a cache hit", async () => {
 test("project inventory stops on oversized directory trees", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-research-cache-directories-"));
   try {
-    for (let index = 0; index < 220; index += 1) {
+    for (let index = 0; index < 501; index += 1) {
       fs.mkdirSync(path.join(root, `directory-${String(index).padStart(3, "0")}`));
     }
     const inventory = await projectInventory(root);
@@ -193,13 +196,13 @@ test("project inventory enforces a real I/O deadline", async () => {
     const inventory = await Promise.race([
       projectInventory(root),
       new Promise((_, reject) => {
-        watchdog = setTimeout(() => reject(new Error("project inventory missed its deadline")), 1_500);
+        watchdog = setTimeout(() => reject(new Error("project inventory missed its deadline")), 2_200);
       })
     ]);
     const elapsedMs = Date.now() - startedAt;
     assert.equal(inventory.truncated, true);
     assert.equal(inventory.verifiable, false);
-    assert.ok(elapsedMs < 800, `inventory took ${elapsedMs}ms`);
+    assert.ok(elapsedMs < 1_400, `inventory took ${elapsedMs}ms`);
   } finally {
     clearTimeout(watchdog);
     fs.promises.readdir = originalReaddir;
@@ -219,7 +222,7 @@ test("project inventory marks read failures and symbolic links unverifiable", as
   fs.mkdirSync(outsideRoot);
   const failedFile = path.join(statFailureRoot, "material.md");
   fs.writeFileSync(failedFile, "material", "utf8");
-  fs.symlinkSync(outsideRoot, path.join(linkedRoot, "external-materials"), "dir");
+  fs.symlinkSync(outsideRoot, path.join(linkedRoot, "external-materials"), process.platform === "win32" ? "junction" : "dir");
   const originalReaddir = fs.promises.readdir;
   const originalStat = fs.promises.stat;
   try {
@@ -379,6 +382,11 @@ test("concurrent cache updates cannot let a stale completion overwrite the winne
     assert.equal(olderResult.reason, "cache-generation-changed");
     const stored = stateStore.values.get(olderPreparation.identity.key);
     assert.match(stored.summary, /NEWER RESULT WINS/);
+    // The losing completion is merged, not dropped: both excerpts survive.
+    assert.equal(olderResult.merged, true);
+    const excerptTexts = stored.researchExcerpts.map((excerpt) => excerpt.text || excerpt);
+    assert.ok(excerptTexts.some((text) => String(text).includes("OLDER RESULT")));
+    assert.ok(excerptTexts.some((text) => String(text).includes("NEWER RESULT")));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -462,4 +470,100 @@ test("research cache ignores non-project and non-research workflows", async () =
   });
   assert.equal(result.identity, null);
   assert.equal(result.context, "");
+});
+
+test("domi-analyst project turns refresh the research snapshot", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-research-cache-analyst-"));
+  const stateStore = memoryStateStore();
+  try {
+    fs.writeFileSync(path.join(root, "项目主页.md"), "# 项目", "utf8");
+    const preparation = await prepareProjectResearchCache({
+      stateStore,
+      payload: {
+        workflowId: "domi-analyst",
+        externalType: "project",
+        externalRecordId: "project-example",
+        cacheNamespace: "local-test"
+      },
+      workspacePath: root
+    });
+    assert.equal(preparation.identity.writeEligible, true);
+    const result = await updateProjectResearchCache({
+      stateStore,
+      preparation,
+      output: "本轮问答沉淀的关键判断：项目处于早期但方向明确。",
+      workspacePath: root
+    });
+    assert.equal(result.updated, true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("person records keep their own research cache slot", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-research-cache-person-"));
+  const personRoot = path.join(root, "4.人脉库", "张三");
+  fs.mkdirSync(personRoot, { recursive: true });
+  fs.writeFileSync(path.join(personRoot, "人物主页.md"), "# 张三", "utf8");
+  const stateStore = memoryStateStore();
+  const payload = {
+    workflowId: "desk-research",
+    externalType: "person",
+    externalRecordId: "person-zhang",
+    cacheNamespace: "local-test",
+    threadId: "thread-a"
+  };
+  try {
+    const prepared = await prepareProjectResearchCache({ stateStore, payload, workspacePath: personRoot });
+    assert.equal(prepared.identity.key, "research-cache-v1:person:local-test:person-zhang");
+    const update = await updateProjectResearchCache({
+      stateStore,
+      preparation: prepared,
+      output: "张三近期从原公司离职并正在筹备新基金，值得保持季度联系。",
+      workspacePath: personRoot,
+      sourceThreadId: "thread-a"
+    });
+    assert.equal(update.updated, true);
+    const warm = await prepareProjectResearchCache({
+      stateStore,
+      payload: { ...payload, threadId: "thread-b" },
+      workspacePath: personRoot
+    });
+    assert.equal(warm.cacheHit, true);
+    assert.match(warm.context, /张三近期从原公司离职/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("excerpts skip table rows and carry thread metadata", async () => {
+  const stateStore = memoryStateStore();
+  const preparation = await prepareProjectResearchCache({
+    stateStore,
+    payload: {
+      workflowId: "desk-research",
+      externalType: "project",
+      externalRecordId: "project-example",
+      cacheNamespace: "local-test"
+    },
+    workspacePath: ""
+  });
+  await updateProjectResearchCache({
+    stateStore,
+    preparation,
+    output: [
+      "| 指标 | 数值 |",
+      "| 营收 | 100 |",
+      "正常事实行：公司主体已经完成变更登记。",
+      "storage_receipt: 必须被剔除的收发行"
+    ].join("\n"),
+    sourceThreadId: "thread-x"
+  });
+  const stored = stateStore.values.get(preparation.identity.key);
+  const texts = stored.researchExcerpts.map((excerpt) => excerpt.text);
+  assert.equal(texts.some((text) => text.startsWith("|")), false, "table rows are dropped");
+  assert.equal(texts.some((text) => text.includes("storage_receipt")), false);
+  assert.ok(texts.some((text) => text.includes("变更登记")));
+  assert.ok(stored.researchExcerpts.every((excerpt) => excerpt.threadId === "thread-x"));
+  assert.ok(stored.researchExcerpts.every((excerpt) => Number(excerpt.capturedAt) > 0));
 });

@@ -9,6 +9,16 @@ const specificationPath = path.join(root, "resources", "media-runtime.json");
 const SUPPORTED_TARGET_ARCHITECTURES = new Set(["arm64", "x64"]);
 const REQUIRED_DEPLOYMENT_TARGET = "12.0";
 
+function curlBinary() {
+  // Windows 10+ 在 System32 自带 curl.exe；macOS 使用绝对路径。
+  return process.platform === "win32" ? "curl" : "/usr/bin/curl";
+}
+
+function tarBinary() {
+  // Windows 10+ 的 System32 tar.exe 是 bsdtar，同时支持 tar 与 zip。
+  return process.platform === "win32" ? "tar" : "/usr/bin/tar";
+}
+
 function resolveTargetArchitecture(value = process.env.DOMI_TARGET_ARCH || process.arch) {
   const targetArch = String(value || process.arch).trim().toLowerCase();
   if (!SUPPORTED_TARGET_ARCHITECTURES.has(targetArch)) {
@@ -118,7 +128,7 @@ function archiveMatches(filePath, specification) {
 }
 
 function download(url, destination) {
-  execFileSync("/usr/bin/curl", [
+  execFileSync(curlBinary(), [
     "--fail",
     "--location",
     "--show-error",
@@ -358,7 +368,127 @@ function copyLicenseFiles(specification, archivePath, destination) {
   }
 }
 
+function windowsRuntimeUrl(targetArch) {
+  return targetArch === "arm64"
+    ? "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-winarm64-lgpl.zip"
+    : "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip";
+}
+
+function validateWindowsBinary(binaryPath, name) {
+  if (!fs.existsSync(binaryPath)) throw new Error(`Prepared ${name} binary is missing.`);
+  const output = execFileSync(binaryPath, ["-version"], {
+    encoding: "utf8",
+    timeout: 30_000,
+    windowsHide: true
+  });
+  if (
+    !output.startsWith(`${name} version`)
+    || /--enable-(?:gpl|nonfree)\b/.test(output)
+  ) {
+    throw new Error(`Prepared ${name} binary failed the LGPL runtime policy check.`);
+  }
+  const stat = fs.statSync(binaryPath);
+  // BtbN 的 win64 LGPL 构建是静态链接的单文件可执行（>100MB）。
+  if (stat.size < 500_000 || stat.size > 300 * 1024 * 1024) {
+    throw new Error(`Prepared ${name} binary size is outside the expected range.`);
+  }
+  return {
+    name,
+    sha256: sha256File(binaryPath),
+    size: stat.size
+  };
+}
+
+function removeTreeBestEffort(target) {
+  // Windows 上 Defender 可能短暂锁定刚运行过的 exe；rmSync 的
+  // maxRetries 会针对 EBUSY/EPERM 自动重试，最终失败也不阻断安装。
+  try {
+    fs.rmSync(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (error) {
+    console.warn(`Warning: could not fully remove ${target}: ${error.message}`);
+  }
+}
+
+function prepareWindowsRuntime() {
+  const targetArch = resolveTargetArchitecture();
+  const url = windowsRuntimeUrl(targetArch);
+  const outputRoot = outputRootForArchitecture(targetArch);
+  const cacheRoot = process.env.DOMI_MEDIA_RUNTIME_CACHE
+    ? path.resolve(process.env.DOMI_MEDIA_RUNTIME_CACHE)
+    : path.join(process.env.LOCALAPPDATA || os.homedir(), "domi", "cache", "media-runtime");
+  fs.mkdirSync(cacheRoot, { recursive: true });
+  const archivePath = path.join(cacheRoot, path.basename(new URL(url).pathname));
+  if (!fs.existsSync(archivePath)) {
+    const temporaryPath = `${archivePath}.download-${process.pid}`;
+    fs.rmSync(temporaryPath, { force: true });
+    try {
+      download(url, temporaryPath);
+      fs.renameSync(temporaryPath, archivePath);
+    } finally {
+      fs.rmSync(temporaryPath, { force: true });
+    }
+  }
+
+  const stagingRoot = fs.mkdtempSync(path.join(os.tmpdir(), "domi-media-runtime-win-"));
+  try {
+    execFileSync(tarBinary(), ["-xf", archivePath, "-C", stagingRoot], {
+      stdio: "inherit",
+      timeout: 5 * 60_000
+    });
+    const candidates = [
+      path.join(stagingRoot, "bin"),
+      ...fs.readdirSync(stagingRoot, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => path.join(stagingRoot, entry.name, "bin"))
+    ];
+    const sourceBin = candidates.find((directory) =>
+      fs.existsSync(path.join(directory, "ffmpeg.exe"))
+      && fs.existsSync(path.join(directory, "ffprobe.exe"))
+    );
+    if (!sourceBin) {
+      throw new Error("FFmpeg Windows 构建缺少 ffmpeg.exe 或 ffprobe.exe。");
+    }
+
+    validateWindowsBinary(path.join(sourceBin, "ffmpeg.exe"), "ffmpeg");
+    validateWindowsBinary(path.join(sourceBin, "ffprobe.exe"), "ffprobe");
+
+    fs.rmSync(outputRoot, { recursive: true, force: true });
+    const binDirectory = path.join(outputRoot, "bin");
+    fs.mkdirSync(binDirectory, { recursive: true });
+    // LGPL 共享构建需要连同目录中的 DLL 一起分发。
+    for (const entry of fs.readdirSync(sourceBin)) {
+      fs.copyFileSync(path.join(sourceBin, entry), path.join(binDirectory, entry));
+    }
+    const manifest = {
+      schemaVersion: 1,
+      name: "FFmpeg",
+      targetPlatform: "win32",
+      targetArch,
+      license: "LGPL-2.1-or-later",
+      sourceUrl: url,
+      binaries: [
+        validateWindowsBinary(path.join(binDirectory, "ffmpeg.exe"), "ffmpeg"),
+        validateWindowsBinary(path.join(binDirectory, "ffprobe.exe"), "ffprobe")
+      ]
+    };
+    fs.writeFileSync(
+      path.join(outputRoot, "manifest.json"),
+      `${JSON.stringify(manifest, null, 2)}\n`,
+      "utf8"
+    );
+    console.log(
+      `Prepared LGPL FFmpeg runtime for win32-${targetArch} from ${url}.`
+    );
+  } finally {
+    removeTreeBestEffort(stagingRoot);
+  }
+}
+
 function main() {
+  if (process.platform === "win32") {
+    prepareWindowsRuntime();
+    return;
+  }
   if (process.platform !== "darwin") {
     throw new Error("The domi media runtime can only be prepared on macOS.");
   }
@@ -429,8 +559,10 @@ module.exports = {
   inspectMacOSMinimumVersion,
   inspectMachOArchitectures,
   outputRootForArchitecture,
+  prepareWindowsRuntime,
   resolveTargetArchitecture,
   sha256File,
   validateBinary,
-  validateSpecification
+  validateSpecification,
+  windowsRuntimeUrl
 };

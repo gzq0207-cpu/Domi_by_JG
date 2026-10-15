@@ -65,11 +65,34 @@ function pathIsWithin(rootPath, candidatePath, { allowRoot = true } = {}) {
     && ((allowRoot && candidate === root) || candidate.startsWith(`${root}${path.sep}`));
 }
 
+// Trusted entity workspace roots under the local repository. The chain layout
+// spreads projects across the numbered segment directories, so every segment
+// root plus the people root is trusted. The repository root itself stays
+// untrusted (task workspaces must never be created at the library root).
+const CHAIN_SEGMENT_DIRECTORIES = Object.freeze([
+  "01.能源与电力",
+  "02.数据中心基础设施",
+  "03.算力芯片",
+  "04.服务器与整机制造",
+  "05.互联与网络",
+  "06.云与算力服务",
+  "07.模型层",
+  "08.基础软件与工具链",
+  "09.Agent与平台",
+  "10.应用",
+  "11.终端与具身",
+  "_其他行业"
+]);
+
 function entityWorkspaceRoots(settings = {}) {
   if (settings.storageBackend !== "local" || !settings.localRepositoryDir) return [];
   const repositoryRootRaw = path.resolve(expandUserPath(settings.localRepositoryDir));
   if (!existingDirectoryRealPath(repositoryRootRaw)) return [];
   return [
+    // Chain layout (current).
+    ...CHAIN_SEGMENT_DIRECTORIES.map((directory) => path.join(repositoryRootRaw, directory)),
+    path.join(repositoryRootRaw, "12.人脉"),
+    // Pre-chain layout (kept until the library migration relocates them).
     path.join(repositoryRootRaw, "3.项目库"),
     path.join(repositoryRootRaw, "4.人脉库")
   ].filter((candidate) => stableDescendantRealPath(repositoryRootRaw, candidate, { allowRoot: false }))
@@ -100,7 +123,8 @@ function projectResearchCacheScope({
   settings,
   resolveEntityWorkspace
 }) {
-  if (payload?.externalType !== "project" || !payload?.externalRecordId) {
+  const entityType = String(payload?.externalType || "");
+  if ((entityType !== "project" && entityType !== "person") || !payload?.externalRecordId) {
     return { allowed: true, workspacePath: "" };
   }
   if (settings?.storageBackend !== "local") {
@@ -108,12 +132,19 @@ function projectResearchCacheScope({
   }
   try {
     const canonicalCandidate = resolveEntityWorkspace({
-      entityType: "project",
+      entityType,
       recordId: payload.externalRecordId
     });
-    const projectRoot = entityWorkspaceRoots(settings)[0] || "";
-    const canonical = stableDescendantRealPath(projectRoot, canonicalCandidate, { allowRoot: false });
-    const requested = stableDescendantRealPath(projectRoot, workspacePath, { allowRoot: false });
+    // Both entity libraries (3.项目库 / 4.人脉库) are trusted roots; the
+    // canonical directory must live inside one of them and the requested
+    // workspace must be exactly that directory.
+    const roots = entityWorkspaceRoots(settings);
+    const canonical = roots
+      .map((root) => stableDescendantRealPath(root, canonicalCandidate, { allowRoot: false }))
+      .find(Boolean);
+    const requested = roots
+      .map((root) => stableDescendantRealPath(root, workspacePath, { allowRoot: false }))
+      .find(Boolean);
     return {
       allowed: Boolean(canonical && requested && canonical === requested),
       workspacePath: canonical && canonical === requested ? canonical : ""

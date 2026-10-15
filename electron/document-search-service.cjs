@@ -5,15 +5,37 @@ class DocumentSearchService {
   constructor(options) {
     this.databasePath = options.databasePath;
     this.workerPath = options.workerPath || path.join(__dirname, "document-search-worker.cjs");
+    this.cloudContentAllowed = options.cloudContentAllowed || (() => false);
+    this.semanticEnabled = options.semanticEnabled || (() => false);
+    this.semanticCacheDir = options.semanticCacheDir || "";
     this.worker = null;
     this.sequence = 0;
     this.pending = new Map();
   }
 
+  cloudContentFlag() {
+    try {
+      return this.cloudContentAllowed() === true;
+    } catch {
+      return false;
+    }
+  }
+
+  semanticEnabledFlag() {
+    try {
+      return this.semanticEnabled() === true;
+    } catch {
+      return false;
+    }
+  }
+
   ensureWorker() {
     if (this.worker) return this.worker;
     const worker = new Worker(this.workerPath, {
-      workerData: { databasePath: this.databasePath }
+      workerData: {
+        databasePath: this.databasePath,
+        semanticCacheDir: this.semanticCacheDir
+      }
     });
     worker.on("message", (message) => {
       if (message?.type !== "response") return;
@@ -27,7 +49,7 @@ class DocumentSearchService {
       if (this.worker === worker) this.worker = null;
       for (const pending of this.pending.values()) {
         clearTimeout(pending.timeout);
-        pending.resolve({ ok: false, results: [], error: error.message || String(error) });
+        pending.resolve({ ok: false, results: [], degraded: false, error: error.message || String(error) });
       }
       this.pending.clear();
     };
@@ -40,28 +62,76 @@ class DocumentSearchService {
     return worker;
   }
 
+  postToWorker(message) {
+    this.ensureWorker().postMessage({
+      ...message,
+      cloudContentAllowed: this.cloudContentFlag(),
+      semanticEnabled: this.semanticEnabledFlag()
+    });
+  }
+
   scheduleIndex(rootPath, force = false) {
     if (!rootPath) return;
-    this.ensureWorker().postMessage({ type: "index", rootPath, force });
+    this.postToWorker({ type: "index", rootPath, force });
   }
 
   updateFile(rootPath, filePath) {
     if (!rootPath || !filePath) return;
-    this.ensureWorker().postMessage({ type: "index-file", rootPath, filePath });
+    this.postToWorker({ type: "index-file", rootPath, filePath });
   }
 
   search(rootPath, request) {
     if (!rootPath || !String(request?.query || "").trim()) {
-      return Promise.resolve({ ok: true, results: [], indexing: false, indexedCount: 0, lastIndexedAt: 0 });
+      return Promise.resolve({
+        ok: true,
+        results: [],
+        degraded: false,
+        indexing: false,
+        indexedCount: 0,
+        lastIndexedAt: 0
+      });
     }
     const id = ++this.sequence;
     return new Promise((resolve) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
-        resolve({ ok: false, results: [], error: "文档搜索暂时繁忙，请稍后重试。" });
+        resolve({
+          ok: false,
+          results: [],
+          degraded: false,
+          error: "文档搜索暂时繁忙，请稍后重试。"
+        });
       }, 3_000);
       this.pending.set(id, { resolve, timeout });
-      this.ensureWorker().postMessage({ type: "search", id, rootPath, request });
+      this.postToWorker({
+        type: "search",
+        id,
+        rootPath,
+        request
+      });
+    });
+  }
+
+  // Semantic retrieval may include a model inference (or a cold model load
+  // retry); it runs in the run-startup path in parallel with other context
+  // preparation, so it gets a longer, still-bounded timeout.
+  semanticSearch(rootPath, request) {
+    if (!rootPath || !String(request?.query || "").trim() || !this.semanticEnabledFlag()) {
+      return Promise.resolve({ ok: true, available: false, results: [], degraded: false });
+    }
+    const id = ++this.sequence;
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        this.pending.delete(id);
+        resolve({ ok: false, available: false, results: [], degraded: false });
+      }, 15_000);
+      this.pending.set(id, { resolve, timeout });
+      this.postToWorker({
+        type: "semantic-search",
+        id,
+        rootPath,
+        request
+      });
     });
   }
 

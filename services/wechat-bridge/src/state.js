@@ -2,9 +2,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+function defaultStateDir() {
+  if (process.platform === "win32" && process.env.APPDATA) {
+    return path.join(process.env.APPDATA, "domi", "wechat-bridge");
+  }
+  return path.join(os.homedir(), "Library", "Application Support", "domi", "wechat-bridge");
+}
+
 export const STATE_DIR = path.resolve(
   process.env.CODEX_WECHAT_STATE_DIR
-    || path.join(os.homedir(), "Library", "Application Support", "domi", "wechat-bridge"),
+    || defaultStateDir(),
 );
 export const CREDENTIALS_PATH = path.join(STATE_DIR, "credentials.json");
 export const SESSIONS_PATH = path.join(STATE_DIR, "sessions.json");

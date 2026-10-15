@@ -5,7 +5,12 @@ const path = require("node:path");
 
 const RADAR_SOURCES_SETTINGS_KEY = "radar-sources-v1";
 const PODCAST_JOBS_CACHE_KEY = "radar-podcast-jobs-v1";
-const SOURCE_KINDS = new Set(["news", "wechat", "podcast"]);
+const TWITTER_ITEMS_CACHE_KEY = "radar-twitter-items-v1";
+const TWITTER_BEARER_SECRET_KEY = "radar.twitter.bearer.v1";
+const TWITTER_API_BASE = "https://api.twitter.com/2";
+const TWITTER_MAX_ITEMS_PER_SOURCE = 30;
+const TWITTER_MAX_ITEMS_TOTAL = 500;
+const SOURCE_KINDS = new Set(["news", "wechat", "podcast", "youtube_channel", "twitter"]);
 const PODCAST_JOB_STATES = new Set([
   "discovered",
   "downloading",
@@ -572,12 +577,19 @@ function sourceId() {
 
 function normalizeSource(input, previous = null, now = Date.now()) {
   const kind = SOURCE_KINDS.has(input?.kind) ? input.kind : previous?.kind;
-  if (!SOURCE_KINDS.has(kind)) throw new Error("信源类型必须是新闻源、重点公众号或播客源。");
+  if (!SOURCE_KINDS.has(kind)) throw new Error("信源类型必须是新闻源、重点公众号、播客源、YouTube 频道或 X 大V。");
   const name = String(input?.name ?? previous?.name ?? "").trim().slice(0, 120);
   if (!name) throw new Error("请填写信源名称。");
   const rawUrl = input?.url ?? previous?.url ?? "";
   const url = normalizePublicUrl(rawUrl, { optional: kind === "wechat" });
   if (kind !== "wechat" && !url) throw new Error("请填写公开信源链接。");
+  if (kind === "youtube_channel" && !youTubeChannelDescriptor(url)) {
+    throw new Error("YouTube 频道链接需形如 youtube.com/@频道、/channel/UC…、/c/… 或播放列表链接。");
+  }
+  if (kind === "twitter" && !twitterHandleFromUrl(url)) {
+    throw new Error("X 大V链接需形如 https://x.com/用户名。");
+  }
+  const autoProcessKind = kind === "podcast" || kind === "youtube_channel";
   return {
     id: String(previous?.id || input?.id || sourceId()),
     kind,
@@ -588,7 +600,7 @@ function normalizeSource(input, previous = null, now = Date.now()) {
       ? (previous?.priority === "important" ? "important" : "normal")
       : (input.priority === "important" ? "important" : "normal"),
     keywords: normalizeStringList(input?.keywords ?? previous?.keywords),
-    autoProcess: kind === "podcast" && (input?.autoProcess === true || (input?.autoProcess === undefined && previous?.autoProcess === true)),
+    autoProcess: autoProcessKind && (input?.autoProcess === true || (input?.autoProcess === undefined && previous?.autoProcess === true)),
     createdAt: Number(previous?.createdAt) || now,
     updatedAt: now,
     lastCheckedAt: Number(previous?.lastCheckedAt) || 0,
@@ -625,6 +637,29 @@ function jobIdFor(sourceIdValue, episode) {
     .update(`${sourceIdValue}\u0000${episode.episodeUrl || ""}\u0000${episode.mediaUrl}`)
     .digest("hex")
     .slice(0, 32);
+}
+
+function twitterItemIdFor(sourceIdValue, tweetId) {
+  return crypto.createHash("sha256")
+    .update(`${sourceIdValue}\u0000${tweetId}`)
+    .digest("hex")
+    .slice(0, 32);
+}
+
+function normalizeTwitterItem(item) {
+  if (!item || !item.id || !item.sourceId || !item.tweetId) return null;
+  return {
+    id: String(item.id),
+    sourceId: String(item.sourceId),
+    handle: String(item.handle || ""),
+    authorName: String(item.authorName || "").slice(0, 120),
+    tweetId: String(item.tweetId),
+    text: String(item.text || "").slice(0, 2000),
+    url: String(item.url || ""),
+    createdAt: Number(item.createdAt) || null,
+    discoveredAt: Number(item.discoveredAt) || null,
+    updatedAt: Number(item.updatedAt) || Date.now()
+  };
 }
 
 async function readResponseLimited(response, maxBytes) {
@@ -718,13 +753,343 @@ function mediaExtension(mediaUrl, contentType) {
   })[type] || ".m4a";
 }
 
+const YOUTUBE_HOSTS = new Set([
+  "youtube.com",
+  "www.youtube.com",
+  "m.youtube.com",
+  "music.youtube.com",
+  "youtu.be",
+  "www.youtu.be"
+]);
+const YOUTUBE_VIDEO_ID_PATTERN = /^[A-Za-z0-9_-]{11}$/;
+const YOUTUBE_AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio[ext=opus]/bestaudio[ext=webm]/bestaudio";
+const YOUTUBE_RESOLVE_TIMEOUT_MS = 90_000;
+const YOUTUBE_DOWNLOAD_TIMEOUT_MS = 30 * 60_000;
+const YOUTUBE_MAX_DURATION_SECONDS = 6 * 60 * 60;
+const YOUTUBE_ALLOWED_AVAILABILITY = new Set(["public", "unlisted"]);
+const YOUTUBE_TWITTER_HOSTS = new Set(["x.com", "www.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"]);
+const TWITTER_RESERVED_PATHS = new Set([
+  "intent", "i", "home", "explore", "search", "notifications",
+  "messages", "settings", "compose", "post", "login", "signup", "hashtag"
+]);
+const YOUTUBE_BLOCKING_LIVE_STATUS = new Set(["is_live", "is_upcoming", "post_live"]);
+
+function youTubeVideoIdFromUrl(value) {
+  let url;
+  try {
+    url = new URL(String(value || ""));
+  } catch {
+    return "";
+  }
+  if (url.protocol !== "https:" || !YOUTUBE_HOSTS.has(url.hostname.toLowerCase())) return "";
+  const pathname = url.pathname.replace(/\/+$/, "");
+  let videoId = "";
+  if (url.hostname.toLowerCase().endsWith("youtu.be")) {
+    videoId = pathname.split("/").pop() || "";
+  } else if (/^\/watch$/.test(pathname)) {
+    videoId = url.searchParams.get("v") || "";
+  } else {
+    const match = /^\/(?:shorts|live|embed|v)\/([A-Za-z0-9_-]+)/.exec(pathname);
+    videoId = match ? match[1] : "";
+  }
+  return YOUTUBE_VIDEO_ID_PATTERN.test(videoId) ? videoId : "";
+}
+
+function youTubeCanonicalUrl(videoId) {
+  return `https://www.youtube.com/watch?v=${videoId}`;
+}
+
+// YouTube channel/playlist sources: instead of one episode URL, the user drops
+// a channel handle, channel id, custom name, legacy user name or playlist URL.
+// Discovery reads the channel's public Atom feed (no login, no cookies) and
+// turns each new entry into a regular podcast job that downloads via yt-dlp.
+function youTubeChannelDescriptor(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(String(rawUrl || ""));
+  } catch {
+    return null;
+  }
+  if (!YOUTUBE_HOSTS.has(parsed.hostname.toLowerCase())) return null;
+  const playlist = parsed.searchParams.get("list");
+  if (playlist && /^(PL|OL|UU|FL|RD)[\w-]{10,}$/.test(playlist)) {
+    return { type: "playlist", value: playlist };
+  }
+  const channelMatch = parsed.pathname.match(/^\/(?:channel\/)([A-Za-z0-9_-]{10,})\/?$/);
+  if (channelMatch) return { type: "channel_id", value: channelMatch[1] };
+  const handleMatch = parsed.pathname.match(/^\/@([A-Za-z0-9._-]{3,30})\/?$/);
+  if (handleMatch) return { type: "handle", value: handleMatch[1] };
+  const customMatch = parsed.pathname.match(/^\/(?:c|user)\/([^/?#]{2,60})\/?$/);
+  if (customMatch) return { type: "custom", value: customMatch[1] };
+  return null;
+}
+
+function youTubeFeedUrlForDescriptor(descriptor) {
+  if (!descriptor) return null;
+  if (descriptor.type === "channel_id") {
+    return `https://www.youtube.com/feeds/videos.xml?channel_id=${encodeURIComponent(descriptor.value)}`;
+  }
+  if (descriptor.type === "playlist") {
+    return `https://www.youtube.com/feeds/videos.xml?playlist_id=${encodeURIComponent(descriptor.value)}`;
+  }
+  // handle / custom / legacy user names need the channel page first to learn
+  // the stable channel id; the public page advertises its own feed link.
+  const pagePath = descriptor.type === "handle" ? `/@${descriptor.value}` : `/${descriptor.type === "user" ? "user" : "c"}/${descriptor.value}`;
+  return `https://www.youtube.com${pagePath}`;
+}
+
+function youTubeFeedLinkFromChannelPage(html) {
+  const match = String(html || "").match(
+    /<link\b[^>]*type="application\/rss\+xml"[^>]*href="([^"]+)"/i
+  ) || String(html || "").match(
+    /<link\b[^>]*href="([^"]*feeds\/videos\.xml[^"]*)"[^>]*type="application\/rss\+xml"/i
+  );
+  if (!match) return null;
+  const href = decodeEntities(match[1]);
+  if (!/[?&](?:channel_id|playlist_id)=/.test(href)) return null;
+  return href.startsWith("http") ? href : `https://www.youtube.com${href}`;
+}
+
+function parseYouTubeChannelFeed(xml) {
+  const feed = String(xml || "");
+  if (!/<feed\b/i.test(feed) || !/<entry\b/i.test(feed)) {
+    throw new Error("YouTube 频道订阅源格式无法识别。");
+  }
+  const channelTitle = findTagValue(feed, ["title"]);
+  const entries = [...feed.matchAll(/<entry\b[^>]*>([\s\S]*?)<\/entry>/gi)];
+  const episodes = entries.map((entry) => {
+    const block = entry[1];
+    const videoId = findTagValue(block, ["yt:videoId"]).trim();
+    if (!YOUTUBE_VIDEO_ID_PATTERN.test(videoId)) return null;
+    const episodeUrl = youTubeCanonicalUrl(videoId);
+    const publishedAt = parseTimestamp(
+      findTagValue(block, ["published"]) || findTagValue(block, ["updated"])
+    );
+    return {
+      title: findTagValue(block, ["title"]) || "未命名 YouTube 单集",
+      description: findTagValue(block, ["media:description"]).slice(0, 4000),
+      publishedAt,
+      // The public feed has no duration; yt-dlp enforces duration limits at
+      // download time before any audio is fetched.
+      durationSec: null,
+      episodeUrl,
+      mediaUrl: episodeUrl,
+      podcastTitle: findTagValue(block, ["name"]) || channelTitle,
+      sourceFormat: "youtube",
+      publicAccess: true
+    };
+  }).filter(Boolean);
+  if (!episodes.length) throw new Error("YouTube 频道订阅源里没有可用的单集。");
+  return { channelTitle, episodes };
+}
+
+// X (Twitter) KOL sources: X sits behind a login wall for anonymous scraping,
+// so domi only reads it through the user's own X API v2 application
+// credentials (App-only Bearer Token). No cookies, no login bypass.
+function twitterHandleFromUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(String(rawUrl || ""));
+  } catch {
+    return null;
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (!YOUTUBE_TWITTER_HOSTS.has(host)) return null;
+  const match = parsed.pathname.match(/^\/@?([A-Za-z0-9_]{1,15})\/?$/);
+  if (!match) return null;
+  const handle = match[1];
+  if (TWITTER_RESERVED_PATHS.has(handle.toLowerCase())) return null;
+  return handle;
+}
+
+function youTubeTimestamp(uploadDate) {
+  const match = /^(\d{4})(\d{2})(\d{2})$/.exec(String(uploadDate || ""));
+  if (!match) return null;
+  const parsed = Date.parse(`${match[1]}-${match[2]}-${match[3]}T00:00:00Z`);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function youTubeEpisodeFromInfo(info) {
+  if (!info || typeof info !== "object" || Array.isArray(info)) {
+    throw new Error("yt-dlp 未返回有效的 YouTube 视频元数据。");
+  }
+  if (String(info._type || "video") !== "video") {
+    throw new Error("YouTube 链接必须是单集视频页，不接受频道或播放列表。");
+  }
+  const availability = String(info.availability || "").toLowerCase();
+  if (availability && !YOUTUBE_ALLOWED_AVAILABILITY.has(availability)) {
+    throw new Error("该 YouTube 视频是会员、付费或需登录内容，domi 不会绕过访问限制下载。");
+  }
+  if (Number(info.age_limit || 0) > 0) {
+    throw new Error("该 YouTube 视频有年龄限制，domi 不会绕过访问限制下载。");
+  }
+  const liveStatus = String(info.live_status || "").toLowerCase();
+  if (info.is_live === true || YOUTUBE_BLOCKING_LIVE_STATUS.has(liveStatus)) {
+    throw new Error("直播和未开始的 YouTube 视频不支持下载。");
+  }
+  const durationSec = Number(info.duration || 0);
+  if (!Number.isFinite(durationSec) || durationSec <= 0) {
+    throw new Error("YouTube 视频元数据缺少时长，无法确认可下载性。");
+  }
+  if (durationSec > YOUTUBE_MAX_DURATION_SECONDS) {
+    throw new Error(`YouTube 视频时长超过 ${Math.round(YOUTUBE_MAX_DURATION_SECONDS / 3600)} 小时限制。`);
+  }
+  const videoId = youTubeVideoIdFromUrl(info.webpage_url || info.original_url) || String(info.id || "");
+  if (!YOUTUBE_VIDEO_ID_PATTERN.test(videoId)) {
+    throw new Error("yt-dlp 未返回可识别的 YouTube 视频标识。");
+  }
+  const episodeUrl = youTubeCanonicalUrl(videoId);
+  return {
+    title: String(info.title || "").trim() || "未命名 YouTube 单集",
+    description: String(info.description || "").trim().slice(0, 4000),
+    publishedAt: youTubeTimestamp(info.upload_date),
+    durationSec: Math.round(durationSec),
+    episodeUrl,
+    // YouTube 没有公开直链音频；下载阶段按 sourceFormat=youtube 走 yt-dlp。
+    mediaUrl: episodeUrl,
+    podcastTitle: String(info.channel || info.uploader || info.uploader_id || "").trim(),
+    sourceFormat: "youtube",
+    publicAccess: true
+  };
+}
+
+function defaultYouTubeExec(file, args, execOptions) {
+  const { execFile } = require("node:child_process");
+  return new Promise((resolve, reject) => {
+    execFile(file, args, {
+      windowsHide: true,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+      ...execOptions
+    }, (error, stdout, stderr) => {
+      if (error) {
+        error.stderr = stderr;
+        reject(error);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+class YouTubeDlp {
+  constructor({ execImpl, proxy } = {}) {
+    this.execImpl = execImpl || defaultYouTubeExec;
+    this.proxy = String(proxy || process.env.DOMI_YOUTUBE_PROXY || "").trim();
+    this.cachedCommand = "";
+  }
+
+  ytDlpCandidates() {
+    const candidates = [];
+    const fromEnv = String(process.env.DOMI_YTDLP_PATH || "").trim();
+    if (fromEnv) candidates.push(fromEnv);
+    candidates.push("yt-dlp", "yt-dlp.exe");
+    return candidates;
+  }
+
+  async resolveCommand() {
+    // Only the real executor benefits from caching; injected test doubles
+    // must stay isolated.
+    const cacheable = this.execImpl === defaultYouTubeExec;
+    if (cacheable && this.cachedCommand) return this.cachedCommand;
+    for (const candidate of this.ytDlpCandidates()) {
+      try {
+        const { stdout } = await this.execImpl(candidate, ["--version"], { timeout: 30_000 });
+        if (/^\d{4}\.\d{2}\.\d{2}/.test(String(stdout).trim())) {
+          if (cacheable) this.cachedCommand = candidate;
+          return candidate;
+        }
+      } catch {
+        // keep looking
+      }
+    }
+    throw new Error("未找到 yt-dlp；请先安装 yt-dlp（或设置 DOMI_YTDLP_PATH）后再处理 YouTube 播客。");
+  }
+
+  proxyArgs() {
+    return this.proxy ? ["--proxy", this.proxy] : [];
+  }
+
+  async run(args, options = {}) {
+    const command = await this.resolveCommand();
+    try {
+      return await this.execImpl(command, args, {
+        timeout: options.timeoutMs,
+        maxBuffer: 64 * 1024 * 1024
+      });
+    } catch (error) {
+      const detail = String(error?.stderr || error?.message || error || "").split(/\r?\n/).find(Boolean) || "未知错误";
+      throw new Error(`yt-dlp 执行失败：${detail}`);
+    }
+  }
+
+  async resolveEpisode(videoUrl) {
+    const videoId = youTubeVideoIdFromUrl(videoUrl);
+    if (!videoId) throw new Error("请提供 YouTube 单集视频链接（watch、youtu.be、shorts 或 live 页面）。");
+    const { stdout } = await this.run([
+      "--dump-single-json",
+      "--no-playlist",
+      "--no-warnings",
+      "--skip-download",
+      "--format", YOUTUBE_AUDIO_FORMAT,
+      ...this.proxyArgs(),
+      youTubeCanonicalUrl(videoId)
+    ], { timeoutMs: YOUTUBE_RESOLVE_TIMEOUT_MS });
+    let info;
+    try {
+      info = JSON.parse(stdout);
+    } catch {
+      throw new Error("yt-dlp 返回的 YouTube 元数据不是有效 JSON。");
+    }
+    return youTubeEpisodeFromInfo(info);
+  }
+
+  async downloadAudio(videoUrl, outputBasePath, { maxBytes, timeoutMs } = {}) {
+    const episode = await this.resolveEpisode(videoUrl);
+    const sizeLimit = Math.max(1024, Number(maxBytes) || DEFAULT_AUDIO_LIMIT_BYTES);
+    // Clean stale files from earlier attempts with a different audio format.
+    for (const name of fs.readdirSync(path.dirname(outputBasePath))) {
+      if (name.startsWith(`${path.basename(outputBasePath)}.`)) {
+        fs.rmSync(path.join(path.dirname(outputBasePath), name), { force: true });
+      }
+    }
+    await this.run([
+      "--no-playlist",
+      "--no-warnings",
+      "--no-progress",
+      "--no-mtime",
+      "--format", YOUTUBE_AUDIO_FORMAT,
+      "--max-filesize", String(sizeLimit),
+      "--output", `${outputBasePath}.%(ext)s`,
+      ...this.proxyArgs(),
+      episode.episodeUrl
+    ], { timeoutMs: Math.max(60_000, Number(timeoutMs) || YOUTUBE_DOWNLOAD_TIMEOUT_MS) });
+    const produced = fs.readdirSync(path.dirname(outputBasePath))
+      .filter((name) => name.startsWith(`${path.basename(outputBasePath)}.`))
+      .map((name) => path.join(path.dirname(outputBasePath), name));
+    if (produced.length !== 1) {
+      throw new Error("yt-dlp 没有产出唯一的音频文件。");
+    }
+    const bytes = fs.statSync(produced[0]).size;
+    if (bytes <= 0) throw new Error("yt-dlp 下载的音频为空。");
+    if (bytes > sizeLimit) throw new Error("YouTube 音频超过下载大小限制。");
+    try {
+      fs.chmodSync(produced[0], 0o600);
+    } catch {
+      // Best effort on filesystems without POSIX permissions.
+    }
+    return { path: produced[0], bytes, episode };
+  }
+}
+
 class RadarSourceService {
-  constructor({ stateStore, cacheDir, fetchImpl, now } = {}) {
+  constructor({ stateStore, cacheDir, fetchImpl, now, youTube } = {}) {
     if (!stateStore) throw new Error("RadarSourceService requires stateStore");
     this.stateStore = stateStore;
     this.cacheDir = path.resolve(cacheDir || path.join(os.homedir(), ".domi", "cache", "podcasts"));
     this.fetchImpl = fetchImpl || globalThis.fetch;
     this.now = now || (() => Date.now());
+    this.youTube = youTube instanceof YouTubeDlp ? youTube : new YouTubeDlp(youTube || {});
   }
 
   loadSources() {
@@ -765,14 +1130,51 @@ class RadarSourceService {
     return this.stateStore.saveCache(PODCAST_JOBS_CACHE_KEY, { version: 1, jobs: limited });
   }
 
+  loadTwitterItems() {
+    const stored = this.stateStore.loadCache(TWITTER_ITEMS_CACHE_KEY);
+    const raw = Array.isArray(stored?.value) ? stored.value : stored?.value?.items;
+    return {
+      items: (Array.isArray(raw) ? raw : []).map(normalizeTwitterItem).filter(Boolean),
+      updatedAt: Number(stored?.updatedAt) || 0
+    };
+  }
+
+  saveTwitterItems(items) {
+    const limited = [...items]
+      .sort((left, right) => Number(right.createdAt || right.discoveredAt) - Number(left.createdAt || left.discoveredAt))
+      .slice(0, TWITTER_MAX_ITEMS_TOTAL);
+    return this.stateStore.saveCache(TWITTER_ITEMS_CACHE_KEY, { version: 1, items: limited });
+  }
+
+  twitterTokenStatus() {
+    const secret = this.stateStore.loadSecret(TWITTER_BEARER_SECRET_KEY);
+    return { configured: Boolean(secret?.value), updatedAt: Number(secret?.updatedAt) || 0 };
+  }
+
+  saveTwitterToken(token) {
+    const value = String(token || "").trim();
+    if (!value) {
+      this.stateStore.deleteSecret(TWITTER_BEARER_SECRET_KEY);
+      return { ok: true, configured: false };
+    }
+    if (value.length < 20 || /\s/.test(value)) {
+      throw new Error("X API Bearer Token 格式看起来不对；请从你的 X 开发者后台复制完整令牌。");
+    }
+    this.stateStore.saveSecret(TWITTER_BEARER_SECRET_KEY, value);
+    return { ok: true, configured: true };
+  }
+
   list() {
     const sourceState = this.loadSources();
     const jobState = this.loadJobs();
+    const twitterState = this.loadTwitterItems();
     return {
       ok: true,
       sources: sourceState.sources,
       jobs: jobState.jobs,
-      updatedAt: Math.max(sourceState.updatedAt, jobState.updatedAt)
+      twitterItems: twitterState.items,
+      twitterTokenConfigured: this.twitterTokenStatus().configured,
+      updatedAt: Math.max(sourceState.updatedAt, jobState.updatedAt, twitterState.updatedAt)
     };
   }
 
@@ -854,15 +1256,18 @@ class RadarSourceService {
     const state = this.loadSources();
     const sources = state.sources.filter((item) => item.id !== id);
     const jobs = this.loadJobs().jobs.filter((item) => item.sourceId !== id);
+    const twitterItems = this.loadTwitterItems().items.filter((item) => item.sourceId !== id);
     const sourceSaved = this.saveSources(sources);
     const jobSaved = this.saveJobs(jobs);
+    const twitterSaved = this.saveTwitterItems(twitterItems);
     return {
       ok: true,
       deleted: sources.length !== state.sources.length,
       sourceId: id,
       sources,
       jobs,
-      updatedAt: Math.max(sourceSaved.updatedAt, jobSaved.updatedAt)
+      twitterItems,
+      updatedAt: Math.max(sourceSaved.updatedAt, jobSaved.updatedAt, twitterSaved.updatedAt)
     };
   }
 
@@ -886,7 +1291,15 @@ class RadarSourceService {
   }
 
   async discoverSource(source, limit) {
+    if (source.kind === "youtube_channel") {
+      return this.discoverYouTubeChannel(source, limit);
+    }
     if (source.kind !== "podcast") return [];
+    // YouTube has no public page-embedded audio link; it goes through the
+    // user's own yt-dlp before any HTTP fetch of the page.
+    if (youTubeVideoIdFromUrl(source.url)) {
+      return [await this.youTube.resolveEpisode(source.url)];
+    }
     const first = await this.fetchText(source.url);
     const parsedUrl = new URL(first.url);
     const isXiaoyuzhou = parsedUrl.hostname === "www.xiaoyuzhoufm.com" || parsedUrl.hostname === "xiaoyuzhoufm.com";
@@ -913,19 +1326,110 @@ class RadarSourceService {
     return [parseXiaoyuzhouEpisode(first.text, first.url)];
   }
 
+  // YouTube 频道发现：公开 Atom 订阅源 → 单集列表，后续下载/转写与单集 YouTube
+  // 链接完全一致（yt-dlp 只在下载时校验时长与访问限制）。
+  async discoverYouTubeChannel(source, limit) {
+    const descriptor = youTubeChannelDescriptor(source.url);
+    if (!descriptor) throw new Error("YouTube 频道链接无法识别，请使用 @频道、/channel/UC…、/c/… 或播放列表链接。");
+    let feedUrl = youTubeFeedUrlForDescriptor(descriptor);
+    if (descriptor.type === "handle" || descriptor.type === "custom") {
+      // 先拉频道公开页，从页面声明的 RSS link 里拿到稳定的 channel_id。
+      const page = await this.fetchText(feedUrl, { maxBytes: 2 * 1024 * 1024 });
+      const link = youTubeFeedLinkFromChannelPage(page.text);
+      if (!link) {
+        throw new Error("无法从 YouTube 频道页找到公开订阅源；请改用 /channel/UC… 形式的链接。");
+      }
+      feedUrl = link;
+    }
+    const feed = await this.fetchText(feedUrl, { maxBytes: 4 * 1024 * 1024 });
+    const { episodes } = parseYouTubeChannelFeed(feed.text);
+    return episodes.slice(0, limit);
+  }
+
+  // X 大V发现：仅通过用户自己的 X API v2 凭证拉取时间线，不绕过登录墙。
+  async fetchTwitterTimeline(source, limit) {
+    const handle = twitterHandleFromUrl(source.url);
+    if (!handle) throw new Error("X 大V链接无法识别，请使用 https://x.com/用户名 形式的链接。");
+    const secret = this.stateStore.loadSecret(TWITTER_BEARER_SECRET_KEY);
+    if (!secret?.value) {
+      throw new Error("还没有配置 X API Bearer Token；domi 不会绕过 X 的登录墙。请在「X 大V」页配置你自己的 X 开发者凭证。");
+    }
+    const maxResults = Math.min(Math.max(Number(limit) || 10, 5), TWITTER_MAX_ITEMS_PER_SOURCE);
+    const endpoint = `${TWITTER_API_BASE}/users/by/username/${encodeURIComponent(handle)}/tweets`
+      + `?max_results=${maxResults}&exclude=replies&tweet.fields=created_at`;
+    const request = await safeFetch(this.fetchImpl, endpoint, {
+      accept: "application/json",
+      headers: { Authorization: `Bearer ${secret.value}` }
+    });
+    let payload;
+    try {
+      const buffer = await readResponseLimited(request.response, 4 * 1024 * 1024);
+      payload = JSON.parse(buffer.toString("utf8"));
+    } catch (error) {
+      if (request.didTimeout()) throw new Error(`读取 X 时间线超时（${Math.round(request.timeoutMs / 1000)} 秒）。`);
+      throw error instanceof Error ? error : new Error(String(error));
+    } finally {
+      request.cleanup();
+    }
+    const tweets = Array.isArray(payload?.data) ? payload.data : [];
+    const now = this.now();
+    return tweets.map((tweet) => ({
+      id: twitterItemIdFor(source.id, String(tweet.id || "")),
+      sourceId: source.id,
+      handle,
+      authorName: source.name,
+      tweetId: String(tweet.id || ""),
+      text: String(tweet.text || "").slice(0, 2000),
+      url: `https://x.com/${handle}/status/${tweet.id}`,
+      createdAt: parseTimestamp(tweet.created_at),
+      discoveredAt: now,
+      updatedAt: now
+    })).filter((item) => item.tweetId);
+  }
+
   async sync(request = {}) {
     const sourceState = this.loadSources();
+    // kinds 过滤允许调用方只同步部分类型：快循环只轮询播客 RSS，
+    // X 大V与 YouTube 频道走每日一次的低频同步，避免耗尽 X API 配额。
+    const kinds = Array.isArray(request.kinds)
+      ? new Set(request.kinds.map(String).filter((kind) => SOURCE_KINDS.has(kind)))
+      : null;
     const selected = sourceState.sources.filter((source) =>
-      source.enabled && (!request.sourceId || source.id === String(request.sourceId))
+      source.enabled
+      && (!request.sourceId || source.id === String(request.sourceId))
+      && (!kinds || kinds.has(source.kind))
     );
     const limit = Math.min(Math.max(Number(request.limit) || DEFAULT_DISCOVERY_LIMIT, 1), MAX_DISCOVERY_LIMIT);
     const existingJobs = this.loadJobs().jobs;
     const jobsById = new Map(existingJobs.map((job) => [job.id, job]));
+    const twitterItemsById = new Map(this.loadTwitterItems().items.map((item) => [item.id, item]));
     const results = [];
     const checkedAt = this.now();
     const sourceUpdates = new Map();
     for (const source of selected) {
-      if (source.kind !== "podcast") {
+      if (source.kind === "twitter") {
+        try {
+          const tweets = await this.fetchTwitterTimeline(source, limit);
+          let discoveredTweets = 0;
+          for (const item of tweets) {
+            const previous = twitterItemsById.get(item.id);
+            if (!previous) discoveredTweets += 1;
+            twitterItemsById.set(item.id, normalizeTwitterItem({
+              ...previous,
+              ...item,
+              discoveredAt: Number(previous?.discoveredAt) || item.discoveredAt
+            }));
+          }
+          sourceUpdates.set(source.id, { ...source, lastCheckedAt: checkedAt, lastSuccessAt: checkedAt, error: "" });
+          results.push({ sourceId: source.id, ok: true, discoveredCount: discoveredTweets, totalCount: tweets.length });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          sourceUpdates.set(source.id, { ...source, lastCheckedAt: checkedAt, error: message });
+          results.push({ sourceId: source.id, ok: false, discoveredCount: 0, error: message });
+        }
+        continue;
+      }
+      if (source.kind !== "podcast" && source.kind !== "youtube_channel") {
         sourceUpdates.set(source.id, { ...source, lastCheckedAt: checkedAt, lastSuccessAt: checkedAt, error: "" });
         results.push({ sourceId: source.id, ok: true, discoveredCount: 0 });
         continue;
@@ -992,15 +1496,33 @@ class RadarSourceService {
     }
     const jobs = [...latestJobsById.values()]
       .filter((job) => sources.some((source) => source.id === job.sourceId));
+    // Twitter items keep the latest snapshot semantics of jobs: only add new
+    // tweets and refresh metadata; never delete items the user has not acted on.
+    const latestTwitterItemsById = new Map(this.loadTwitterItems().items.map((item) => [item.id, item]));
+    for (const candidate of twitterItemsById.values()) {
+      const latest = latestTwitterItemsById.get(candidate.id);
+      latestTwitterItemsById.set(candidate.id, latest ? normalizeTwitterItem({
+        ...latest,
+        text: candidate.text,
+        url: candidate.url,
+        createdAt: candidate.createdAt,
+        updatedAt: Math.max(Number(latest.updatedAt) || 0, checkedAt)
+      }) : candidate);
+    }
+    const twitterItems = [...latestTwitterItemsById.values()]
+      .filter((item) => sources.some((source) => source.id === item.sourceId));
     const sourceSaved = this.saveSources(sources);
     const jobSaved = this.saveJobs(jobs);
+    const twitterSaved = this.saveTwitterItems(twitterItems);
     return {
       ok: results.every((item) => item.ok),
       partial: results.some((item) => item.ok) && results.some((item) => !item.ok),
       sources,
       jobs: this.loadJobs().jobs,
+      twitterItems: this.loadTwitterItems().items,
+      twitterTokenConfigured: this.twitterTokenStatus().configured,
       results,
-      updatedAt: Math.max(sourceSaved.updatedAt, jobSaved.updatedAt)
+      updatedAt: Math.max(sourceSaved.updatedAt, jobSaved.updatedAt, twitterSaved.updatedAt)
     };
   }
 
@@ -1023,6 +1545,9 @@ class RadarSourceService {
 
   async download(jobId, options = {}) {
     const job = this.getJob(jobId);
+    if (job.sourceFormat === "youtube") {
+      return this.downloadYouTube(job, options);
+    }
     fs.mkdirSync(this.cacheDir, { recursive: true, mode: 0o700 });
     try {
       fs.chmodSync(this.cacheDir, 0o700);
@@ -1096,6 +1621,46 @@ class RadarSourceService {
     }
   }
 
+  async downloadYouTube(job, options = {}) {
+    fs.mkdirSync(this.cacheDir, { recursive: true, mode: 0o700 });
+    try {
+      fs.chmodSync(this.cacheDir, 0o700);
+    } catch {
+      // Best effort on filesystems without POSIX permissions.
+    }
+    this.updateJob(job.id, { status: "downloading", error: "" });
+    try {
+      // Reuse a previously downloaded audio file, mirroring the regular path.
+      const current = this.getJob(job.id);
+      if (current.localAudioPath) {
+        try {
+          const stat = fs.statSync(current.localAudioPath);
+          const maxBytes = Math.max(1024, Number(options.maxBytes) || DEFAULT_AUDIO_LIMIT_BYTES);
+          if (stat.isFile() && stat.size > 0 && stat.size <= maxBytes) {
+            const updated = this.updateJob(job.id, { status: "downloaded", error: "" });
+            return { ok: true, cached: true, path: current.localAudioPath, bytes: stat.size, job: updated.job };
+          }
+        } catch {
+          // Download below.
+        }
+      }
+      const result = await this.youTube.downloadAudio(job.episodeUrl, path.join(this.cacheDir, job.id), {
+        maxBytes: options.maxBytes,
+        timeoutMs: options.timeoutMs
+      });
+      const updated = this.updateJob(job.id, {
+        status: "downloaded",
+        localAudioPath: result.path,
+        error: ""
+      });
+      return { ok: true, cached: false, path: result.path, bytes: result.bytes, job: updated.job };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.updateJob(job.id, { status: "failed", localAudioPath: "", error: message });
+      throw new Error(message);
+    }
+  }
+
   async removeAudio(audioPath) {
     const resolved = path.resolve(String(audioPath || ""));
     const relative = path.relative(this.cacheDir, resolved);
@@ -1138,6 +1703,7 @@ module.exports = {
   PODCAST_JOBS_CACHE_KEY,
   RADAR_SOURCES_SETTINGS_KEY,
   RadarSourceService,
+  YouTubeDlp,
   canonicalSourceName,
   normalizePublicUrl,
   normalizeSource,
@@ -1146,5 +1712,11 @@ module.exports = {
   parsePodcastRss,
   parseXiaoyuzhouEpisode,
   parseXiaoyuzhouEpisodeLinks,
-  safeFetch
+  parseYouTubeChannelFeed,
+  safeFetch,
+  twitterHandleFromUrl,
+  youTubeChannelDescriptor,
+  youTubeEpisodeFromInfo,
+  youTubeFeedLinkFromChannelPage,
+  youTubeVideoIdFromUrl
 };

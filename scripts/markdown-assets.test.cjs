@@ -78,12 +78,18 @@ async function main() {
       /当前资料库内/,
       "an absolute image outside the trusted library must remain blocked"
     );
-    const escapedImagePath = path.join(materialDirectory, "越界.png");
-    fs.symlinkSync(outsideImage, escapedImagePath);
+    const escapedSourceDirectory = `${root}-escape-source`;
+    fs.mkdirSync(escapedSourceDirectory);
+    fs.writeFileSync(path.join(escapedSourceDirectory, "outside.png"), png);
+    fs.symlinkSync(
+      escapedSourceDirectory,
+      path.join(materialDirectory, "越界资料"),
+      process.platform === "win32" ? "junction" : "dir"
+    );
     assert.throws(
       () => resolveMarkdownImagePath(
         siblingDocumentPath,
-        "../原始材料/越界.png",
+        "../原始材料/越界资料/outside.png",
         { rootPath: libraryRoot }
       ),
       /允许的资料库范围内/,
@@ -104,7 +110,7 @@ async function main() {
     fs.mkdirSync(unsafeNoteDirectory, { recursive: true });
     const unsafeDocumentPath = path.join(unsafeNoteDirectory, "纪要.md");
     fs.writeFileSync(unsafeDocumentPath, "# 纪要\n", "utf8");
-    fs.symlinkSync(outsideDirectory, path.join(unsafeNoteDirectory, "assets"));
+    fs.symlinkSync(outsideDirectory, path.join(unsafeNoteDirectory, "assets"), process.platform === "win32" ? "junction" : undefined);
     await assert.rejects(
       () => savePastedMarkdownImage({
         documentPath: unsafeDocumentPath,
@@ -254,11 +260,12 @@ async function main() {
     assert.match(missing.html, /未找到/);
 
     console.log("markdown assets tests passed");
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-    fs.rmSync(outsideImage, { force: true });
-    fs.rmSync(outsideDirectory, { recursive: true, force: true });
-  }
+} finally {
+fs.rmSync(root, { recursive: true, force: true });
+fs.rmSync(outsideImage, { force: true });
+fs.rmSync(outsideDirectory, { recursive: true, force: true });
+fs.rmSync(`${root}-escape-source`, { recursive: true, force: true });
+}
 }
 
 main().catch((error) => {

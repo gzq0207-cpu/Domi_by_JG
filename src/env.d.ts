@@ -3,7 +3,8 @@ export {};
 declare global {
   interface Window {
     workbench: {
-      checkCodex: () => Promise<CodexCheckResult>;
+      checkCodex: (request?: { refreshModels?: boolean }) => Promise<CodexCheckResult>;
+      checkAgentCli: (engineId?: "claude" | "workbuddy") => Promise<AgentCliStatus>;
       loadSettings: () => Promise<AppSettingsResult>;
       saveSettings: (request: AppSettingsSaveRequest) => Promise<AppSettingsSaveResult>;
       selectDirectory: (currentPath?: string) => Promise<DirectorySelectionResult>;
@@ -25,6 +26,7 @@ declare global {
       downloadUpdate: () => Promise<UpdateStatus>;
       installUpdate: () => Promise<UpdateInstallResult>;
       runCodex: (payload: CodexRunRequest) => Promise<CodexRunResult>;
+      verifyLibraryCitation: (request: { runId: string; citationId: string }) => Promise<{ ok: boolean; citation?: LibraryCitation; error?: string }>;
       stopCodex: (runId: string) => Promise<{ ok: boolean; error?: string }>;
       recoverCodexThread: (threadId: string) => Promise<CodexThreadRecoveryResult>;
       bindCodexRun: (runId: string) => Promise<{ ok: boolean; error?: string }>;
@@ -71,6 +73,7 @@ declare global {
       createDocumentLibraryEntry: (
         request: DocumentLibraryCreateRequest
       ) => Promise<DocumentLibraryCreateResult>;
+      finalizeSubscriptionDigest: (request: { day: string }) => Promise<{ ok: boolean; files?: string[]; error?: string }>;
       readMarkdown: (request: MarkdownReadRequest) => Promise<MarkdownReadResult>;
       saveMarkdown: (request: MarkdownSaveRequest) => Promise<MarkdownSaveResult>;
       renameMarkdown: (request: MarkdownRenameRequest) => Promise<MarkdownRenameResult>;
@@ -86,6 +89,9 @@ declare global {
       createProjectWorkspace: (request: ProjectWorkspaceRequest) => Promise<ProjectWorkspaceResult>;
       openWorkspace: (workspacePath?: string) => Promise<{ ok: boolean; error?: string; workspacePath: string }>;
       loadDomiCache: () => Promise<DomiSyncResult>;
+  syncFeishuWikiMirror: (
+    request?: { trigger?: string }
+  ) => Promise<FeishuWikiMirrorSyncResult>;
       checkDomi: () => Promise<DomiStatusResult>;
       getFeishuSetupStatus: (request?: { force?: boolean }) => Promise<FeishuSetupStatus>;
       startFeishuSetupAuth: () => Promise<FeishuSetupAuthStartResult>;
@@ -122,6 +128,7 @@ declare global {
       ) => Promise<RadarSourceBulkImportResult>;
       deleteRadarSource: (request: { sourceId: string }) => Promise<RadarSourceMutationResult>;
       syncRadarSources: (request?: RadarSourceSyncRequest) => Promise<RadarSourceSyncResult>;
+saveRadarTwitterToken: (request: { token: string }) => Promise<RadarTwitterTokenResult>;
       processPodcastEpisode: (request: PodcastProcessRequest) => Promise<PodcastProcessResult>;
       listDomiTasks: (request?: DomiTaskBoardRequest) => Promise<DomiTaskBoardSnapshot>;
       updateDomiTask: (request: DomiTaskUpdateRequest) => Promise<DomiTaskUpdateResult>;
@@ -140,8 +147,9 @@ declare global {
         request: DomiEntityMaterialsRequest
       ) => Promise<DomiEntityWorkspaceResult>;
       loadDomiEntityMaterials: (request: DomiEntityMaterialsRequest) => Promise<DomiEntityMaterialsResult>;
-      onCodexEvent: (callback: (payload: CodexEventPayload) => void) => () => void;
-      onUpdateStatus: (callback: (status: UpdateStatus) => void) => () => void;
+  onCodexEvent: (callback: (payload: CodexEventPayload) => void) => () => void;
+  onUpdateStatus: (callback: (status: UpdateStatus) => void) => () => void;
+  onIntakeItem: (callback: (item: IntakeItem) => void) => () => void;
     };
   }
 }
@@ -205,6 +213,7 @@ export type MarkdownDocument = {
 export type DocumentLibraryNode = {
   kind: "folder" | "markdown" | "pdf";
   name: string;
+  displayName?: string;
   path: string;
   relativePath: string;
   size: number;
@@ -233,6 +242,7 @@ export type DocumentLibrarySearchRequest = {
   query: string;
   limit?: number;
   includeTranscripts?: boolean;
+  excludeTranscripts?: boolean;
 };
 
 export type DocumentLibrarySearchMatch = {
@@ -249,6 +259,8 @@ export type DocumentLibrarySearchMatch = {
 export type DocumentLibrarySearchResult = {
   ok: boolean;
   results: DocumentLibrarySearchMatch[];
+  degraded?: boolean;
+  partial?: boolean;
   indexing: boolean;
   indexedCount: number;
   lastIndexedAt: number;
@@ -617,7 +629,21 @@ export type DomiWeeklyNewsCheckpointResult = {
   error?: string;
 };
 
-export type RadarSourceKind = "news" | "wechat" | "podcast";
+export type RadarSourceKind = "news" | "wechat" | "podcast" | "youtube_channel" | "twitter";
+export type FeishuWikiMirrorSyncResult = {
+  ok?: boolean;
+  skipped?: boolean;
+  reason?: string;
+  spaceId?: string;
+  total?: number;
+  created?: number;
+  updated?: number;
+  skippedCount?: number;
+  failed?: number;
+  failures?: Array<{ relativePath: string; error: string }>;
+  error?: string;
+};
+
 export type RadarSourcePriority = "normal" | "important";
 
 export type RadarSource = {
@@ -724,7 +750,28 @@ export type RadarSourceSnapshot = {
   ok: boolean;
   sources: RadarSource[];
   jobs: PodcastJob[];
+  twitterItems?: TwitterItem[];
+  twitterTokenConfigured?: boolean;
   updatedAt: number;
+  error?: string;
+};
+
+export type TwitterItem = {
+  id: string;
+  sourceId: string;
+  handle: string;
+  authorName: string;
+  tweetId: string;
+  text: string;
+  url: string;
+  createdAt: number | null;
+  discoveredAt: number | null;
+  updatedAt: number;
+};
+
+export type RadarTwitterTokenResult = {
+  ok: boolean;
+  configured?: boolean;
   error?: string;
 };
 
@@ -735,6 +782,7 @@ export type RadarSourceMutationResult = {
   deleted?: boolean;
   sources?: RadarSource[];
   jobs?: PodcastJob[];
+  twitterItems?: TwitterItem[];
   updatedAt?: number;
   error?: string;
 };
@@ -743,6 +791,7 @@ export type RadarSourceSyncRequest = {
   sourceId?: string;
   limit?: number;
   fresh?: boolean;
+  kinds?: RadarSourceKind[];
 };
 
 export type RadarSourceSyncItem = {
@@ -758,6 +807,8 @@ export type RadarSourceSyncResult = {
   partial?: boolean;
   sources: RadarSource[];
   jobs: PodcastJob[];
+  twitterItems?: TwitterItem[];
+  twitterTokenConfigured?: boolean;
   results: RadarSourceSyncItem[];
   updatedAt: number;
   error?: string;
@@ -800,6 +851,10 @@ export type DomiNewsItem = {
   evidenceStatus: string;
   action: string;
   worthFollowing?: boolean;
+  articleType?: "event" | "article";
+  contentPath?: string;
+  contentLink?: string;
+  documentLink?: string;
   updatedAt?: number;
 };
 
@@ -1217,16 +1272,17 @@ export type DomiEntityMaterialsResult = {
 };
 
 export type CodexCheckResult = {
-  ok: boolean;
-  path: string;
-  version: string;
-  transport: "app-server" | "browser";
-  workspacePath: string;
-  account: CodexAccount | null;
-  authMode: "chatgpt" | "relay";
-  providerLabel: string;
-  apiBaseUrl: string;
-  credentialStored: boolean;
+ok: boolean;
+path: string;
+version: string;
+transport: "app-server" | "browser";
+workspacePath: string;
+account: CodexAccount | null;
+authMode: "chatgpt" | "relay";
+providerLabel: string;
+apiBaseUrl: string;
+apiWireApi: "" | "responses" | "chat";
+credentialStored: boolean;
   requiresOpenaiAuth: boolean;
   configuredModel: string;
   configuredReasoningEffort: string;
@@ -1248,9 +1304,16 @@ export type CodexCheckResult = {
 export type AppSettings = {
   version: 9;
   onboardingComplete: boolean;
-  authMode: "chatgpt" | "relay";
+  agentProvider: "codex" | "claude" | "workbuddy";
+  authMode: "chatgpt" | "relay" | "agent-cli";
+  claudeCliPath: string;
+  workbuddyCliPath: string;
+  workbuddyArgs: string;
+  claudeModel: string;
+
   apiBaseUrl: string;
   apiModel: string;
+  apiWireApi: "responses" | "chat";
   relayCredentialConfigured: boolean;
   codexPath: string;
   plaudConnectionMode: "unconfigured" | "enabled" | "disabled";
@@ -1272,7 +1335,9 @@ export type AppSettings = {
   localRepositoryDir: string;
   localDatabasePath: string;
   externalAccessMode: "always" | "ask";
-  radarFollowedDomains: Array<"AI" | "半导体" | "智能出行" | "前沿科技" | "具身智能&机器人" | "消费" | "生物医药">;
+  radarFollowedDomains: Array<"能源与电力" | "数据中心基础设施" | "算力芯片" | "服务器与整机制造" | "互联与网络" | "云与算力服务" | "模型层" | "基础软件与工具链" | "Agent与平台" | "应用" | "终端与具身">;
+  documentSearchCloudContent: boolean;
+  semanticSearchEnabled: boolean;
   updateChannel: "stable" | "beta";
 };
 
@@ -1325,12 +1390,14 @@ export type CodexRuntimeActionResult = Partial<CodexInstallResult> & CodexRuntim
 };
 
 export type CodexRelayConfigureRequest = {
-  requestId: string;
-  baseUrl: string;
-  model: string;
-  apiKey?: string;
-  keepExistingKey?: boolean;
-  codexPath?: string;
+requestId: string;
+baseUrl: string;
+model: string;
+wireApi?: "responses" | "chat";
+apiKey?: string;
+keepExistingKey?: boolean;
+  agentProvider?: "codex" | "claude" | "workbuddy";
+codexPath?: string;
 };
 
 export type CodexConnectionTestRequest = {
@@ -1456,6 +1523,20 @@ export type RendererIssueReport = {
   column?: number;
 };
 
+export type AgentCliStatus = {
+  ok: boolean;
+  engine: "claude" | "workbuddy" | "codex";
+  detected: boolean;
+  path: string;
+  via: string;
+  version: string;
+  login: {
+    loggedIn: boolean | null;
+    detail: string;
+  };
+  error: string;
+};
+
 export type CodexAccount = {
   type: string;
   email?: string;
@@ -1479,6 +1560,29 @@ export type CodexModel = {
   }>;
 };
 
+export type SourceScope = "selected" | "library" | "research";
+
+export type LibraryCitation = {
+  id: string;
+  claim: string;
+  kind: "fact" | "inference";
+  sourceId: string;
+  path: string;
+  relativePath: string;
+  title: string;
+  date: string;
+  version: string;
+  quote: string;
+  startOffset: number;
+  endOffset: number;
+  startLine: number;
+  endLine: number;
+  sectionTitle: string;
+  pages: number[];
+  status: "verified" | "stale" | "invalid" | "unbound";
+  issues: string[];
+};
+
 export type CodexRunRequest = {
   runId: string;
   prompt: string;
@@ -1497,6 +1601,8 @@ export type CodexRunRequest = {
    */
   activeDocumentPath?: string;
   attachmentPaths?: string[];
+  /** Omitted for legacy/background workflows; explicit restricted modes fail closed. */
+  sourceScope?: SourceScope;
   threadId?: string;
   ephemeral?: boolean;
   background?: boolean;
@@ -1526,6 +1632,46 @@ export type CodexRunResult = {
   error?: string;
   workspacePath?: string;
   eventCount?: number;
+  sourceScope?: SourceScope;
+  sourceScopeIsolated?: boolean;
+  libraryUsage?: LibraryUsage;
+};
+
+export type LibraryUsage = {
+  sourceScope?: SourceScope;
+  selectedPaths?: string[];
+  citations?: LibraryCitation[];
+  citationCheck?: {
+    checked: boolean;
+    referencedCount: number;
+    verifiedCount: number;
+    invalidCount: number;
+    missing: boolean;
+    issues: string[];
+  };
+  candidateCount: number;
+  readCount: number;
+  fullCount: number;
+  readChars: number;
+  remainingChars: number;
+  searches: number;
+  remainingSearches: number;
+  warnings: string[];
+  sources: Array<{
+    sourceId: string;
+    path: string;
+    relativePath: string;
+    title: string;
+    date: string;
+    totalChars: number;
+    coveredChars: number;
+    version?: string;
+    ranges?: Array<{ start: number; end: number }>;
+    fullDocument: boolean;
+    sections: string[];
+    pages: number[];
+    line: number;
+  }>;
 };
 
 export type CodexThreadRecoveryResult = {
@@ -1534,6 +1680,9 @@ export type CodexThreadRecoveryResult = {
   threadId: string;
   turnId?: string;
   status: "running" | "completed" | "stopped" | "failed" | "unknown";
+  sourceScope?: SourceScope;
+  sourceScopeIsolated?: boolean;
+  libraryUsage?: LibraryUsage;
   output?: string;
   error?: string;
   pendingUserInputRequests?: CodexUserInputRequest[];
@@ -1575,6 +1724,20 @@ export type CodexUserInputAnswerResult = {
   error?: string;
 };
 
+export type IntakeItem = {
+  /** "url"（默认，文章/播客/视频等链接）或 "file"（收件箱附件：PDF、图片、Excel/CSV 等）。 */
+  kind?: "url" | "file";
+  url?: string;
+  title?: string;
+  text?: string;
+  source?: string;
+  /** kind="file" 时：主进程下载后的本地绝对路径。 */
+  filePath?: string;
+  fileName?: string;
+  fileSize?: number;
+  receivedAt?: string;
+};
+
 export type CodexEventPayload = {
   runId: string;
   type:
@@ -1585,6 +1748,7 @@ export type CodexEventPayload = {
     | "reconnected"
     | "assistant-delta"
     | "usage"
+    | "library-usage"
     | "json"
     | "stdout"
     | "stderr"
@@ -1617,6 +1781,9 @@ export type CodexEventPayload = {
   };
   item?: CodexEventItem;
   usage?: CodexUsage;
+  sourceScope?: SourceScope;
+  sourceScopeIsolated?: boolean;
+  libraryUsage?: LibraryUsage;
 };
 
 export type CodexUsage = {

@@ -1,6 +1,8 @@
 import {
   AlertCircle,
+  ExternalLink,
   Check,
+  KeyRound,
   MessageSquareText,
   Mic2,
   Newspaper,
@@ -9,29 +11,27 @@ import {
   RefreshCw,
   Upload,
   Trash2,
-  X
+  Twitter,
+  X,
+  Youtube
 } from "lucide-react";
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { workbench } from "./bridge";
 import { useAppConfirm } from "./AppConfirmDialog";
 import type {
   PodcastJob,
-  PodcastProcessResult,
   RadarSource,
   RadarSourceBulkImportResult,
   RadarSourceKind,
   RadarSourceSaveRequest,
-  RadarSourceSnapshot
+  RadarSourceSnapshot,
+  TwitterItem
 } from "./env";
 
 type RadarSourceManagerProps = {
   open: boolean;
   onClose: () => void;
   onSnapshot?: (snapshot: RadarSourceSnapshot) => void;
-  onPodcastTranscript?: (
-    job: PodcastJob,
-    result: PodcastProcessResult
-  ) => Promise<void> | void;
 };
 
 type SourceDraft = {
@@ -58,8 +58,36 @@ const EMPTY_DRAFT: SourceDraft = {
 const TABS: Array<{ kind: RadarSourceKind; label: string; icon: typeof Newspaper }> = [
   { kind: "news", label: "新闻源", icon: Newspaper },
   { kind: "wechat", label: "重点公众号", icon: MessageSquareText },
-  { kind: "podcast", label: "播客", icon: Mic2 }
+  { kind: "podcast", label: "播客", icon: Mic2 },
+  { kind: "youtube_channel", label: "YouTube 频道", icon: Youtube },
+  { kind: "twitter", label: "X 大V", icon: Twitter }
 ];
+
+const PODCAST_LIKE_KINDS: RadarSourceKind[] = ["podcast", "youtube_channel"];
+
+function isPodcastLikeKind(kind: RadarSourceKind) {
+  return PODCAST_LIKE_KINDS.includes(kind);
+}
+
+function sourceUrlLabel(kind: RadarSourceKind) {
+  if (kind === "podcast") return "RSS、节目页、公开单集或 YouTube 视频链接";
+  if (kind === "youtube_channel") return "YouTube 频道或播放列表链接";
+  if (kind === "twitter") return "X 主页链接";
+  return "网址";
+}
+
+function sourceUrlPlaceholder(kind: RadarSourceKind) {
+  if (kind === "youtube_channel") return "https://www.youtube.com/@频道名";
+  if (kind === "twitter") return "https://x.com/用户名";
+  return "https://";
+}
+
+function sourceUrlError(kind: RadarSourceKind) {
+  if (kind === "podcast") return "请粘贴播客 RSS、节目页、公开单集或 YouTube 视频链接。";
+  if (kind === "youtube_channel") return "请粘贴 YouTube 频道（@频道、/channel/UC…、/c/…）或播放列表链接。";
+  if (kind === "twitter") return "请粘贴形如 https://x.com/用户名 的 X 主页链接。";
+  return "请粘贴新闻源网址。";
+}
 
 function sourceDraft(source: RadarSource): SourceDraft {
   return {
@@ -79,10 +107,10 @@ function splitKeywords(value: string) {
 }
 
 function podcastStatus(job: PodcastJob) {
-  if (job.status === "transcript_ready") return "PLAUD 文字稿已就绪";
-  if (job.status === "transcribing") return "PLAUD 正在生成";
+  if (job.status === "transcript_ready") return "文字稿已就绪";
+  if (job.status === "transcribing") return "正在生成文字稿";
   if (job.status === "downloading") return "正在下载公开音频";
-  if (job.status === "downloaded") return "已下载，等待 PLAUD";
+  if (job.status === "downloaded") return "音频已下载";
   if (job.status === "failed") return "处理失败";
   if (job.status === "skipped") return "已跳过";
   return "等待处理";
@@ -91,8 +119,7 @@ function podcastStatus(job: PodcastJob) {
 export default function RadarSourceManager({
   open,
   onClose,
-  onSnapshot,
-  onPodcastTranscript
+  onSnapshot
 }: RadarSourceManagerProps) {
   const { confirm, confirmDialog } = useAppConfirm();
   const [tab, setTab] = useState<RadarSourceKind>("news");
@@ -100,7 +127,6 @@ export default function RadarSourceManager({
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [processingIds, setProcessingIds] = useState<Set<string>>(() => new Set());
   const [draft, setDraft] = useState<SourceDraft | null>(null);
   const [bulkImportOpen, setBulkImportOpen] = useState(false);
   const [bulkImportText, setBulkImportText] = useState("");
@@ -112,6 +138,9 @@ export default function RadarSourceManager({
   const bulkImportFileRef = useRef<HTMLInputElement | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [twitterTokenDraft, setTwitterTokenDraft] = useState("");
+  const [twitterTokenSaving, setTwitterTokenSaving] = useState(false);
+  const [twitterTokenConfigured, setTwitterTokenConfigured] = useState(false);
 
   const sources = useMemo(
     () => (snapshot?.sources || []).filter((source) => source.kind === tab),
@@ -123,8 +152,14 @@ export default function RadarSourceManager({
   );
   const jobs = useMemo(
     () => (snapshot?.jobs || [])
-      .filter((job) => tab === "podcast" && podcastSourceIds.has(job.sourceId))
+      .filter((job) => isPodcastLikeKind(tab) && podcastSourceIds.has(job.sourceId))
       .sort((left, right) => (right.publishedAt || right.discoveredAt) - (left.publishedAt || left.discoveredAt)),
+    [snapshot, tab, podcastSourceIds]
+  );
+  const tweets = useMemo(
+    () => (snapshot?.twitterItems || [])
+      .filter((item) => tab === "twitter" && podcastSourceIds.has(item.sourceId))
+      .sort((left, right) => (right.createdAt || right.discoveredAt || 0) - (left.createdAt || left.discoveredAt || 0)),
     [snapshot, tab, podcastSourceIds]
   );
 
@@ -138,6 +173,7 @@ export default function RadarSourceManager({
         return;
       }
       setSnapshot(result);
+      setTwitterTokenConfigured(result.twitterTokenConfigured === true);
       onSnapshot?.(result);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : String(loadError));
@@ -158,7 +194,7 @@ export default function RadarSourceManager({
       return;
     }
     if (draft.kind !== "wechat" && !draft.url.trim()) {
-      setError(draft.kind === "podcast" ? "请粘贴播客 RSS、节目页或公开单集链接。" : "请粘贴新闻源网址。");
+      setError(sourceUrlError(draft.kind));
       return;
     }
     setSaving(true);
@@ -172,7 +208,7 @@ export default function RadarSourceManager({
         enabled: draft.enabled,
         priority: draft.priority,
         keywords: splitKeywords(draft.keywords),
-        autoProcess: draft.kind === "podcast" && draft.autoProcess
+        autoProcess: isPodcastLikeKind(draft.kind) && draft.autoProcess
       };
       const result = await workbench.saveRadarSource(request);
       if (!result.ok) {
@@ -298,27 +334,27 @@ export default function RadarSourceManager({
     await load();
   }
 
-  async function processJob(job: PodcastJob) {
-    if (processingIds.has(job.id)) return;
-    setProcessingIds((current) => new Set(current).add(job.id));
+  async function saveTwitterToken() {
+    const token = twitterTokenDraft.trim();
+    if (!token) {
+      setError("请先粘贴你的 X API v2 Bearer Token。");
+      return;
+    }
+    setTwitterTokenSaving(true);
     setError("");
-    setNotice(`正在下载“${job.title}”并交给 PLAUD，窗口可以继续使用。`);
     try {
-      const result = await workbench.processPodcastEpisode({ jobId: job.id });
+      const result = await workbench.saveRadarTwitterToken({ token });
       if (!result.ok) {
-        setError(result.error || "播客处理失败。");
+        setError(result.error || "保存 X API 凭证失败。");
         return;
       }
-      setNotice("PLAUD 文字稿已生成，domi 正在整理并归档。 ");
-      if (result.job) await onPodcastTranscript?.(result.job, result);
-      setNotice("播客纪要已整理并按项目或行业归档。 ");
-      await load();
+      setTwitterTokenDraft("");
+      setTwitterTokenConfigured(result.configured === true);
+      setNotice("X API 凭证已保存在本机，只用于读取你订阅的大V时间线。");
+    } catch (tokenError) {
+      setError(tokenError instanceof Error ? tokenError.message : String(tokenError));
     } finally {
-      setProcessingIds((current) => {
-        const next = new Set(current);
-        next.delete(job.id);
-        return next;
-      });
+      setTwitterTokenSaving(false);
     }
   }
 
@@ -336,29 +372,19 @@ export default function RadarSourceManager({
         ok: true,
         sources: result.sources,
         jobs: result.jobs,
+        twitterItems: result.twitterItems,
+        twitterTokenConfigured: result.twitterTokenConfigured,
         updatedAt: result.updatedAt,
         error: result.error
       };
       setSnapshot(nextSnapshot);
+      if (typeof result.twitterTokenConfigured === "boolean") {
+        setTwitterTokenConfigured(result.twitterTokenConfigured);
+      }
       onSnapshot?.(nextSnapshot);
       const discovered = result.results.reduce((sum, item) => sum + item.discoveredCount, 0);
-      setNotice(discovered ? `发现 ${discovered} 期新内容。` : "已检查，没有发现新内容。 ");
+      setNotice(discovered ? `发现 ${discovered} 条新内容。` : "已检查，没有发现新内容。 ");
 
-      const autoSources = new Map(
-        result.sources
-          .filter((source) => source.kind === "podcast" && source.enabled && source.autoProcess)
-          .map((source) => [source.id, source] as const)
-      );
-      const candidates = result.jobs.filter((job) => {
-        const source = autoSources.get(job.sourceId);
-        if (!source || job.status !== "discovered") return false;
-        if (!source.keywords.length) return true;
-        const haystack = `${job.title} ${job.description}`.toLocaleLowerCase("zh-CN");
-        return source.keywords.some((keyword) => haystack.includes(keyword.toLocaleLowerCase("zh-CN")));
-      }).sort(
-        (left, right) => (right.publishedAt || right.discoveredAt) - (left.publishedAt || left.discoveredAt)
-      ).slice(0, 1);
-      for (const job of candidates) await processJob(job);
     } catch (syncError) {
       setError(syncError instanceof Error ? syncError.message : String(syncError));
     } finally {
@@ -377,7 +403,7 @@ export default function RadarSourceManager({
           <div>
             <span>行业动态</span>
             <h2 id="radar-source-title">信源管理</h2>
-            <p>配置仅保存在本机；公开播客音频交给你的 PLAUD 转写。</p>
+            <p>配置仅保存在本机；订阅单集通过转发或本地整理入库。</p>
           </div>
           <button type="button" aria-label="关闭信源管理" onClick={onClose}><X size={19} /></button>
         </header>
@@ -406,7 +432,11 @@ export default function RadarSourceManager({
             ? "扫描时优先核验这些网站。"
             : tab === "wechat"
               ? "记录重点公众号名称与关注关键词；不绕过微信访问限制。"
-              : "支持公开 RSS、小宇宙公开节目页或单集页；拒绝付费、私密和 DRM 内容。"}</p>
+              : tab === "podcast"
+                ? "支持公开 RSS、小宇宙公开节目页或单集页、YouTube 公开视频（需本机安装 yt-dlp）；拒绝付费、私密和 DRM 内容。"
+                : tab === "youtube_channel"
+                  ? "订阅 YouTube 频道或播放列表：同步时自动发现新单集，下载与转写与播客完全一致（需本机安装 yt-dlp）。"
+                  : "订阅 X 上的大V：同步时通过你自己的 X API 凭证拉取最新推送；domi 不绕过登录墙。"}</p>
           <span>
             <button type="button" onClick={() => { resetBulkImport(); setDraft({ ...EMPTY_DRAFT, kind: tab }); }}>
               <Plus size={15} />添加
@@ -520,6 +550,32 @@ export default function RadarSourceManager({
           </section>
         )}
 
+        {tab === "twitter" && (
+          <section className="radar-source-bulk" aria-label="X API 凭证">
+            <div className="radar-source-form-title">
+              <div>
+                <strong><KeyRound size={14} /> X API 凭证{twitterTokenConfigured ? "（已配置）" : "（未配置）"}</strong>
+                <small>{twitterTokenConfigured
+                  ? "同步时用你自己的 X API v2 凭证读取大V时间线；令牌只存在这台电脑的本地密钥库。"
+                  : "自动读取 X 大V推送需要你自己的 X 开发者 Bearer Token；domi 不绕过登录墙，也不读取浏览器 Cookie。"}</small>
+              </div>
+            </div>
+            <div className="radar-source-bulk-file">
+              <input
+                type="password"
+                value={twitterTokenDraft}
+                placeholder="粘贴 X API v2 App-only Bearer Token"
+                spellCheck={false}
+                autoComplete="off"
+                onChange={(event) => setTwitterTokenDraft(event.target.value)}
+              />
+              <button type="button" onClick={() => void saveTwitterToken()} disabled={twitterTokenSaving}>
+                {twitterTokenSaving ? "保存中" : "保存凭证"}
+              </button>
+            </div>
+          </section>
+        )}
+
         {draft && (
           <form className="radar-source-form" onSubmit={save}>
             <div className="radar-source-form-title">
@@ -531,8 +587,8 @@ export default function RadarSourceManager({
               <input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
             </label>
             <label>
-              <span>{draft.kind === "wechat" ? "主页或文章链接（可选）" : draft.kind === "podcast" ? "RSS、节目页或公开单集链接" : "网址"}</span>
-              <input value={draft.url} placeholder="https://" onChange={(event) => setDraft({ ...draft, url: event.target.value })} />
+              <span>{draft.kind === "wechat" ? "主页或文章链接（可选）" : sourceUrlLabel(draft.kind)}</span>
+              <input value={draft.url} placeholder={sourceUrlPlaceholder(draft.kind)} onChange={(event) => setDraft({ ...draft, url: event.target.value })} />
             </label>
             <label>
               <span>关注关键词</span>
@@ -540,7 +596,6 @@ export default function RadarSourceManager({
             </label>
             <div className="radar-source-form-options">
               <label><input type="checkbox" checked={draft.priority === "important"} onChange={(event) => setDraft({ ...draft, priority: event.target.checked ? "important" : "normal" })} />重点关注</label>
-              {draft.kind === "podcast" && <label><input type="checkbox" checked={draft.autoProcess} onChange={(event) => setDraft({ ...draft, autoProcess: event.target.checked })} />发现新单集后自动交给 PLAUD</label>}
             </div>
             <button className="radar-source-save" type="submit" disabled={saving}>{saving ? "保存中" : "保存信源"}</button>
           </form>
@@ -571,11 +626,10 @@ export default function RadarSourceManager({
             </article>
           ))}
 
-          {tab === "podcast" && jobs.length > 0 && (
+          {isPodcastLikeKind(tab) && jobs.length > 0 && (
             <section className="podcast-discovery-list">
               <h3>发现的单集 <small>{jobs.length}</small></h3>
               {jobs.slice(0, 30).map((job) => {
-                const processing = processingIds.has(job.id) || ["downloading", "transcribing"].includes(job.status);
                 return (
                   <article key={job.id}>
                     <div>
@@ -583,14 +637,28 @@ export default function RadarSourceManager({
                       <span>{job.podcastTitle || "播客"}{job.publishedAt ? ` · ${new Date(job.publishedAt).toLocaleDateString("zh-CN")}` : ""}</span>
                       <small className={job.status === "failed" ? "error" : ""}>{podcastStatus(job)}{job.error ? `：${job.error}` : ""}</small>
                     </div>
-                    {job.status !== "transcript_ready" && job.status !== "skipped" ? (
-                      <button type="button" disabled={processing} onClick={() => void processJob(job)}>
-                        <RefreshCw className={processing ? "spinning" : ""} size={14} />{processing ? "处理中" : "用 PLAUD 转写"}
-                      </button>
-                    ) : <span className="podcast-ready"><Check size={14} />已就绪</span>}
+                    {job.episodeUrl ? (
+                      <a className="podcast-episode-link" href={job.episodeUrl} target="_blank" rel="noreferrer">打开单集<ExternalLink size={13} /></a>
+                    ) : <span className="podcast-ready">已收录</span>}
                   </article>
                 );
               })}
+            </section>
+          )}
+
+          {tab === "twitter" && tweets.length > 0 && (
+            <section className="podcast-discovery-list">
+              <h3>最新推送 <small>{tweets.length}</small></h3>
+              {tweets.slice(0, 30).map((item: TwitterItem) => (
+                <article key={item.id}>
+                  <div>
+                    <strong>@{item.handle}{item.authorName && item.authorName !== item.handle ? ` · ${item.authorName}` : ""}</strong>
+                    <span>{item.createdAt ? new Date(item.createdAt).toLocaleString("zh-CN") : "时间未知"}</span>
+                    <small>{item.text}</small>
+                    {item.url ? <a href={item.url} target="_blank" rel="noreferrer">查看原文</a> : null}
+                  </div>
+                </article>
+              ))}
             </section>
           )}
         </div>

@@ -13,6 +13,19 @@ const {
   listDocumentLibrary
 } = require("../electron/document-library.cjs");
 
+test("translated knowledge shows a Chinese title while its original filename and path remain usable", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-chinese-title-"));
+  try {
+    const name = "20260923English Knowledge Article.md";
+    const file = path.join(root, name);
+    fs.writeFileSync(file, "<!-- domi:managed:start -->\n# 中文知识文章\n<!-- domi:managed:end -->\n");
+    const node = listDocumentLibrary(root).nodes[0];
+    assert.equal(node.name, name);
+    assert.equal(node.path, file);
+    assert.equal(node.displayName, "20260923中文知识文章.md");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test("new local libraries are rooted in a domi工作区 folder", () => {
   const selectedDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "domi-workspace-parent-"));
   try {
@@ -20,8 +33,8 @@ test("new local libraries are rooted in a domi工作区 folder", () => {
     assert.equal(workspaceRoot, path.join(selectedDirectory, "domi工作区"));
     assert.equal(domiWorkspaceRoot(workspaceRoot), workspaceRoot);
     ensureDocumentLibraryStructure(workspaceRoot);
-    assert.ok(fs.existsSync(path.join(workspaceRoot, "3.项目库")));
-    assert.ok(fs.existsSync(path.join(workspaceRoot, "4.人脉库")));
+    assert.ok(fs.existsSync(path.join(workspaceRoot, "07.模型层")));
+    assert.ok(fs.existsSync(path.join(workspaceRoot, "12.人脉")));
     const todoDocumentPath = path.join(workspaceRoot, LOCAL_TODO_DOCUMENT_NAME);
     assert.ok(fs.existsSync(todoDocumentPath));
     assert.match(fs.readFileSync(todoDocumentPath, "utf8"), /^# 待办事项/m);
@@ -41,7 +54,7 @@ test("document library reflects the canonical local repository structure", () =>
   const rootPath = fs.mkdtempSync(path.join(os.tmpdir(), "domi-document-library-"));
   try {
     ensureDocumentLibraryStructure(rootPath);
-    const projectDirectory = path.join(rootPath, "3.项目库", "AI", "Agent", "示例项目");
+    const projectDirectory = path.join(rootPath, "07.模型层", "闭源基础模型", "示例项目");
     fs.mkdirSync(projectDirectory, { recursive: true });
     fs.writeFileSync(path.join(projectDirectory, "项目主页.md"), "# 示例项目\n");
     fs.writeFileSync(path.join(projectDirectory, "融资材料.pdf"), "%PDF-1.4\n");
@@ -67,11 +80,11 @@ test("document library reflects the canonical local repository structure", () =>
       "directory entries and unsupported files must not trigger per-item lstat calls"
     );
     assert.deepEqual(
-      snapshot.nodes.slice(0, 4).map((node) => node.name),
-      DOCUMENT_LIBRARY_DIRECTORIES
+      snapshot.nodes.filter((node) => node.kind === "folder").map((node) => node.name).sort(),
+      [...DOCUMENT_LIBRARY_DIRECTORIES].sort()
     );
-    const projectRoot = snapshot.nodes.find((node) => node.name === "3.项目库");
-    const project = projectRoot.children[0].children[0].children[0];
+    const projectRoot = snapshot.nodes.find((node) => node.name === "07.模型层");
+    const project = projectRoot.children[0].children[0];
     assert.deepEqual(project.children.map((node) => node.kind).sort(), ["markdown", "pdf"]);
   } finally {
     fs.rmSync(rootPath, { recursive: true, force: true });
@@ -82,7 +95,7 @@ test("document library creates Markdown files and folders without escaping its r
   const rootPath = fs.mkdtempSync(path.join(os.tmpdir(), "domi-document-create-"));
   try {
     ensureDocumentLibraryStructure(rootPath);
-    const parentPath = path.join(rootPath, "1.行业研究");
+    const parentPath = path.join(rootPath, "13.认知库");
     const folder = createDocumentLibraryEntry(rootPath, {
       parentPath,
       kind: "folder",
@@ -116,7 +129,8 @@ test("document library prefers the configured repository root", () => {
       localLibraryDir: "/tmp/materials"
     }),
     {
-      rootPath: "/tmp/domi-repository",
+      // path.resolve 在 Windows 上把 /tmp 映射到当前盘符，期望值需同样计算。
+      rootPath: path.resolve("/tmp/domi-repository"),
       initializeStructure: true
     }
   );
@@ -128,7 +142,7 @@ test("legacy project-material folder opens from its containing library root", ()
       localLibraryDir: "/tmp/1.Investment/3.项目库"
     }),
     {
-      rootPath: "/tmp/1.Investment",
+      rootPath: path.resolve("/tmp/1.Investment"),
       initializeStructure: false
     }
   );

@@ -18,18 +18,24 @@ test("Lark runtime specification pins both official macOS releases", () => {
   const specification = require("../resources/lark-runtime.json");
   assert.equal(specification.version, "1.0.60");
   assert.equal(specification.license, "MIT");
-  assert.equal(validateSpecification(specification, "arm64").sha256,
+  assert.equal(validateSpecification(specification, "arm64", "darwin").sha256,
     "3c9ae7a6f98a13e4f429add6f845f25b4099e9275e56fe0b82b587bad8d633f6");
-  assert.equal(validateSpecification(specification, "x64").sha256,
+  assert.equal(validateSpecification(specification, "x64", "darwin").sha256,
     "5a42a244cd3ae95725514f1f8d264f95a82f99d20f769fc27fdece44b7c38b6d");
+  // Windows 官方发布同样被固定在规格文件中。
+  assert.equal(validateSpecification(specification, "x64", "win32").target, "windows-amd64");
+  assert.equal(validateSpecification(specification, "x64", "win32").sha256,
+    "151912dc244541f4698343e5ef470db3bccbeb838be1ca329836616299151f18");
+  assert.equal(validateSpecification(specification, "arm64", "win32").target, "windows-arm64");
 });
 
 test("Lark runtime output is architecture-specific", () => {
   assert.equal(resolveTargetArchitecture("arm64"), "arm64");
   assert.equal(resolveTargetArchitecture("x64"), "x64");
   assert.throws(() => resolveTargetArchitecture("universal"), /Unsupported Lark runtime architecture/);
-  assert.match(outputRootForArchitecture("arm64"), /build\/lark-runtime-arm64$/);
-  assert.match(outputRootForArchitecture("x64"), /build\/lark-runtime-x64$/);
+  const separatorPattern = path.sep === "\\" ? "\\\\" : "/";
+  assert.match(outputRootForArchitecture("arm64"), new RegExp(`build${separatorPattern}lark-runtime-arm64$`));
+  assert.match(outputRootForArchitecture("x64"), new RegExp(`build${separatorPattern}lark-runtime-x64$`));
 });
 
 test("Lark runtime resolver prefers packaged resources and validates the manifest", (t) => {
@@ -51,6 +57,12 @@ test("Lark runtime resolver prefers packaged resources and validates the manifes
 });
 
 test("Lark runtime resolver rejects a symlinked executable", (t) => {
+  if (process.platform === "win32") {
+    // 创建文件符号链接在 Windows 需要管理员权限或开发者模式，
+    // 该场景仅对 POSIX 运行时有意义。
+    t.skip("symlink-based lark runtime layout requires POSIX privileges");
+    return;
+  }
   const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "domi-lark-runtime-link-test-"));
   t.after(() => fs.rmSync(temporaryRoot, { recursive: true, force: true }));
   const runtimeRoot = path.join(temporaryRoot, "build", "lark-runtime-arm64");

@@ -10,19 +10,160 @@ const {
   shouldIndexFile,
   upsertIndexedDocument
 } = require("./document-search-index.cjs");
+const {
+  countPendingEmbeddings,
+  fetchChunkTexts,
+  loadPendingChunkBatch,
+  semanticScan,
+  storeEmbeddings
+} = require("./semantic-chunks.cjs");
+const {
+  EMBED_BATCH_SIZE,
+  configureSemanticEmbedder,
+  embedTexts,
+  semanticEmbedderReady,
+  warmSemanticEmbedder
+} = require("./semantic-embedder.cjs");
+
+// Windows cannot detect cloud placeholders through stat (libuv never fills
+// stat.blocks there), so guard by root path markers instead. Reading a
+// placeholder would trigger an on-demand download of the whole file.
+const CLOUD_ROOT_PATTERN = /(?:^|\/)(onedrive|dropbox|nutstore|坚果云|googledrive|google drive|idrive)(?:$|\/)/i;
 
 const database = openDocumentSearchIndex(workerData.databasePath);
+if (workerData.semanticCacheDir) {
+  configureSemanticEmbedder({ cacheDir: workerData.semanticCacheDir });
+}
 let activeRoot = "";
 let indexing = false;
 let indexedCount = 0;
 let lastIndexedAt = 0;
 let lastError = "";
+let lastScanComplete = false;
+let cloudContentAllowed = false;
+let semanticEnabled = false;
+let embeddingPumpActive = false;
 let rerunRequested = false;
 let activeGeneration = "";
 const INDEX_FRESHNESS_MS = 5 * 60_000;
+const EMBED_PUMP_IDLE_MS = 60_000;
 
 function status() {
-  return { indexing, indexedCount, lastIndexedAt, error: lastError || undefined };
+  return {
+    indexing,
+    indexedCount,
+    lastIndexedAt,
+    partial: !lastScanComplete,
+    error: lastError || undefined
+  };
+}
+
+// Short operations (single-file upserts, searches) are serialized through one
+// queue so a search that arrives right after an index-file message always
+// observes the freshly indexed content.
+let queueTail = Promise.resolve();
+
+function enqueue(operation) {
+  const run = queueTail.then(operation);
+  queueTail = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+function rootLooksCloudSynced(rootPath) {
+  const normalized = String(rootPath || "").split(path.sep).join("/");
+  return CLOUD_ROOT_PATTERN.test(normalized);
+}
+
+function adoptSemanticSettings(message) {
+  const next = message.semanticEnabled === true;
+  if (next === semanticEnabled) return;
+  semanticEnabled = next;
+  if (semanticEnabled) {
+    // Loading (and first-use downloading) the model is fire-and-forget:
+    // retrieval simply stays unavailable until it is ready.
+    warmSemanticEmbedder();
+    scheduleEmbeddingPump();
+  }
+}
+
+// Background pump: fills embeddings for pending chunks in small batches,
+// yielding between batches so queued searches are never starved for long.
+function scheduleEmbeddingPump() {
+  if (!semanticEnabled || embeddingPumpActive) return;
+  embeddingPumpActive = true;
+  const pump = async () => {
+    for (;;) {
+      if (!semanticEnabled) {
+        // Stay alive (cheap idle poll) so re-enabling the setting never
+        // leaves the pipeline without a pump.
+        await new Promise((resolve) => setTimeout(resolve, EMBED_PUMP_IDLE_MS));
+        continue;
+      }
+      if (!semanticEmbedderReady()) {
+        await new Promise((resolve) => setTimeout(resolve, 2_000));
+        continue;
+      }
+      const pending = countPendingEmbeddings(database);
+      if (!pending) {
+        await new Promise((resolve) => setTimeout(resolve, EMBED_PUMP_IDLE_MS));
+        continue;
+      }
+      const batch = loadPendingChunkBatch(database, EMBED_BATCH_SIZE);
+      if (!batch.length) continue;
+      const vectors = await embedTexts(batch.map((item) => item.text), "passage");
+      if (!vectors) {
+        // Embedding failed for this batch; back off instead of hot-looping.
+        await new Promise((resolve) => setTimeout(resolve, 5_000));
+        continue;
+      }
+      storeEmbeddings(database, batch.map((item, index) => ({
+        id: item.id,
+        embedding: vectors[index]
+      })));
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  };
+  void pump();
+}
+
+async function semanticSearch(message) {
+  const query = String(message.request?.query || "").trim();
+  if (!query) {
+    return { ok: true, available: true, results: [], degraded: false };
+  }
+  if (!semanticEnabled) {
+    return { ok: true, available: false, results: [], degraded: false };
+  }
+  if (!semanticEmbedderReady()) {
+    return { ok: true, available: false, results: [], degraded: false };
+  }
+  const limit = Math.max(1, Math.min(Number(message.request?.limit) || 8, 60));
+  const vectors = await embedTexts([query], "query");
+  if (!vectors?.length) {
+    return { ok: false, available: true, results: [], degraded: false };
+  }
+  const scan = semanticScan(database, vectors[0], limit);
+  const texts = fetchChunkTexts(database, scan.results.map((result) => result.id));
+  return {
+    ok: true,
+    available: true,
+    degraded: scan.degraded,
+    scanned: scan.scanned,
+    results: scan.results.map((result) => ({
+      path: result.path,
+      relativePath: result.relativePath,
+      line: result.startLine,
+      endLine: result.endLine,
+      offset: result.offset,
+      endOffset: result.endOffset,
+      snippet: texts.get(result.id) || "",
+      score: result.score
+    }))
+  };
+}
+
+function skipContentFor(rootPath) {
+  return process.platform === "win32" && rootLooksCloudSynced(rootPath) && !cloudContentAllowed;
 }
 
 function yieldToMessages() {
@@ -56,6 +197,7 @@ async function indexRoot(rootPath) {
   }
   indexing = true;
   lastError = "";
+  const skipContent = skipContentFor(rootPath);
   const generation = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   activeGeneration = generation;
   const scanState = { complete: true };
@@ -76,9 +218,13 @@ async function indexRoot(rootPath) {
       }
       if (!stat.isFile()) continue;
       try {
-        if (upsertIndexedDocument(database, scanRoot, filePath, stat, generation)) changed += 1;
-      } catch {
-        // A single unreadable/partially-synced OneDrive file must not invalidate the index.
+        if (await upsertIndexedDocument(database, scanRoot, filePath, stat, generation, { skipContent })) {
+          changed += 1;
+        }
+      } catch (error) {
+        // Retain existing index rows when a file is temporarily unreadable.
+        scanState.complete = false;
+        lastError = `Index failed: ${filePath}: ${error instanceof Error ? error.message : String(error)}`;
       }
       scanned += 1;
       if (scanned % 20 === 0) {
@@ -87,14 +233,22 @@ async function indexRoot(rootPath) {
         await yieldToMessages();
       }
     }
-    if (activeRoot === scanRoot && scanState.complete) {
-      removeStaleDocuments(database, generation);
-      indexedCount = scanned;
-      lastIndexedAt = Date.now();
+    if (activeRoot === scanRoot) {
+      if (scanState.complete) {
+        removeStaleDocuments(database, generation);
+        lastScanComplete = true;
+        indexedCount = scanned;
+        lastIndexedAt = Date.now();
+      } else {
+        // Incomplete scan: stale rows are kept on purpose (they may be merely
+        // unreadable, not deleted) but the index is flagged as partial.
+        lastScanComplete = false;
+      }
     }
     parentPort.postMessage({ type: "indexed", status: status(), changed });
   } catch (error) {
     lastError = error instanceof Error ? error.message : String(error);
+    lastScanComplete = false;
     lastIndexedAt = Date.now();
     parentPort.postMessage({ type: "status", status: status() });
   } finally {
@@ -108,39 +262,51 @@ async function indexRoot(rootPath) {
   }
 }
 
+function adoptRoot(rootPath) {
+  const resolvedRoot = path.resolve(rootPath);
+  if (activeRoot !== resolvedRoot) {
+    activeRoot = configureRoot(database, resolvedRoot);
+    lastIndexedAt = 0;
+    indexedCount = 0;
+    lastScanComplete = false;
+    if (indexing) rerunRequested = true;
+  }
+  return activeRoot;
+}
+
 parentPort.on("message", (message) => {
   if (!message || typeof message !== "object") return;
+  adoptSemanticSettings(message);
   if (message.type === "index-file") {
+    cloudContentAllowed = message.cloudContentAllowed === true;
     const rootPath = path.resolve(message.rootPath);
     const filePath = path.resolve(message.filePath);
-    if (activeRoot !== rootPath) {
-      activeRoot = configureRoot(database, rootPath);
-      lastIndexedAt = 0;
-      indexedCount = 0;
-      if (indexing) rerunRequested = true;
-    }
-    if (activeRoot === rootPath && pathInsideRoot(rootPath, filePath) && shouldIndexFile(filePath)) {
-      void fs.promises.stat(filePath).then((stat) => {
-        if (!stat.isFile()) return;
-        upsertIndexedDocument(
-          database,
-          rootPath,
-          filePath,
-          stat,
-          activeGeneration || `direct-${Date.now()}`
-        );
-      }).catch(() => undefined);
+    if (adoptRoot(rootPath) === rootPath
+      && pathInsideRoot(rootPath, filePath)
+      && shouldIndexFile(filePath)) {
+      enqueue(async () => {
+        try {
+          const stat = await fs.promises.stat(filePath);
+          if (!stat.isFile()) return;
+          await upsertIndexedDocument(
+            database,
+            rootPath,
+            filePath,
+            stat,
+            activeGeneration || `direct-${Date.now()}`,
+            { skipContent: skipContentFor(rootPath) }
+          );
+        } catch {
+          // Transient races (file removed between messages) are fine.
+        }
+      });
     }
     return;
   }
   if (message.type === "index") {
+    cloudContentAllowed = message.cloudContentAllowed === true;
     const rootPath = path.resolve(message.rootPath);
-    if (activeRoot !== rootPath) {
-      activeRoot = configureRoot(database, rootPath);
-      lastIndexedAt = 0;
-      indexedCount = 0;
-      if (indexing) rerunRequested = true;
-    }
+    adoptRoot(rootPath);
     if (indexing && message.force === true) {
       rerunRequested = true;
     } else if (!indexing && (message.force === true || Date.now() - lastIndexedAt >= INDEX_FRESHNESS_MS)) {
@@ -148,36 +314,57 @@ parentPort.on("message", (message) => {
     }
     return;
   }
-  if (message.type !== "search") return;
-  try {
-    const rootPath = path.resolve(message.rootPath);
-    if (activeRoot !== rootPath) {
-      activeRoot = configureRoot(database, rootPath);
-      lastIndexedAt = 0;
-      indexedCount = 0;
-      if (indexing) rerunRequested = true;
-    }
-    if (!indexing && Date.now() - lastIndexedAt >= INDEX_FRESHNESS_MS) {
-      void indexRoot(rootPath);
-    }
-    const results = searchIndexedDocuments(database, message.request);
-    parentPort.postMessage({
-      type: "response",
-      id: message.id,
-      result: { ok: !lastError, results, ...status() }
-    });
-  } catch (error) {
-    parentPort.postMessage({
-      type: "response",
-      id: message.id,
-      result: {
-        ok: false,
-        results: [],
-        error: error instanceof Error ? error.message : String(error),
-        ...status()
-      }
-    });
+  if (message.type !== "search" && message.type !== "semantic-search") return;
+  cloudContentAllowed = message.cloudContentAllowed === true;
+  const rootPath = path.resolve(message.rootPath);
+  adoptRoot(rootPath);
+  if (!indexing && Date.now() - lastIndexedAt >= INDEX_FRESHNESS_MS) {
+    void indexRoot(rootPath);
   }
+  if (message.type === "semantic-search") {
+    void semanticSearch(message).then((result) => {
+      parentPort.postMessage({
+        type: "response",
+        id: message.id,
+        result
+      });
+    }).catch((error) => {
+      parentPort.postMessage({
+        type: "response",
+        id: message.id,
+        result: {
+          ok: false,
+          available: true,
+          results: [],
+          degraded: false,
+          error: error instanceof Error ? error.message : String(error)
+        }
+      });
+    });
+    return;
+  }
+  enqueue(() => {
+    try {
+      const search = searchIndexedDocuments(database, message.request);
+      parentPort.postMessage({
+        type: "response",
+        id: message.id,
+        result: { ok: !lastError, results: search.results, degraded: search.degraded, ...status() }
+      });
+    } catch (error) {
+      parentPort.postMessage({
+        type: "response",
+        id: message.id,
+        result: {
+          ok: false,
+          results: [],
+          degraded: false,
+          error: error instanceof Error ? error.message : String(error),
+          ...status()
+        }
+      });
+    }
+  });
 });
 
 process.on("exit", () => {

@@ -37,6 +37,53 @@ function executableExists(candidate) {
   }
 }
 
+function codexHostPathFor(binaryPath) {
+  const directory = path.dirname(binaryPath);
+  // Windows 发行版把命令宿主命名为 codex-code-mode-host.exe；npm 全局
+  // 安装则是 codex-code-mode-host.cmd。优先匹配原始 Unix 命名以保持既有
+  // 行为，再回退到 Windows 命名。
+  const hostNames = ["codex-code-mode-host"];
+  if (process.platform === "win32") {
+    hostNames.push("codex-code-mode-host.exe", "codex-code-mode-host.cmd");
+  }
+  for (const hostName of hostNames) {
+    const hostPath = path.join(directory, hostName);
+    if (executableExists(hostPath)) return hostPath;
+  }
+  return null;
+}
+
+function codexSpawnPlan(binaryPath, args) {
+  if (process.platform !== "win32") {
+    return { command: binaryPath, args, env: {} };
+  }
+  const lower = String(binaryPath).toLowerCase();
+  if (lower.endsWith(".exe") || lower.endsWith(".com")) {
+    return { command: binaryPath, args, env: {} };
+  }
+  if (lower.endsWith(".cmd") || lower.endsWith(".bat")) {
+    // npm 全局安装的 CLI 在 Windows 上是 cmd 批处理包装；CreateProcess
+    // 无法直接执行，Node 也拒绝无 shell 的 .cmd spawn，需经 cmd.exe
+    // 解释（cross-spawn 的标准引号方式 + verbatim 参数避免二次转义）。
+    const quoted = [binaryPath, ...args]
+      .map((value) => /[\s"]/.test(value) ? `"${value}"` : value)
+      .join(" ");
+    return {
+      command: process.env.ComSpec || "cmd.exe",
+      args: ["/d", "/s", "/c", quoted],
+      env: {},
+      windowsVerbatimArguments: true
+    };
+  }
+  // 无扩展名或 .js 脚本（例如本地开发的 Node 版 Codex 或测试桩）：
+  // 以 Node 模式用当前运行时执行。
+  return {
+    command: process.execPath,
+    args: [binaryPath, ...args],
+    env: { ELECTRON_RUN_AS_NODE: "1" }
+  };
+}
+
 function canonicalCodexRuntime(candidate) {
   const requestedPath = String(candidate || "").trim();
   if (!requestedPath || !executableExists(requestedPath)) return null;
@@ -47,8 +94,8 @@ function canonicalCodexRuntime(candidate) {
     return null;
   }
   if (!executableExists(binaryPath)) return null;
-  const hostPath = path.join(path.dirname(binaryPath), "codex-code-mode-host");
-  if (!executableExists(hostPath)) return null;
+  const hostPath = codexHostPathFor(binaryPath);
+  if (!hostPath) return null;
   return { binaryPath, hostPath, requestedPath };
 }
 
@@ -64,6 +111,16 @@ function resolveCodexBinary(preferredPath = "") {
     "/usr/local/bin/codex",
     "/usr/bin/codex"
   ].filter(Boolean);
+  if (process.platform === "win32") {
+    // Windows：官方 standalone / 用户目录使用 codex.exe；开发模式下
+    // @openai/codex-sdk 的平台分包也内置了完整的 Codex 运行时。
+    const vendorTriple = process.arch === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc";
+    candidates.push(
+      path.join(home, ".codex", "packages", "standalone", "current", "bin", "codex.exe"),
+      path.join(home, ".local", "bin", "codex.exe"),
+      path.join(__dirname, "..", "node_modules", `@openai/codex-win32-${process.arch}`, "vendor", vendorTriple, "bin", "codex.exe")
+    );
+  }
 
   const runtime = candidates
     .map(canonicalCodexRuntime)
@@ -88,6 +145,7 @@ class CodexAppServer {
     onNotification,
     onUserInputRequest,
     onUserInputRequestClosed,
+    onDynamicToolCall,
     onLog,
     onExit,
     requestTimeoutMs = 45_000
@@ -98,6 +156,7 @@ class CodexAppServer {
     this.onNotification = onNotification;
     this.onUserInputRequest = onUserInputRequest;
     this.onUserInputRequestClosed = onUserInputRequestClosed;
+    this.onDynamicToolCall = onDynamicToolCall;
     this.onLog = onLog;
     this.onExit = onExit;
     this.requestTimeoutMs = requestTimeoutMs;
@@ -105,6 +164,7 @@ class CodexAppServer {
     this.startPromise = null;
     this.pending = new Map();
     this.pendingUserInput = new Map();
+    this.pendingToolCalls = new Set();
     this.resolvedUserInput = new Set();
     this.nextRequestId = 1;
     this.intentionalClose = false;
@@ -197,10 +257,13 @@ class CodexAppServer {
     this.pendingUserInput.clear();
     this.resolvedUserInput.clear();
     this.declaredCapabilities = codexClientCapabilities();
-    this.child = spawn(binary, ["app-server", "--listen", "stdio://", ...(runtime.args || [])], {
+    const runtimeArguments = ["app-server", "--listen", "stdio://", ...(runtime.args || [])];
+    const plan = codexSpawnPlan(binary, runtimeArguments);
+    this.child = spawn(plan.command, plan.args, {
       cwd: this.cwd,
-      env: codexEnvironment(runtime.env),
-      stdio: ["pipe", "pipe", "pipe"]
+      env: { ...codexEnvironment(runtime.env), ...plan.env },
+      stdio: ["pipe", "pipe", "pipe"],
+      ...(plan.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {})
     });
 
     const processStarted = new Promise((resolve, reject) => {
@@ -214,7 +277,7 @@ class CodexAppServer {
     this.child.stderr.on("data", (chunk) => {
       const text = chunk.toString();
       this.stderrTail = `${this.stderrTail}${text}`.slice(-8000);
-      this.onLog?.(text);
+      this.#emitLog(text);
     });
 
     this.child.on("exit", (code, signal) => {
@@ -252,7 +315,7 @@ class CodexAppServer {
         throw error;
       }
       this.declaredCapabilities = codexClientCapabilities({ experimentalApi: false });
-      this.onLog?.("当前 Codex 版本不接受 experimentalApi 声明，domi 已切换稳定兼容模式。\n");
+      this.#emitLog("当前 Codex 版本不接受 experimentalApi 声明，domi 已切换稳定兼容模式。\n");
       await this.#sendRequest("initialize", initializeParams);
     }
     this.#send({ method: "initialized" });
@@ -317,6 +380,15 @@ class CodexAppServer {
     this.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
+  #emitLog(text) {
+    try {
+      this.onLog?.(text);
+    } catch {
+      // 日志回调抛错（例如宿主 stderr 管道已断开触发 EPIPE）
+      // 不应中断 App Server 的事件处理导致主进程崩溃。
+    }
+  }
+
   #handleLine(line) {
     const trimmed = line.trim();
     if (!trimmed) {
@@ -327,7 +399,7 @@ class CodexAppServer {
     try {
       message = JSON.parse(trimmed);
     } catch {
-      this.onLog?.(`无法解析 App Server 消息：${trimmed}\n`);
+      this.#emitLog(`无法解析 App Server 消息：${trimmed}\n`);
       return;
     }
 
@@ -360,6 +432,26 @@ class CodexAppServer {
   }
 
   #handleServerRequest(message) {
+    if (message.method === "item/tool/call") {
+      const key = this.#requestKey(message.id);
+      if (this.pendingToolCalls.has(key)) return;
+      this.pendingToolCalls.add(key);
+      const child = this.child;
+      Promise.resolve().then(() => {
+        if (typeof this.onDynamicToolCall !== "function") throw new Error("当前客户端未注册资料读取工具。");
+        return this.onDynamicToolCall(message.params || {});
+      }).then((result) => ({
+        success: Boolean(result) && result.ok !== false,
+        contentItems: [{ type: "inputText", text: JSON.stringify(result || { ok: false, error: "工具未返回结果。" }) }]
+      })).catch((error) => ({
+        success: false,
+        contentItems: [{ type: "inputText", text: JSON.stringify({ ok: false, error: error.message || String(error) }) }]
+      })).then((result) => {
+        this.pendingToolCalls.delete(key);
+        if (this.child === child && child && !child.killed) this.#send({ id: message.id, result });
+      }).catch((error) => this.#emitLog(`资料工具响应未能送达：${error.message}\n`));
+      return;
+    }
     const approvalMethods = new Set([
       "item/commandExecution/requestApproval",
       "item/fileChange/requestApproval",

@@ -11,20 +11,49 @@ const SETTINGS_KEY = "runtime";
 const EMAIL_PATTERN = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
 const MAX_CALENDAR_RECIPIENTS = 50;
 const RADAR_DOMAINS = Object.freeze([
-  "AI",
-  "半导体",
-  "智能出行",
-  "前沿科技",
-  "具身智能&机器人",
-  "消费",
-  "生物医药"
+  "能源与电力",
+  "数据中心基础设施",
+  "算力芯片",
+  "服务器与整机制造",
+  "云与算力服务",
+  "模型层",
+  "基础软件与工具链",
+  "Agent与平台",
+  "应用",
+  "终端与具身"
 ]);
-const LEGACY_RADAR_DEFAULT_DOMAINS = Object.freeze(RADAR_DOMAINS.slice(0, 5));
+// Stored values from the pre-chain vocabulary are remapped on read so an
+// existing user's radar subscription survives the taxonomy migration.
+const LEGACY_DOMAIN_ALIASES = Object.freeze({
+  AI: "模型层",
+  "半导体": "算力芯片",
+  "能源": "能源与电力",
+  "企业软件": "基础软件与工具链",
+  "具身智能&机器人": "终端与具身",
+  "智能出行": "终端与具身",
+  "前沿科技": "其他行业",
+  "消费": "其他行业",
+  "消费科技": "其他行业",
+  "生物医药": "其他行业",
+  "互联网科技": "其他行业"
+});
+const LEGACY_RADAR_DEFAULT_DOMAINS = Object.freeze([
+  "算力芯片",
+  "数据中心基础设施",
+  "模型层",
+  "Agent与平台",
+  "应用"
+]);
 
 function normalizeRadarFollowedDomains(value) {
-  if (!Array.isArray(value)) return [...LEGACY_RADAR_DEFAULT_DOMAINS];
-  const selected = new Set(value.map((item) => String(item || "").trim()));
-  return RADAR_DOMAINS.filter((domain) => selected.has(domain));
+if (!Array.isArray(value)) return [...LEGACY_RADAR_DEFAULT_DOMAINS];
+const selected = new Set(
+value
+.map((item) => String(item || "").trim())
+.map((item) => LEGACY_DOMAIN_ALIASES[item] || item)
+);
+// 空数组表示用户主动暂停全部采集，必须保留，不得回退默认值。
+return RADAR_DOMAINS.filter((domain) => selected.has(domain));
 }
 
 function parseCalendarRecipients(value = "") {
@@ -56,6 +85,10 @@ function parseCalendarRecipients(value = "") {
   return recipients;
 }
 
+function normalizeAgentProvider(value) {
+  return ["claude", "workbuddy"].includes(value) ? value : "codex";
+}
+
 function normalizeCalendarRecipients(value = "") {
   return parseCalendarRecipients(value).map((recipient) => recipient.label).join(", ");
 }
@@ -66,7 +99,13 @@ const defaultSettings = Object.freeze({
   authMode: "chatgpt",
   apiBaseUrl: "",
   apiModel: "",
+  apiWireApi: "responses",
   relayCredentialConfigured: false,
+  agentProvider: "codex",
+  claudeCliPath: "",
+  workbuddyCliPath: "",
+  workbuddyArgs: "",
+  claudeModel: "",
   codexPath: "",
   plaudConnectionMode: "unconfigured",
   plaudBrowser: "chrome",
@@ -88,7 +127,9 @@ const defaultSettings = Object.freeze({
   localDatabasePath: "",
   externalAccessMode: "always",
   radarFollowedDomains: [...LEGACY_RADAR_DEFAULT_DOMAINS],
-  updateChannel: "stable"
+documentSearchCloudContent: false,
+semanticSearchEnabled: true,
+updateChannel: "stable"
 });
 
 const domiConfigKeys = Object.freeze([
@@ -156,14 +197,29 @@ function normalizeSettings(value = {}) {
     : value.onboardingComplete
       ? "enabled"
       : "unconfigured";
-  const authMode = version >= 5 && value.authMode === "relay" ? "relay" : "chatgpt";
+  const agentProvider = normalizeAgentProvider(value.agentProvider);
+  const authMode = version >= 5 && value.authMode === "relay"
+    ? "relay"
+    : version >= 9 && value.authMode === "agent-cli" && ["claude", "workbuddy"].includes(agentProvider)
+      ? "agent-cli"
+      : "chatgpt";
+  const apiWireApi = authMode === "relay" && value.apiWireApi === "chat" ? "chat" : "responses";
+
   return {
     version: 9,
     onboardingComplete: Boolean(value.onboardingComplete),
     authMode,
     apiBaseUrl: authMode === "relay" ? String(value.apiBaseUrl || "").trim() : "",
     apiModel: authMode === "relay" ? String(value.apiModel || "").trim() : "",
+    apiWireApi,
     relayCredentialConfigured: authMode === "relay" && Boolean(value.relayCredentialConfigured),
+    agentProvider: ["relay", "agent-cli"].includes(authMode) && ["claude", "workbuddy"].includes(value.agentProvider)
+      ? value.agentProvider
+      : "codex",
+    claudeCliPath: String(value.claudeCliPath || "").trim(),
+    workbuddyCliPath: String(value.workbuddyCliPath || "").trim(),
+    workbuddyArgs: String(value.workbuddyArgs || "").trim(),
+    claudeModel: String(value.claudeModel || "").trim(),
     codexPath,
     plaudConnectionMode,
     plaudBrowser: value.plaudBrowser === "tabbit" ? "tabbit" : "chrome",
@@ -188,7 +244,9 @@ function normalizeSettings(value = {}) {
     localDatabasePath,
     externalAccessMode: value.externalAccessMode === "ask" ? "ask" : "always",
     radarFollowedDomains: normalizeRadarFollowedDomains(value.radarFollowedDomains),
-    updateChannel: value.updateChannel === "beta" ? "beta" : "stable"
+documentSearchCloudContent: value.documentSearchCloudContent === true,
+semanticSearchEnabled: value.semanticSearchEnabled !== false,
+updateChannel: value.updateChannel === "beta" ? "beta" : "stable"
   };
 }
 
@@ -461,9 +519,20 @@ class AppSettingsService {
       codexPath: settings.codexPath,
       args: [],
       env: {},
-      defaultModel: settings.authMode === "relay" ? settings.apiModel : "",
-      providerLabel: settings.authMode === "relay" ? "Responses 中转站" : "个人 ChatGPT",
+      defaultModel: settings.authMode === "agent-cli"
+        ? settings.claudeModel
+        : settings.authMode === "relay" ? settings.apiModel : "",
+      providerLabel: settings.authMode === "agent-cli"
+        ? `${settings.agentProvider === "claude" ? "Claude" : "WorkBuddy"} 本地客户端`
+        : settings.agentProvider === "claude"
+          ? "Claude API（OpenAI 兼容）"
+          : settings.agentProvider === "workbuddy"
+            ? "WorkBuddy API（OpenAI 兼容）"
+            : settings.authMode === "relay"
+              ? (settings.apiWireApi === "chat" ? "Chat Completions 中转站" : "Responses 中转站")
+              : "个人 ChatGPT",
       apiBaseUrl: settings.authMode === "relay" ? settings.apiBaseUrl : "",
+      apiWireApi: settings.authMode === "relay" ? settings.apiWireApi : "",
       hasApiKey: settings.authMode === "relay" && settings.relayCredentialConfigured
     };
     if (this.domiConfigPath) runtime.env.DOMI_CONFIG_PATH = this.domiConfigPath;
@@ -475,6 +544,7 @@ module.exports = {
   AppSettingsService,
   defaultSettings,
   domiConfigKeys,
+  normalizeAgentProvider,
   normalizeCalendarRecipients,
   normalizeRadarFollowedDomains,
   normalizeSettings,

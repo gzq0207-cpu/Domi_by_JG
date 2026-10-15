@@ -24,7 +24,7 @@ test("entity workspaces reject library roots and symlink escapes", (t) => {
   fs.mkdirSync(outside, { recursive: true });
   fs.mkdirSync(projectsDir, { recursive: true });
   const escape = path.join(projectRoot, "escape");
-  fs.symlinkSync(outside, escape, "dir");
+  fs.symlinkSync(outside, escape, process.platform === "win32" ? "junction" : "dir");
   const settings = { storageBackend: "local", localRepositoryDir: library };
 
   assert.equal(validCodexWorkspace({
@@ -83,7 +83,7 @@ test("project cache scope requires the record's exact canonical directory", (t) 
   assert.deepEqual(crossed, { allowed: false, workspacePath: "" });
 
   const projectAlias = path.join(library, "3.项目库", "AI", "Agent", "项目别名");
-  fs.symlinkSync(projectB, projectAlias, "dir");
+  fs.symlinkSync(projectB, projectAlias, process.platform === "win32" ? "junction" : "dir");
   const redirected = projectResearchCacheScope({
     payload,
     workspacePath: projectB,
@@ -107,8 +107,8 @@ test("configured root aliases are allowed while symlinks below the root are reje
   fs.mkdirSync(projectB, { recursive: true });
   fs.mkdirSync(path.join(physicalLibrary, "4.人脉库"), { recursive: true });
   fs.mkdirSync(projectsDir, { recursive: true });
-  fs.symlinkSync(physicalLibrary, aliasLibrary, "dir");
-  fs.symlinkSync(projectB, projectAlias, "dir");
+  fs.symlinkSync(physicalLibrary, aliasLibrary, process.platform === "win32" ? "junction" : "dir");
+  fs.symlinkSync(projectB, projectAlias, process.platform === "win32" ? "junction" : "dir");
   const settings = { storageBackend: "local", localRepositoryDir: aliasLibrary };
 
   assert.equal(validCodexWorkspace({
@@ -142,7 +142,7 @@ test("a project-library root symlink cannot escape the selected repository", (t)
   fs.mkdirSync(escapedProject, { recursive: true });
   fs.mkdirSync(path.join(library, "4.人脉库"), { recursive: true });
   fs.mkdirSync(projectsDir, { recursive: true });
-  fs.symlinkSync(outsideProjectRoot, path.join(library, "3.项目库"), "dir");
+  fs.symlinkSync(outsideProjectRoot, path.join(library, "3.项目库"), process.platform === "win32" ? "junction" : "dir");
   const settings = { storageBackend: "local", localRepositoryDir: library };
 
   assert.equal(validCodexWorkspace({

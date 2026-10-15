@@ -24,6 +24,12 @@ function readManifest(manifestPath, targetArch) {
   }
 }
 
+function larkCliNames() {
+  // Windows 发行版以 .exe 结尾；优先匹配原始 Unix 命名，
+  // 保持手工准备的跨平台运行时目录行为一致。
+  return process.platform === "win32" ? ["lark-cli", "lark-cli.exe"] : ["lark-cli"];
+}
+
 function resolveBundledLarkRuntime(options = {}) {
   const resourcesPath = String(options.resourcesPath || process.resourcesPath || "").trim();
   const appRoot = path.resolve(options.appRoot || path.join(__dirname, ".."));
@@ -35,10 +41,13 @@ function resolveBundledLarkRuntime(options = {}) {
   ].filter(Boolean);
 
   for (const runtimeRoot of candidates) {
-    const cliPath = path.join(runtimeRoot, "bin", "lark-cli");
     const manifestPath = path.join(runtimeRoot, "manifest.json");
     const manifest = readManifest(manifestPath, targetArch);
-    if (!manifest || !executableFile(cliPath)) continue;
+    if (!manifest) continue;
+    const cliPath = larkCliNames()
+      .map((name) => path.join(runtimeRoot, "bin", name))
+      .find((candidate) => executableFile(candidate));
+    if (!cliPath) continue;
     return {
       ok: true,
       source: resourcesPath && path.resolve(runtimeRoot).startsWith(path.resolve(resourcesPath))
@@ -68,6 +77,7 @@ function resolveLarkCliForChild(options = {}) {
 
 module.exports = {
   executableFile,
+  larkCliNames,
   readManifest,
   resolveBundledLarkRuntime,
   resolveLarkCliForChild

@@ -8,6 +8,11 @@ const { execFileSync } = require("node:child_process");
 const root = path.resolve(__dirname, "..");
 const specificationPath = path.join(root, "resources", "lark-runtime.json");
 
+function tarBinary() {
+  // Windows 10+ 的 System32 tar.exe 是 bsdtar，同时支持 tar.gz 与 zip。
+  return process.platform === "win32" ? "tar" : "/usr/bin/tar";
+}
+
 function resolveTargetArchitecture(value = process.env.DOMI_TARGET_ARCH || process.arch) {
   const targetArch = String(value || "").trim();
   if (!new Set(["arm64", "x64"]).has(targetArch)) {
@@ -63,7 +68,21 @@ function download(url, destination, redirects = 0) {
   });
 }
 
-function validateSpecification(specification, targetArch) {
+function validateSpecification(specification, targetArch, platform = process.platform) {
+  if (platform === "win32") {
+    const target = specification?.targets?.[`win32-${targetArch}`];
+    if (
+      specification?.license !== "MIT"
+      || !/^\d+\.\d+\.\d+$/.test(String(specification?.version || ""))
+      || !target
+      || !/^https:\/\/github\.com\/larksuite\/cli\/releases\/download\//.test(String(target.url || ""))
+      || !/windows-(?:amd64|arm64)\.zip$/.test(String(target.url || ""))
+      || !/^[a-f0-9]{64}$/.test(String(target.sha256 || ""))
+    ) {
+      throw new Error("Lark runtime specification is invalid.");
+    }
+    return target;
+  }
   const target = specification?.targets?.[targetArch];
   if (
     specification?.license !== "MIT"
@@ -78,12 +97,16 @@ function validateSpecification(specification, targetArch) {
   return target;
 }
 
-function validateArchiveEntries(archivePath) {
-  const entries = execFileSync("/usr/bin/tar", ["-tzf", archivePath], {
+function validateArchiveEntries(archivePath, { platform = process.platform } = {}) {
+  const isWindows = platform === "win32";
+  const entries = execFileSync(tarBinary(), [isWindows ? "-tf" : "-tzf", archivePath], {
     encoding: "utf8",
     maxBuffer: 1024 * 1024
   }).split(/\r?\n/).filter(Boolean);
-  if (!entries.includes("lark-cli") || !entries.includes("LICENSE")) {
+  const expectedExecutable = isWindows ? "lark-cli.exe" : "lark-cli";
+  const normalized = entries.map((entry) => entry.replace(/^\.[\\/]/, "").replace(/\\/g, "/"));
+  if (!normalized.some((entry) => entry === expectedExecutable || entry.endsWith(`/${expectedExecutable}`))
+    || !normalized.some((entry) => entry === "LICENSE" || entry.endsWith("/LICENSE"))) {
     throw new Error("Lark CLI archive is missing its executable or license.");
   }
   if (entries.some((entry) => path.isAbsolute(entry) || entry.split("/").includes(".."))) {
@@ -110,15 +133,40 @@ function installPreparedRuntime(stagingRoot, outputRoot) {
   fs.renameSync(preparedRoot, outputRoot);
 }
 
+function findArchiveEntry(extractedRoot, fileName) {
+  const queue = [extractedRoot];
+  let visited = 0;
+  while (queue.length && visited < 5_000) {
+    const directory = queue.shift();
+    visited += 1;
+    let children;
+    try {
+      children = fs.readdirSync(directory, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const child of children) {
+      const candidate = path.join(directory, child.name);
+      if (child.isFile() && child.name === fileName) return candidate;
+      if (child.isDirectory() && !child.name.startsWith(".")) queue.push(candidate);
+    }
+  }
+  return "";
+}
+
 async function prepare(options = {}) {
   const targetArch = resolveTargetArchitecture(options.targetArch);
+  const platform = process.platform;
+  const isWindows = platform === "win32";
   const specification = JSON.parse(fs.readFileSync(specificationPath, "utf8"));
-  const target = validateSpecification(specification, targetArch);
+  const target = validateSpecification(specification, targetArch, platform);
   const outputRoot = outputRootForArchitecture(targetArch);
-  const cacheRoot = path.join(
-    os.homedir(),
-    "Library", "Caches", "com.domi.workbench", "lark-runtime", specification.version
-  );
+  const cacheRoot = isWindows
+    ? path.join(process.env.LOCALAPPDATA || os.homedir(), "domi", "cache", "lark-runtime", specification.version)
+    : path.join(
+      os.homedir(),
+      "Library", "Caches", "com.domi.workbench", "lark-runtime", specification.version
+    );
   const archivePath = options.archivePath
     ? path.resolve(options.archivePath)
     : path.join(cacheRoot, path.basename(new URL(target.url).pathname));
@@ -135,11 +183,47 @@ async function prepare(options = {}) {
     fs.renameSync(temporaryArchive, archivePath);
   }
 
-  validateArchiveEntries(archivePath);
+  validateArchiveEntries(archivePath, { platform });
   const stagingRoot = fs.mkdtempSync(path.join(os.tmpdir(), "domi-lark-runtime-"));
   const extractedRoot = path.join(stagingRoot, "extracted");
   const preparedRoot = path.join(stagingRoot, "prepared");
   fs.mkdirSync(extractedRoot, { recursive: true });
+  if (isWindows) {
+    execFileSync(tarBinary(), ["-xf", archivePath, "-C", extractedRoot]);
+    const extractedBinary = findArchiveEntry(extractedRoot, "lark-cli.exe");
+    const extractedLicense = findArchiveEntry(extractedRoot, "LICENSE");
+    if (!extractedBinary || !extractedLicense) {
+      throw new Error("Lark CLI archive is missing its executable or license.");
+    }
+    if (fs.lstatSync(extractedBinary).isSymbolicLink() || fs.lstatSync(extractedLicense).isSymbolicLink()) {
+      throw new Error("Lark CLI archive entries must be regular files.");
+    }
+    const licenseText = fs.readFileSync(extractedLicense, "utf8");
+    if (!licenseText.startsWith("MIT License") || !licenseText.includes(specification.copyright)) {
+      throw new Error("Lark CLI archive license does not match the pinned MIT notice.");
+    }
+    fs.mkdirSync(path.join(preparedRoot, "bin"), { recursive: true });
+    fs.copyFileSync(extractedBinary, path.join(preparedRoot, "bin", "lark-cli.exe"));
+    fs.copyFileSync(extractedLicense, path.join(preparedRoot, "LICENSE"));
+    const manifest = {
+      name: "lark-cli",
+      version: specification.version,
+      targetArch,
+      target: target.target,
+      license: specification.license,
+      source: specification.source,
+      upstreamUrl: target.url,
+      upstreamSha256: target.sha256,
+      binarySha256: sha256(path.join(preparedRoot, "bin", "lark-cli.exe"))
+    };
+    fs.writeFileSync(path.join(preparedRoot, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, {
+      mode: 0o644
+    });
+    installPreparedRuntime(stagingRoot, outputRoot);
+    console.log(`Prepared Lark CLI ${specification.version} for win32-${targetArch} at ${outputRoot}.`);
+    return { outputRoot, manifest };
+  }
+
   execFileSync("/usr/bin/tar", ["-xzf", archivePath, "-C", extractedRoot, "lark-cli", "LICENSE"]);
 
   const extractedBinary = path.join(extractedRoot, "lark-cli");
@@ -185,6 +269,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  findArchiveEntry,
   outputRootForArchitecture,
   prepare,
   resolveTargetArchitecture,

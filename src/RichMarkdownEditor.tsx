@@ -25,6 +25,7 @@ import {
   X
 } from "lucide-react";
 import { workbench } from "./bridge";
+import { isLocalMarkdownResource, isLocalPdfResource, resolveLocalDocumentLink } from "./document-resources";
 import { prepareMarkdownForEditor, restoreMarkdownFromEditor } from "./markdownDialect";
 import "./RichMarkdownEditor.css";
 
@@ -727,18 +728,13 @@ export default function RichMarkdownEditor({
             void workbench.openResource(href);
             return true;
           }
-          if (!href.startsWith("#") && !/^[a-z][a-z0-9+.-]*:/i.test(href)) {
+          const target = resolveLocalDocumentLink(href, documentPath);
+          if (target) {
             event.preventDefault();
-            try {
-              const baseUrl = new URL(`file://${encodeURI(documentPath)}`);
-              const target = decodeURIComponent(new URL(href, baseUrl).pathname);
-              if (/\.(?:md|markdown|pdf)$/i.test(target) && onOpenDocument) {
-                onOpenDocument(target);
-              } else {
-                void workbench.openResource(target);
-              }
-            } catch {
-              // Keep malformed links editable instead of opening an unintended path.
+            if ((isLocalMarkdownResource(target) || isLocalPdfResource(target)) && onOpenDocument) {
+              onOpenDocument(target);
+            } else {
+              void workbench.openResource(target);
             }
             return true;
           }

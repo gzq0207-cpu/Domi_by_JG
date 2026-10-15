@@ -4,17 +4,25 @@ const os = require("node:os");
 const path = require("node:path");
 const {
   RadarSourceService,
+  YouTubeDlp,
   normalizePublicUrl,
   parseRadarSourceBulkText,
   parsePodcastRss,
   parseXiaoyuzhouEpisode,
-  parseXiaoyuzhouEpisodeLinks
+  parseXiaoyuzhouEpisodeLinks,
+  youTubeEpisodeFromInfo,
+  youTubeVideoIdFromUrl,
+  parseYouTubeChannelFeed,
+  youTubeFeedLinkFromChannelPage,
+  youTubeChannelDescriptor,
+  twitterHandleFromUrl
 } = require("../electron/radar-sources.cjs");
 const { DomiIntegration } = require("../electron/domi-integration.cjs");
 
 function memoryStore() {
   const settings = new Map();
   const cache = new Map();
+  const secrets = new Map();
   let tick = 1_700_000_000_000;
   const metrics = { saveAppSettingsCount: 0, saveCacheCount: 0 };
   return {
@@ -36,6 +44,17 @@ function memoryStore() {
       const stored = { value, updatedAt: tick += 1 };
       cache.set(key, stored);
       return stored;
+    },
+    loadSecret(key) {
+      return secrets.get(key) || null;
+    },
+    saveSecret(key, value) {
+      const stored = { value: String(value), updatedAt: tick += 1 };
+      secrets.set(key, stored);
+      return stored;
+    },
+    deleteSecret(key) {
+      secrets.delete(key);
     }
   };
 }
@@ -357,6 +376,465 @@ assert.throws(() => normalizePublicUrl("https://user:pass@example.com/feed"), /�
   fs.rmSync(tempRoot, { recursive: true, force: true });
 })();
 
+{
+  assert.equal(youTubeVideoIdFromUrl("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+  assert.equal(youTubeVideoIdFromUrl("https://youtu.be/dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+  assert.equal(youTubeVideoIdFromUrl("https://www.youtube.com/shorts/dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+  assert.equal(youTubeVideoIdFromUrl("https://www.youtube.com/@channel"), "");
+  assert.equal(youTubeVideoIdFromUrl("https://example.com/watch?v=dQw4w9WgXcQ"), "");
+
+  const episode = youTubeEpisodeFromInfo({
+    _type: "video",
+    id: "dQw4w9WgXcQ",
+    webpage_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    title: "公开测试视频",
+    description: "公开视频简介",
+    channel: "测试频道",
+    upload_date: "20260807",
+    duration: 2700,
+    ext: "webm",
+    availability: "public",
+    age_limit: 0,
+    live_status: "not_live"
+  });
+  assert.equal(episode.sourceFormat, "youtube");
+  assert.equal(episode.episodeUrl, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+  assert.equal(episode.podcastTitle, "测试频道");
+  assert.equal(episode.durationSec, 2700);
+
+  assert.throws(() => youTubeEpisodeFromInfo({
+    _type: "video",
+    id: "dQw4w9WgXcQ",
+    webpage_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    duration: 2700,
+    availability: "subscriber_only"
+  }), /付费或需登录内容/);
+  assert.throws(() => youTubeEpisodeFromInfo({
+    _type: "video",
+    id: "dQw4w9WgXcQ",
+    webpage_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    duration: 2700,
+    age_limit: 18
+  }), /年龄限制/);
+  assert.throws(() => youTubeEpisodeFromInfo({
+    _type: "video",
+    id: "dQw4w9WgXcQ",
+    webpage_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    duration: 2700,
+    is_live: true
+  }), /直播/);
+  assert.throws(() => youTubeEpisodeFromInfo({
+    _type: "playlist"
+  }), /不接受频道或播放列表/);
+}
+
+(async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "domi-youtube-radar-"));
+  const calls = [];
+  const youTubeInfo = {
+    _type: "video",
+    id: "dQw4w9WgXcQ",
+    webpage_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    title: "公开 YouTube 测试视频",
+    description: "简介",
+    channel: "测试频道",
+    upload_date: "20260807",
+    duration: 2700,
+    ext: "m4a",
+    availability: "public",
+    age_limit: 0,
+    live_status: "not_live"
+  };
+  const youTube = new YouTubeDlp({
+    proxy: "http://127.0.0.1:7897",
+    execImpl: async (file, args) => {
+      calls.push({ file, args });
+      if (args[0] === "--version") return { stdout: "2026.07.04\n", stderr: "" };
+      if (args.includes("--dump-single-json")) {
+        return { stdout: `${JSON.stringify(youTubeInfo)}\n`, stderr: "" };
+      }
+      const outputIndex = args.indexOf("--output");
+      fs.writeFileSync(args[outputIndex + 1].replace(/%\(ext\)s$/, "m4a"), Buffer.from("youtube-audio"));
+      return { stdout: "", stderr: "" };
+    }
+  });
+  const service = new RadarSourceService({
+    stateStore: memoryStore(),
+    cacheDir: tempRoot,
+    fetchImpl: async () => {
+      throw new Error("YouTube 信源不应走普通 HTTP 抓取");
+    },
+    youTube
+  });
+  const source = service.save({
+    kind: "podcast",
+    name: "YouTube 公开视频",
+    url: "https://youtu.be/dQw4w9WgXcQ"
+  }).source;
+  const synced = await service.sync({ sourceId: source.id });
+  assert.equal(synced.ok, true);
+  assert.equal(synced.jobs.length, 1);
+  assert.equal(synced.jobs[0].sourceFormat, "youtube");
+  assert.equal(synced.jobs[0].episodeUrl, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+  assert.equal(synced.jobs[0].status, "discovered");
+
+  const job = synced.jobs[0];
+  const downloaded = await service.download(job.id, { maxBytes: 1024 * 1024 });
+  assert.equal(downloaded.ok, true);
+  assert.equal(fs.readFileSync(downloaded.path, "utf8"), "youtube-audio");
+  assert.equal(service.getJob(job.id).status, "downloaded");
+
+  const downloadCall = calls.find((call) => call.args.includes("--output"));
+  assert.ok(downloadCall, "下载必须通过 yt-dlp");
+  const formatIndex = downloadCall.args.indexOf("--format");
+  assert.match(downloadCall.args[formatIndex + 1], /^bestaudio/);
+  const proxyIndex = downloadCall.args.indexOf("--proxy");
+  assert.equal(downloadCall.args[proxyIndex + 1], "http://127.0.0.1:7897");
+  assert.equal(downloadCall.args.some((arg) => /cookie/i.test(arg)), false);
+
+  // 第二次下载复用缓存文件，不再触发新的 yt-dlp 下载调用。
+  const callsBefore = calls.length;
+  const cached = await service.download(job.id, { maxBytes: 1024 * 1024 });
+  assert.equal(cached.cached, true);
+  assert.equal(calls.length, callsBefore);
+
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+})();
+
+(async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "domi-youtube-radar-fail-"));
+  const youTube = new YouTubeDlp({
+    execImpl: async (file, args) => {
+      if (args[0] === "--version") return { stdout: "2026.07.04\n", stderr: "" };
+      if (args.includes("--dump-single-json")) {
+        return {
+          stdout: `${JSON.stringify({
+            _type: "video",
+            id: "dQw4w9WgXcQ",
+            webpage_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            title: "会员视频",
+            duration: 2700,
+            availability: "subscriber_only"
+          })}\n`,
+          stderr: ""
+        };
+      }
+      throw new Error("unexpected");
+    }
+  });
+  const service = new RadarSourceService({
+    stateStore: memoryStore(),
+    cacheDir: tempRoot,
+    youTube
+  });
+  const source = service.save({
+    kind: "podcast",
+    name: "YouTube 会员视频",
+    url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+  }).source;
+  const synced = await service.sync({ sourceId: source.id });
+  assert.equal(synced.ok, false);
+  assert.equal(synced.jobs.length, 0);
+  assert.match(synced.results[0].error, /付费或需登录内容/);
+
+  const missingDlp = new RadarSourceService({
+    stateStore: memoryStore(),
+    cacheDir: tempRoot,
+    youTube: new YouTubeDlp({
+      execImpl: async () => {
+        throw new Error("ENOENT");
+      }
+    })
+  });
+  const missingSource = missingDlp.save({
+    kind: "podcast",
+    name: "YouTube 缺少 yt-dlp",
+    url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+  }).source;
+  const missingSynced = await missingDlp.sync({ sourceId: missingSource.id });
+  assert.equal(missingSynced.ok, false);
+  assert.match(missingSynced.results[0].error, /未找到 yt-dlp/);
+
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+})();
+
 process.on("beforeExit", () => {
   console.log("radar-sources tests passed");
 });
+
+// --- YouTube 频道信源（每日自动读取播客频道的基础） ---
+
+{
+  assert.deepEqual(
+    youTubeChannelDescriptor("https://www.youtube.com/@AcquiredFM"),
+    { type: "handle", value: "AcquiredFM" }
+  );
+  assert.deepEqual(
+    youTubeChannelDescriptor("https://www.youtube.com/channel/UCU3i-tonXj9tqGJzfwcNAbA"),
+    { type: "channel_id", value: "UCU3i-tonXj9tqGJzfwcNAbA" }
+  );
+  assert.deepEqual(
+    youTubeChannelDescriptor("https://www.youtube.com/playlist?list=PLbS9bGj9ZkX0CmCp0mJ8Np2oXK7JbM5aB"),
+    { type: "playlist", value: "PLbS9bGj9ZkX0CmCp0mJ8Np2oXK7JbM5aB" }
+  );
+  assert.equal(youTubeChannelDescriptor("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), null);
+  assert.equal(youTubeChannelDescriptor("https://example.com/@channel"), null);
+
+  const pageHtml = `<html><head>
+    <link rel="canonical" href="https://www.youtube.com/channel/UCU3i-tonXj9tqGJzfwcNAbA">
+    <link rel="alternate" type="application/rss+xml" title="RSS" href="https://www.youtube.com/feeds/videos.xml?channel_id=UCU3i-tonXj9tqGJzfwcNAbA">
+  </head></html>`;
+  assert.equal(
+    youTubeFeedLinkFromChannelPage(pageHtml),
+    "https://www.youtube.com/feeds/videos.xml?channel_id=UCU3i-tonXj9tqGJzfwcNAbA"
+  );
+  assert.equal(youTubeFeedLinkFromChannelPage("<html><head></head></html>"), null);
+
+  const feedXml = `<?xml version="1.0"?>
+<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015">
+  <title>Acquired</title>
+  <entry>
+    <yt:videoId>dQw4w9WgXcQ</yt:videoId>
+    <title>Episode 100: The Whole Story</title>
+    <link rel="alternate" href="https://www.youtube.com/watch?v=dQw4w9WgXcQ"/>
+    <published>2026-09-10T08:00:00+00:00</published>
+    <updated>2026-09-10T08:00:00+00:00</updated>
+    <author><name>Acquired</name></author>
+    <media:description>Episode description.</media:description>
+  </entry>
+  <entry>
+    <yt:videoId>9bZkp7q19f0</yt:videoId>
+    <title>Episode 99: Prior Episode</title>
+    <link rel="alternate" href="https://www.youtube.com/watch?v=9bZkp7q19f0"/>
+    <published>2026-09-01T08:00:00+00:00</published>
+    <updated>2026-09-01T08:00:00+00:00</updated>
+    <media:description>Prior description.</media:description>
+  </entry>
+</feed>`;
+  const parsed = parseYouTubeChannelFeed(feedXml);
+  assert.equal(parsed.channelTitle, "Acquired");
+  assert.equal(parsed.episodes.length, 2);
+  assert.equal(parsed.episodes[0].episodeUrl, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+  assert.equal(parsed.episodes[0].sourceFormat, "youtube");
+  assert.equal(parsed.episodes[0].durationSec, null);
+  assert.equal(parsed.episodes[0].podcastTitle, "Acquired");
+  assert.ok(Number.isFinite(parsed.episodes[0].publishedAt));
+}
+
+(async () => {
+  const store = memoryStore();
+  const fetchLog = [];
+  const channelPage = `<html><head>
+    <link rel="alternate" type="application/rss+xml" href="https://www.youtube.com/feeds/videos.xml?channel_id=UCU3i-tonXj9tqGJzfwcNAbA">
+  </head></html>`;
+  const feedXml = `<?xml version="1.0"?>
+<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015">
+  <title>Acquired</title>
+  <entry>
+    <yt:videoId>dQw4w9WgXcQ</yt:videoId>
+    <title>Episode 100</title>
+    <published>2026-09-10T08:00:00+00:00</published>
+    <updated>2026-09-10T08:00:00+00:00</updated>
+    <media:description>Episode description.</media:description>
+  </entry>
+</feed>`;
+  const service = new RadarSourceService({
+    stateStore: store,
+    cacheDir: fs.mkdtempSync(path.join(os.tmpdir(), "domi-yt-channel-")),
+    fetchImpl: async (url) => {
+      fetchLog.push(String(url));
+      if (String(url) === "https://www.youtube.com/@AcquiredFM") {
+        return new Response(channelPage, { status: 200, headers: { "content-type": "text/html" } });
+      }
+      if (String(url).startsWith("https://www.youtube.com/feeds/videos.xml")) {
+        return new Response(feedXml, { status: 200, headers: { "content-type": "application/rss+xml" } });
+      }
+      throw new Error(`unexpected URL ${url}`);
+    },
+    now: () => 1_700_000_000_100
+  });
+
+  // 非法链接在保存阶段被拒。
+  assert.throws(
+    () => service.save({ kind: "youtube_channel", name: "坏频道", url: "https://example.com/@x" }),
+    /YouTube 频道链接/
+  );
+
+  const created = service.save({
+    kind: "youtube_channel",
+    name: "Acquired",
+    url: "https://www.youtube.com/@AcquiredFM",
+    autoProcess: true
+  });
+  assert.equal(created.source.kind, "youtube_channel");
+  assert.equal(created.source.autoProcess, true);
+
+  const synced = await service.sync({ sourceId: created.source.id });
+  assert.equal(synced.ok, true);
+  assert.equal(synced.jobs.length, 1);
+  assert.equal(synced.jobs[0].status, "discovered");
+  assert.equal(synced.jobs[0].sourceFormat, "youtube");
+  assert.equal(synced.jobs[0].episodeUrl, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+  assert.equal(synced.results[0].discoveredCount, 1);
+  assert.ok(fetchLog.includes("https://www.youtube.com/@AcquiredFM"));
+  assert.ok(fetchLog.some((url) => url.startsWith("https://www.youtube.com/feeds/videos.xml?channel_id=")));
+
+  // 第二次同步不产生重复任务。
+  const syncedAgain = await service.sync({ sourceId: created.source.id });
+  assert.equal(syncedAgain.jobs.length, 1);
+  assert.equal(syncedAgain.results[0].discoveredCount, 0);
+
+  const listed = service.list();
+  assert.equal(listed.sources.length, 1);
+  assert.deepEqual(listed.twitterItems, []);
+})();
+
+// --- X 大V信源（每日自动读取推特推送，需用户自己的 X API 凭证） ---
+
+{
+  assert.equal(twitterHandleFromUrl("https://x.com/elikiba"), "elikiba");
+  assert.equal(twitterHandleFromUrl("https://twitter.com/@sama"), "sama");
+  assert.equal(twitterHandleFromUrl("https://x.com/home"), null);
+  assert.equal(twitterHandleFromUrl("https://x.com/i/intent/post"), null);
+  assert.equal(twitterHandleFromUrl("https://example.com/sama"), null);
+  assert.equal(twitterHandleFromUrl("https://x.com/this_handle_is_way_too_long"), null);
+}
+
+(async () => {
+  const store = memoryStore();
+  const apiCalls = [];
+  const service = new RadarSourceService({
+    stateStore: store,
+    cacheDir: fs.mkdtempSync(path.join(os.tmpdir(), "domi-twitter-")),
+    fetchImpl: async (url) => {
+      apiCalls.push(String(url));
+      return new Response(
+        JSON.stringify({
+          data: [
+            { id: "1800000000000000001", text: "算力供需正在边际变化。", created_at: "2026-09-15T10:00:00.000Z" },
+            { id: "1800000000000000002", text: "关于 CUDA 生态的思考。", created_at: "2026-09-14T10:00:00.000Z" }
+          ]
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    },
+    now: () => 1_700_000_000_100
+  });
+
+  assert.throws(
+    () => service.save({ kind: "twitter", name: "坏链接", url: "https://example.com/sama" }),
+    /X 大V链接/
+  );
+  const source = service.save({
+    kind: "twitter",
+    name: "某大V",
+    url: "https://x.com/kol_handle",
+    keywords: ["算力"]
+  }).source;
+  assert.equal(source.kind, "twitter");
+  assert.equal(source.autoProcess, false);
+
+  // 未配置凭证时同步失败，并给出明确指引，不做任何网络请求。
+  const noToken = await service.sync({ sourceId: source.id });
+  assert.equal(noToken.ok, false);
+  assert.match(noToken.results[0].error, /X API Bearer Token/);
+  assert.equal(apiCalls.length, 0);
+
+  // 令牌格式校验。
+  assert.throws(() => service.saveTwitterToken("short"), /格式看起来不对/);
+  const tokenSaved = service.saveTwitterToken("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+  assert.deepEqual(tokenSaved, { ok: true, configured: true });
+
+  const synced = await service.sync({ sourceId: source.id });
+  assert.equal(synced.ok, true);
+  assert.equal(synced.twitterItems.length, 2);
+  assert.equal(synced.twitterItems[0].handle, "kol_handle");
+  assert.equal(synced.twitterItems[0].url, "https://x.com/kol_handle/status/1800000000000000001");
+  assert.equal(synced.twitterItems[0].authorName, "某大V");
+  assert.equal(synced.twitterTokenConfigured, true);
+  assert.equal(synced.results[0].discoveredCount, 2);
+  assert.equal(apiCalls.length, 1);
+  assert.ok(apiCalls[0].startsWith("https://api.twitter.com/2/users/by/username/kol_handle/tweets"));
+
+  // 第二次同步不产生重复条目。
+  const syncedAgain = await service.sync({ sourceId: source.id });
+  assert.equal(syncedAgain.twitterItems.length, 2);
+  assert.equal(syncedAgain.results[0].discoveredCount, 0);
+
+  // 删除信源时推文一并清理。
+  const deleted = service.delete(source.id);
+  assert.equal(deleted.deleted, true);
+  assert.equal(deleted.twitterItems.length, 0);
+})();
+
+// --- kinds 过滤：快循环只轮询播客，X 大V/YouTube 频道走每日低频同步 ---
+
+(async () => {
+  const store = memoryStore();
+  const requests = [];
+  const youtubeFeed = `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015">
+  <title>Acquired</title>
+  <entry>
+    <yt:videoId>dQw4w9WgXcQ</yt:videoId>
+    <title>第 100 期</title>
+    <published>2026-09-10T00:00:00+00:00</published>
+    <updated>2026-09-10T00:00:00+00:00</updated>
+    <link rel="alternate" href="https://www.youtube.com/watch?v=dQw4w9WgXcQ"/>
+    <author><name>Acquired</name></author>
+  </entry>
+</feed>`;
+  const service = new RadarSourceService({
+    stateStore: store,
+    cacheDir: fs.mkdtempSync(path.join(os.tmpdir(), "domi-radar-kinds-")),
+    fetchImpl: async (url) => {
+      requests.push(String(url));
+      if (String(url).startsWith("https://www.youtube.com/feeds/videos.xml")) {
+        return new Response(youtubeFeed, { status: 200, headers: { "content-type": "application/rss+xml" } });
+      }
+      if (String(url).startsWith("https://api.twitter.com/")) {
+        return new Response(
+          JSON.stringify({
+            data: [
+              { id: "1800000000000000009", text: "新推送。", created_at: "2026-09-15T10:00:00.000Z" }
+            ]
+          }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        );
+      }
+      throw new Error(`unexpected URL ${url}`);
+    },
+    now: () => 1_700_000_000_100
+  });
+
+  const channel = service.save({
+    kind: "youtube_channel",
+    name: "Acquired",
+    url: "https://www.youtube.com/channel/UCU3i-tonXj9tqGJzfwcNAbA"
+  }).source;
+  service.saveTwitterToken("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+  const kol = service.save({ kind: "twitter", name: "某大V", url: "https://x.com/kol_handle" }).source;
+
+  // 快循环只同步播客：YouTube/X 都不应发起任何网络请求。
+  const podcastOnly = await service.sync({ kinds: ["podcast"] });
+  assert.equal(podcastOnly.ok, true);
+  assert.equal(requests.length, 0);
+
+  // 每日同步 YouTube 频道：只访问 YouTube 订阅源，不调用 X API。
+  const youtubeOnly = await service.sync({ kinds: ["youtube_channel"] });
+  assert.equal(youtubeOnly.ok, true);
+  assert.equal(youtubeOnly.jobs.filter((job) => job.sourceId === channel.id).length, 1);
+  assert.equal(requests.filter((url) => url.startsWith("https://api.twitter.com/")).length, 0);
+
+  // 每日同步 X 大V：只调用 X API，不重复访问 YouTube 订阅源。
+  const twitterOnly = await service.sync({ kinds: ["twitter"] });
+  assert.equal(twitterOnly.ok, true);
+  assert.equal(twitterOnly.twitterItems.filter((item) => item.sourceId === kol.id).length, 1);
+  assert.equal(requests.filter((url) => url.startsWith("https://www.youtube.com/")).length, 1);
+  assert.equal(requests.filter((url) => url.startsWith("https://api.twitter.com/")).length, 1);
+
+  // 未知类型被忽略；kinds 为空数组时不同步任何网络源。
+  const none = await service.sync({ kinds: ["not-a-kind"] });
+  assert.equal(none.ok, true);
+  assert.equal(requests.length, 2);
+})();

@@ -37,3 +37,8 @@ demo-workspace/
 *.notarytool-profile
 .npmrc
 .privacy-terms.local
+
+# Local research library, agent workspace, and ad hoc debugging scripts.
+/资料库/
+/.catpaw/
+/scripts/tmp-*

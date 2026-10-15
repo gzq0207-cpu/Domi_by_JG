@@ -22,6 +22,30 @@ const {
   scanManagedEntityIdentityCandidates
 } = require("../electron/local-domi-repository.cjs");
 
+// node:test 的 t.after 按注册顺序（FIFO）执行：临时目录的 rmSync hook
+// 先于后注册的 repository.close() hook。POSIX 允许删除仍被打开的文件，
+// 因此这在 macOS 上无害；Windows 会返回 EBUSY。改用注册表把仓库关闭
+// 收进 rm hook 本身，保证关闭先于删除。
+const repositoriesByRoot = new Map();
+
+function trackRepository(root, repository) {
+  const list = repositoriesByRoot.get(root);
+  if (list) list.push(repository);
+  else repositoriesByRoot.set(root, [repository]);
+}
+
+function removeRootWithRepositories(root) {
+  for (const repository of repositoriesByRoot.get(root) || []) {
+    try {
+      repository.close();
+    } catch {
+      // 已被测试体手动关闭，或从未真正打开。
+    }
+  }
+  repositoriesByRoot.delete(root);
+  fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
+}
+
 test("critical operation snapshot accounts for queues that must finish before an app update", () => {
   const integration = new DomiIntegration({
     stateStore: {},
@@ -114,7 +138,7 @@ test("PLAUD list IPC leaves retry ownership to the worker and forwards fresh rea
 
 test("Finder-launched app resolves the npm lark-cli launcher to its native binary", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-lark-cli-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const scriptsDir = path.join(root, "lib", "node_modules", "@larksuite", "cli", "scripts");
   const nativeDir = path.join(root, "lib", "node_modules", "@larksuite", "cli", "bin");
   const launcherDir = path.join(root, "bin");
@@ -123,9 +147,37 @@ test("Finder-launched app resolves the npm lark-cli launcher to its native binar
   fs.mkdirSync(launcherDir, { recursive: true });
 
   const launcher = path.join(scriptsDir, "run.js");
-  const native = path.join(nativeDir, "lark-cli");
+  const isWindows = process.platform === "win32";
+  const native = path.join(nativeDir, isWindows ? "lark-cli.exe" : "lark-cli");
   const linkedLauncher = path.join(launcherDir, "lark-cli");
   fs.writeFileSync(launcher, "#!/usr/bin/env node\n", { mode: 0o755 });
+
+  if (isWindows) {
+    // Windows 的 npm 不产生符号链接（bin 下是 .cmd 包装），直接把启动器
+    // 脚本交给解析器；真实执行由注入的执行器桩覆盖，因为 Windows 无法
+    // 直接 spawn shell 脚本。
+    fs.writeFileSync(native, "windows launcher stub\n", { mode: 0o755 });
+    const resolvedNative = fs.realpathSync(native);
+    assert.equal(resolveLarkCliExecutable(launcher), resolvedNative);
+
+    const integration = new DomiIntegration({
+      stateStore: {
+        loadCache: () => null,
+        saveCache: () => undefined
+      },
+      plaudOutputDir: path.join(root, "plaud"),
+      execFileFactory: (command, args, options, callback) => {
+        assert.equal(command, resolvedNative);
+        callback(null, "{\"verified\":true,\"identities\":{}}\n", "");
+      }
+    });
+    integration.larkCli = resolveLarkCliExecutable(launcher);
+    const status = await integration.larkStatus();
+    assert.equal(status.ok, true);
+    assert.equal(status.cliPath, resolvedNative);
+    return;
+  }
+
   fs.writeFileSync(
     native,
     "#!/bin/sh\nprintf '{\"verified\":true,\"identities\":{}}\\n'\n",
@@ -186,6 +238,45 @@ test("repeated lark identity checks share a short-lived verification result", as
 
   await integration.larkStatus({ force: true });
   assert.equal(checks, 2);
+});
+
+test("lark status reports disconnected when only the bot identity is verified", async () => {
+  // 2026-10 incident: the user token vanished from the keychain while the bot
+  // identity stayed verified. lark-cli's top-level "verified" is true, so the
+  // setup page kept showing 已连接 while every user API (inbox polling, base
+  // reads) failed with 230027 for days.
+  const integration = new DomiIntegration({
+    stateStore: { loadCache: () => null, saveCache: () => undefined },
+    plaudOutputDir: "/tmp/domi-lark-status-user-missing"
+  });
+  integration.larkCli = process.execPath;
+  integration.runJson = async () => ({
+    verified: true,
+    identities: {
+      bot: { status: "ready", available: true, verified: true, appName: "gzq的飞书 CLI" },
+      user: { status: "missing", available: false, userName: "gzq" }
+    }
+  });
+
+  const status = await integration.larkStatus();
+  assert.equal(status.ok, false);
+  assert.equal(status.userName, "gzq");
+  assert.equal(status.appName, "gzq的飞书 CLI");
+
+  const setup = await integration.feishuSetupStatus();
+  assert.equal(setup.connected, false);
+  assert.ok(setup.error.length > 0);
+
+  // Older CLI output (user block without explicit ready/missing flags) keeps
+  // the legacy verdict so the stricter gate cannot break existing installs.
+  integration.runJson = async () => ({
+    verified: true,
+    identities: { user: { userName: "示例用户", tokenStatus: "valid" } }
+  });
+  integration.larkStatusCache.value = null;
+  integration.larkStatusCache.expiresAt = 0;
+  const legacy = await integration.larkStatus();
+  assert.equal(legacy.ok, true);
 });
 
 test("Feishu setup auth uses split-flow scopes without returning access tokens", async () => {
@@ -1441,7 +1532,7 @@ test("weekly news falls back to retained local history when Feishu is offline", 
 
 test("local repository safely and idempotently indexes existing workspace entities", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-index-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
   const projectPath = path.join(libraryDir, "3.项目库", "AI", "AI基础设施", "驭驯网络");
@@ -1471,7 +1562,7 @@ test("local repository safely and idempotently indexes existing workspace entiti
     "_未分类",
     "历史项目"
   );
-  const personPath = path.join(libraryDir, "4.人脉库", "张三");
+  const personPath = path.join(libraryDir, "12.人脉", "张三");
   fs.mkdirSync(path.join(projectPath, "研究", "不是项目"), { recursive: true });
   fs.mkdirSync(legacyProjectPath, { recursive: true });
   fs.mkdirSync(misplacedResearchPath, { recursive: true });
@@ -1516,7 +1607,7 @@ rating: "A"
   );
 
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const first = repository.reindexWorkspace();
   assert.deepEqual(first.projects, {
     discovered: 2,
@@ -1582,7 +1673,7 @@ rating: "A"
   assert.ok(projectColumns.includes("latest_valuation_usd_100m"));
   assert.equal(
     repository.recordDirectory("project", indexedProject.recordId),
-    projectPath
+    path.join(libraryDir, "07.模型层", "AI基础设施", "驭驯网络")
   );
 
   const newProjectPath = path.join(
@@ -1622,7 +1713,7 @@ subdomains: ["Agent"]
 
 test("legacy workspace import sends dated archive titles to name review", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-project-name-import-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
   const projectRoot = path.join(libraryDir, "3.项目库", "AI", "AI4S");
@@ -1670,7 +1761,7 @@ project_id: "prj_missing_homepage_name"
 `);
 
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const indexed = repository.reindexWorkspace();
   assert.equal(indexed.projects.created, 3);
   assert.equal(indexed.projects.needsNameReview, 4);
@@ -1700,10 +1791,10 @@ project_id: "prj_missing_homepage_name"
 
 test("recordDirectory returns a valid bound homepage without enumerating sibling directories", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-record-fast-path-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
-  const projectDirectory = path.join(libraryDir, "3.项目库", "AI", "Agent", "已绑定项目");
+  const projectDirectory = path.join(libraryDir, "07.模型层", "Agent", "已绑定项目");
   const projectPage = path.join(projectDirectory, "项目主页.md");
   fs.mkdirSync(projectDirectory, { recursive: true });
   fs.writeFileSync(projectPage, `---
@@ -1713,7 +1804,7 @@ project_id: "prj_bound_fast_path"
 # 已绑定项目
 `);
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const now = Date.now();
   repository.database.prepare(`
     INSERT INTO projects (
@@ -1742,7 +1833,7 @@ project_id: "prj_bound_fast_path"
 
 test("workspace indexing skips empty person shells but preserves nested-only legacy people", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-person-shell-filter-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
   const emptyPersonDirectory = path.join(libraryDir, "4.人脉库", "旧空壳人物");
@@ -1756,7 +1847,7 @@ test("workspace indexing skips empty person shells but preserves nested-only leg
   fs.writeFileSync(legacyResearch, "%PDF-1.4\n");
 
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const indexed = repository.reindexWorkspace();
 
   assert.equal(indexed.people.discovered, 1);
@@ -1775,7 +1866,7 @@ test("workspace indexing skips empty person shells but preserves nested-only leg
 
 test("workspace indexing preserves a legacy project with only a root material file", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-project-material-filter-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
   const projectParent = path.join(libraryDir, "3.项目库", "AI", "Agent");
@@ -1786,7 +1877,7 @@ test("workspace indexing preserves a legacy project with only a root material fi
   fs.writeFileSync(path.join(legacyProjectDirectory, "BP.pdf"), "%PDF-1.4\n");
 
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const indexed = repository.reindexWorkspace();
 
   assert.equal(indexed.projects.discovered, 1);
@@ -1796,10 +1887,10 @@ test("workspace indexing preserves a legacy project with only a root material fi
 
 test("recordDirectory keeps a uniquely bound canonical homepage when an indexed attachment is missing", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-record-stale-document-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
-  const projectDirectory = path.join(libraryDir, "3.项目库", "AI", "Agent", "附件已删除项目");
+  const projectDirectory = path.join(libraryDir, "07.模型层", "Agent", "附件已删除项目");
   const projectPage = path.join(projectDirectory, "项目主页.md");
   const missingAttachment = path.join(projectDirectory, "原始材料", "已删除-BP.pdf");
   fs.mkdirSync(projectDirectory, { recursive: true });
@@ -1811,7 +1902,7 @@ project_id: "prj_stale_indexed_document"
 `);
 
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const now = Date.now();
   repository.database.prepare(`
     INSERT INTO projects (
@@ -1854,10 +1945,10 @@ project_id: "prj_stale_indexed_document"
 
 test("background materialization accepts a valid canonical source with a stale attachment index", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-materializer-stale-document-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
-  const projectDirectory = path.join(libraryDir, "3.项目库", "AI", "Agent", "物化附件已删除项目");
+  const projectDirectory = path.join(libraryDir, "07.模型层", "Agent", "物化附件已删除项目");
   const projectPage = path.join(projectDirectory, "项目主页.md");
   const missingAttachment = path.join(projectDirectory, "原始材料", "用户已删除.pdf");
   fs.mkdirSync(projectDirectory, { recursive: true });
@@ -1873,7 +1964,7 @@ status: "待交流"
 `);
 
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const version = 1_700_000_000_000;
   repository.database.prepare(`
     INSERT INTO projects (
@@ -1923,7 +2014,7 @@ status: "待交流"
 
 test("entity rename recovery scans only canonical homepages, not project materials", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-identity-scan-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const libraryDir = path.join(root, "domi工作区");
   const projectDirectory = path.join(libraryDir, "3.项目库", "AI", "Agent", "目标项目");
   const otherProjectDirectory = path.join(libraryDir, "3.项目库", "AI", "Agent", "其他项目");
@@ -1981,13 +2072,12 @@ test("entity rename recovery scans only canonical homepages, not project materia
 
 test("local repository relinks uniquely renamed project and person directories by frontmatter ID", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-relink-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
   const oldProjectDirectory = path.join(
     libraryDir,
-    "3.项目库",
-    "消费科技",
+    "_其他行业",
     "可穿戴",
     "20260715-Mist-AI可穿戴-A"
   );
@@ -1995,8 +2085,8 @@ test("local repository relinks uniquely renamed project and person directories b
     path.dirname(oldProjectDirectory),
     "20260715-Mist labs-AI可穿戴-A"
   );
-  const oldPersonDirectory = path.join(libraryDir, "4.人脉库", "莫子皓");
-  const newPersonDirectory = path.join(libraryDir, "4.人脉库", "莫子皓-补充资料");
+  const oldPersonDirectory = path.join(libraryDir, "12.人脉", "莫子皓");
+  const newPersonDirectory = path.join(libraryDir, "12.人脉", "莫子皓-补充资料");
   const oldProjectPage = path.join(oldProjectDirectory, "项目主页.md");
   const oldProjectMaterial = path.join(oldProjectDirectory, "原始材料", "BP.pdf");
   const oldPersonPage = path.join(oldPersonDirectory, "人物主页.md");
@@ -2061,7 +2151,7 @@ name: "莫子皓"
   fs.mkdirSync(oldProjectDirectory, { recursive: true });
   fs.mkdirSync(oldPersonDirectory, { recursive: true });
   repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
 
   assert.equal(
     repository.recordDirectory("project", "prj_external_rename"),
@@ -2105,11 +2195,11 @@ name: "莫子皓"
 
 test("project rename recovery falls back beyond the old subdomain when needed", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-relink-fallback-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
-  const sourceDirectory = path.join(libraryDir, "3.项目库", "AI", "Agent", "跨领域项目");
-  const targetDirectory = path.join(libraryDir, "3.项目库", "消费科技", "可穿戴", "跨领域项目新目录");
+  const sourceDirectory = path.join(libraryDir, "07.模型层", "Agent", "跨领域项目");
+  const targetDirectory = path.join(libraryDir, "_其他行业", "可穿戴", "跨领域项目新目录");
   const sourcePage = path.join(sourceDirectory, "项目主页.md");
   fs.mkdirSync(sourceDirectory, { recursive: true });
   fs.writeFileSync(sourcePage, `---
@@ -2120,7 +2210,7 @@ company_name: "跨领域项目"
 # 跨领域项目
 `);
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const now = Date.now();
   repository.database.prepare(`
     INSERT INTO projects (
@@ -2148,7 +2238,7 @@ company_name: "跨领域项目"
 
 test("local repository fails closed when the same frontmatter ID exists in two directories", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-relink-conflict-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
   const projectRoot = path.join(libraryDir, "3.项目库", "消费科技", "可穿戴");
@@ -2171,7 +2261,7 @@ subdomains: ["可穿戴"]
   fs.writeFileSync(firstMaterial, "%PDF-1.4\n");
 
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const now = Date.now();
   const originalDocumentPath = path.join(firstDirectory, "项目主页.md");
   const originalMaterialPath = path.join(firstDirectory, "原始材料", "索引存在但文件缺失.pdf");
@@ -2216,12 +2306,12 @@ subdomains: ["可穿戴"]
 
 test("background materialization never creates a target when its source directory disappeared", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-materializer-source-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
-  const sourceDirectory = path.join(libraryDir, "3.项目库", "AI", "Agent", "旧项目名");
-  const movedDirectory = path.join(libraryDir, "3.项目库", "AI", "Agent", "Finder改名");
-  const targetDirectory = path.join(libraryDir, "3.项目库", "AI", "Agent", "新项目名");
+  const sourceDirectory = path.join(libraryDir, "07.模型层", "Agent", "旧项目名");
+  const movedDirectory = path.join(libraryDir, "07.模型层", "Agent", "Finder改名");
+  const targetDirectory = path.join(libraryDir, "07.模型层", "Agent", "新项目名");
   const sourcePage = path.join(sourceDirectory, "项目主页.md");
   const sourceMaterial = path.join(sourceDirectory, "原始材料", "BP.pdf");
   const missingSourceMaterial = path.join(sourceDirectory, "原始材料", "用户已删除.pdf");
@@ -2237,7 +2327,7 @@ subdomains: ["Agent"]
 # 旧项目名
 `);
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const version = 1_700_000_000_000;
   repository.database.prepare(`
     INSERT INTO projects (
@@ -2339,11 +2429,11 @@ project_id: "prj_wrong_target"
 
 test("pending materialization relink rebases documents from its real source directory", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-pending-relink-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
-  const sourceDirectory = path.join(libraryDir, "3.项目库", "AI", "Agent", "Pending旧名");
-  const manualDirectory = path.join(libraryDir, "3.项目库", "AI", "Agent", "Finder最终名");
+  const sourceDirectory = path.join(libraryDir, "07.模型层", "Agent", "Pending旧名");
+  const manualDirectory = path.join(libraryDir, "07.模型层", "Agent", "Finder最终名");
   const sourcePage = path.join(sourceDirectory, "项目主页.md");
   const sourceMaterial = path.join(sourceDirectory, "原始材料", "BP.pdf");
   fs.mkdirSync(path.dirname(sourceMaterial), { recursive: true });
@@ -2356,7 +2446,7 @@ company_name: "Pending旧名"
 # Pending旧名
 `);
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const version = 1_700_000_000_000;
   repository.database.prepare(`
     INSERT INTO projects (
@@ -2410,11 +2500,11 @@ company_name: "Pending旧名"
 
 test("local people list exposes persisted research documents without a full workspace reindex", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-person-documents-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const personDirectory = path.join(libraryDir, "4.人脉库", "叶锐");
   const researchDirectory = path.join(personDirectory, "研究");
   const homepage = path.join(personDirectory, "人物主页.md");
@@ -2443,7 +2533,7 @@ test("local people list exposes persisted research documents without a full work
 
 test("local repository excludes bulk workspace baselines from recent-intake timestamps", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-bulk-baseline-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
 
@@ -2463,7 +2553,7 @@ test("local repository excludes bulk workspace baselines from recent-intake time
   }
 
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const baseline = repository.reindexWorkspace();
   assert.equal(baseline.projects.created, 20);
   assert.equal(
@@ -2493,7 +2583,7 @@ test("local repository excludes bulk workspace baselines from recent-intake time
 
 test("local repository repairs legacy bulk-import timestamps once", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-bulk-migration-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
   let repository = new LocalDomiRepository({ databasePath, libraryDir });
@@ -2520,7 +2610,7 @@ test("local repository repairs legacy bulk-import timestamps once", (t) => {
   repository.close();
 
   repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   assert.equal(
     repository.listProjects().every((project) => project.createdAt === null),
     true
@@ -2534,11 +2624,11 @@ test("local repository repairs legacy bulk-import timestamps once", (t) => {
 
 test("local database editor updates records, managed Markdown and safe directory locations", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-editor-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const version = 1_700_000_000_000;
   const projectDirectory = path.join(libraryDir, "3.项目库", "AI", "Agent", "旧项目名");
   const personDirectory = path.join(libraryDir, "4.人脉库", "旧姓名");
@@ -2635,8 +2725,7 @@ test("local database editor updates records, managed Markdown and safe directory
   assert.equal(updatedProject.latestValuationUsd100m, 1.5);
   const movedProjectPath = path.join(
     libraryDir,
-    "3.项目库",
-    "企业软件",
+    "08.基础软件与工具链",
     "Agent",
     "新项目名",
     "项目主页.md"
@@ -2666,7 +2755,7 @@ test("local database editor updates records, managed Markdown and safe directory
     cities: ["北京"]
   });
   assert.equal(updatedPerson.name, "新姓名");
-  const movedPersonPath = path.join(libraryDir, "4.人脉库", "新姓名", "人物主页.md");
+  const movedPersonPath = path.join(libraryDir, "12.人脉", "新姓名", "人物主页.md");
   assert.match(fs.readFileSync(movedPersonPath, "utf8"), /保留人物正文/);
   assert.match(fs.readFileSync(movedPersonPath, "utf8"), /新组织/);
 
@@ -2691,7 +2780,14 @@ test("local database editor updates records, managed Markdown and safe directory
     worthFollowing: true
   });
   assert.equal(updatedNews.title, "新标题");
-  const movedNewsPath = path.join(libraryDir, "2.行业动态", "2026", "07", "evt_edit.md");
+  const movedNewsPath = path.join(
+    libraryDir,
+    "_其他行业",
+    "_行业认知",
+    "动态",
+    "2026",
+    "20260730新标题.md"
+  );
   assert.equal(fs.existsSync(newsPath), false);
   assert.match(fs.readFileSync(movedNewsPath, "utf8"), /保留行业正文/);
   assert.match(fs.readFileSync(movedNewsPath, "utf8"), /新投资含义/);
@@ -2699,11 +2795,11 @@ test("local database editor updates records, managed Markdown and safe directory
 
 test("field patches commit canonical SQLite state before background Markdown materialization", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-field-patch-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const version = 1_700_000_000_000;
   const projectDirectory = path.join(libraryDir, "3.项目库", "AI", "Agent", "Patch项目");
   const projectPath = path.join(projectDirectory, "项目主页.md");
@@ -2814,8 +2910,7 @@ test("field patches commit canonical SQLite state before background Markdown mat
   });
   const renamedPath = path.join(
     libraryDir,
-    "3.项目库",
-    "AI",
+    "07.模型层",
     "Agent",
     "Patch项目新名",
     "项目主页.md"
@@ -2847,10 +2942,10 @@ test("field patches commit canonical SQLite state before background Markdown mat
 
 test("existing project homepages upgrade once to the readable decision layout", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-readable-homepage-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
-  const projectDirectory = path.join(libraryDir, "3.项目库", "AI", "Agent", "旧主页项目");
+  const projectDirectory = path.join(libraryDir, "07.模型层", "Agent", "旧主页项目");
   const projectPath = path.join(projectDirectory, "项目主页.md");
   const version = 1_700_000_000_000;
   fs.mkdirSync(projectDirectory, { recursive: true });
@@ -2890,7 +2985,7 @@ company_name: "旧主页项目"
   first.close();
 
   const reopened = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => reopened.close());
+  trackRepository(root, reopened);
   const upgraded = fs.readFileSync(projectPath, "utf8");
   assert.match(upgraded, /\[打开项目目录\]\(domi-folder:current\)/);
   assert.match(upgraded, /## 投资摘要[\s\S]*?可快速阅读的投资摘要/);
@@ -2909,11 +3004,11 @@ company_name: "旧主页项目"
 
 test("legacy archive names block unrelated project writes and Markdown materialization", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-legacy-project-name-write-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const version = 1_700_000_000_000;
   const archiveName = "20260630-示例主体-技术专题-A";
   const projectPage = path.join(
@@ -2993,11 +3088,11 @@ test("legacy archive names block unrelated project writes and Markdown materiali
 
 test("field patches validate and merge person and news records", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-field-patch-other-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const version = 1_700_000_000_000;
   const personDirectory = path.join(libraryDir, "4.人脉库", "Patch人物");
   const personPath = path.join(personDirectory, "人物主页.md");
@@ -3055,15 +3150,24 @@ test("field patches validate and merge person and news records", (t) => {
   assert.equal(news.investmentMeaning, "原投资含义");
   assert.equal(news.source, "原来源");
   repository.materializeDatabaseRecord("news", "evt_patch");
-  assert.match(fs.readFileSync(newsPath, "utf8"), /新摘要/);
+  const movedNewsPath = path.join(
+    libraryDir,
+    "07.模型层",
+    "_行业认知",
+    "动态",
+    "2026",
+    "20260710行业事件.md"
+  );
+  assert.equal(fs.existsSync(newsPath), false);
+  assert.match(fs.readFileSync(movedNewsPath, "utf8"), /新摘要/);
 });
 
 test("integration returns a field patch before queued Markdown materialization finishes", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-field-patch-queue-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
-  const projectDirectory = path.join(libraryDir, "3.项目库", "AI", "Agent", "异步项目");
+  const projectDirectory = path.join(libraryDir, "07.模型层", "Agent", "异步项目");
   const projectPath = path.join(projectDirectory, "项目主页.md");
   const version = 1_700_000_000_000;
   fs.mkdirSync(projectDirectory, { recursive: true });
@@ -3118,10 +3222,10 @@ test("integration returns a field patch before queued Markdown materialization f
 
 test("local database preview selects the richest document and row deletion preserves files", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-delete-preview-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
-  const projectDirectory = path.join(libraryDir, "3.项目库", "AI", "Agent", "预览项目");
+  const projectDirectory = path.join(libraryDir, "07.模型层", "Agent", "预览项目");
   const canonicalPath = path.join(projectDirectory, "项目主页.md");
   const researchPath = path.join(projectDirectory, "研究", "预览项目-深度研究.md");
   const memoPath = path.join(projectDirectory, "研究", "预览项目-IC Memo.md");
@@ -3131,7 +3235,7 @@ test("local database preview selects the richest document and row deletion prese
   fs.writeFileSync(memoPath, "# IC Memo\n");
 
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const version = 1_700_000_000_000;
   repository.database.prepare(`
     INSERT INTO projects (
@@ -3178,10 +3282,10 @@ test("local database preview selects the richest document and row deletion prese
 
 test("classification review keeps evidence roles separate and applies local formal subdomains atomically", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-classification-review-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
-  const originalDirectory = path.join(libraryDir, "3.项目库", "_未分类", "边缘项目");
+  const originalDirectory = path.join(libraryDir, "_其他行业", "边缘项目");
   const canonicalPath = path.join(originalDirectory, "项目主页.md");
   const projectEvidence = path.join(originalDirectory, "原始材料", "路演纪要.md");
   const comparableEvidence = path.join(originalDirectory, "研究", "可比公司-智慧尘埃.md");
@@ -3194,7 +3298,7 @@ test("classification review keeps evidence roles separate and applies local form
   fs.writeFileSync(industryEvidence, "# 行业研究\n边缘智能市场与产业链。\n");
 
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
-  t.after(() => repository.close());
+  trackRepository(root, repository);
   const version = 1_700_000_000_000;
   repository.database.prepare(`
     INSERT INTO projects (
@@ -3223,25 +3327,25 @@ test("classification review keeps evidence roles separate and applies local form
       domain: "消费科技",
       subdomains: ["可穿戴"]
     }),
-    /仅用于兼容旧项目.*请选择“消费”/
+    /仅用于兼容旧项目.*产业链链段词表/
   );
 
   const applied = repository.applyProjectClassification({
     action: "apply",
     recordId: "prj_classification",
     expectedUpdatedAt: version,
-    domain: "AI",
+    domain: "模型层",
     subdomains: ["边缘智能"],
     createSubdomainName: "边缘智能",
-    createSubdomainParentDomain: "AI"
+    createSubdomainParentDomain: "模型层"
   });
   assert.equal(applied.ok, true);
-  assert.equal(applied.record.domain, "AI");
+  assert.equal(applied.record.domain, "模型层");
   assert.deepEqual(applied.record.subdomains, ["边缘智能"]);
   assert.ok(applied.taxonomy.customSubdomains.some((item) =>
-    item.name === "边缘智能" && item.parentDomain === "AI"
+    item.name === "边缘智能" && item.parentDomain === "模型层"
   ));
-  const classifiedDirectory = path.join(libraryDir, "3.项目库", "AI", "边缘智能", "边缘项目");
+  const classifiedDirectory = path.join(libraryDir, "07.模型层", "边缘智能", "边缘项目");
   assert.equal(fs.existsSync(path.join(classifiedDirectory, "项目主页.md")), true);
   assert.equal(fs.existsSync(originalDirectory), false);
   assert.match(fs.readFileSync(path.join(classifiedDirectory, "项目主页.md"), "utf8"), /边缘智能/);
@@ -3258,7 +3362,7 @@ test("classification review keeps evidence roles separate and applies local form
       rating: applied.record.rating,
       notes: applied.record.notes
     }),
-    /仅用于兼容旧项目.*请选择“消费”/
+    /仅用于兼容旧项目.*产业链链段词表/
   );
 
   const undone = repository.applyProjectClassification({
@@ -3269,7 +3373,7 @@ test("classification review keeps evidence roles separate and applies local form
   assert.equal(undone.record.domain, "_未分类");
   assert.deepEqual(undone.record.subdomains, []);
   assert.equal(
-    fs.existsSync(path.join(libraryDir, "3.项目库", "_未分类", "边缘项目", "项目主页.md")),
+    fs.existsSync(path.join(libraryDir, "_其他行业", "边缘项目", "项目主页.md")),
     true
   );
   assert.equal(repository.listClassificationReviews().length, 1);
@@ -3277,7 +3381,7 @@ test("classification review keeps evidence roles separate and applies local form
 
 test("local repository mode syncs projects, people and news without Feishu", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-integration-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "资料库");
   const repository = new LocalDomiRepository({ databasePath, libraryDir });
@@ -3364,13 +3468,13 @@ test("local repository mode syncs projects, people and news without Feishu", asy
 
 test("local materials use the exact entity directory and database edits avoid a full sync", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-local-fast-path-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeRootWithRepositories(root));
   const databasePath = path.join(root, "domi-repository.sqlite3");
   const libraryDir = path.join(root, "domi工作区");
-  const projectDirectory = path.join(libraryDir, "3.项目库", "AI", "Agent", "精确项目");
+  const projectDirectory = path.join(libraryDir, "07.模型层", "Agent", "精确项目");
   const canonicalPath = path.join(projectDirectory, "项目主页.md");
   const materialPath = path.join(projectDirectory, "原始材料", "BP.pdf");
-  const unrelatedPath = path.join(libraryDir, "3.项目库", "AI", "Agent", "无关项目", "精确项目误匹配.pdf");
+  const unrelatedPath = path.join(libraryDir, "07.模型层", "Agent", "无关项目", "精确项目误匹配.pdf");
   fs.mkdirSync(path.dirname(materialPath), { recursive: true });
   fs.mkdirSync(path.dirname(unrelatedPath), { recursive: true });
   fs.writeFileSync(canonicalPath, "<!-- domi:managed:start -->\n旧内容\n<!-- domi:managed:end -->\n");

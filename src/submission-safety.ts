@@ -99,6 +99,7 @@ export function taskConversationCodexThreadId(
     messages?: ReadonlyArray<{
       role?: string;
       executionCodexThreadId?: string;
+      sourceScopeIsolated?: boolean;
     }>;
   }>,
   sourceThreadId: string
@@ -107,7 +108,7 @@ export function taskConversationCodexThreadId(
   if (!source) return undefined;
   const latestAssistant = [...(source.messages || [])]
     .reverse()
-    .find((message) => message.role === "assistant");
+    .find((message) => message.role === "assistant" && !message.sourceScopeIsolated);
   const candidates = [
     latestAssistant?.executionCodexThreadId,
     source.codexThreadId

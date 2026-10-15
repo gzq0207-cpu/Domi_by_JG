@@ -16,17 +16,16 @@ import {
 test("Weixin bridge resolves Domi's managed Codex runtime and companion tools", (t) => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "domi-managed-codex-"));
   t.after(() => fs.rmSync(homeDir, { recursive: true, force: true }));
-  const releaseRoot = path.join(homeDir, ".codex", "packages", "standalone", "releases", "0.145.0-test");
-  const binary = path.join(releaseRoot, "bin", "codex");
+  // 使用 current 布局，避免依赖需要特权的符号链接（Windows）。
+  const releaseRoot = path.join(homeDir, ".codex", "packages", "standalone", "current");
+  const binary = path.join(releaseRoot, "bin", process.platform === "win32" ? "codex.exe" : "codex");
   fs.mkdirSync(path.dirname(binary), { recursive: true });
   fs.mkdirSync(path.join(releaseRoot, "codex-path"), { recursive: true });
   fs.mkdirSync(path.join(releaseRoot, "codex-resources", "zsh", "bin"), { recursive: true });
   fs.writeFileSync(binary, "#!/bin/sh\n", { mode: 0o755 });
-  fs.mkdirSync(path.join(homeDir, ".local", "bin"), { recursive: true });
-  fs.symlinkSync(binary, path.join(homeDir, ".local", "bin", "codex"));
 
   const resolved = resolveManagedCodexPath({ homeDir, environment: {} });
-  assert.equal(resolved, path.join(homeDir, ".local", "bin", "codex"));
+  assert.equal(resolved, binary);
   const environment = managedCodexEnvironment(resolved, { PATH: "/usr/bin" }, {});
   assert.equal(environment.PATH.split(path.delimiter)[0], fs.realpathSync(path.join(releaseRoot, "codex-path")));
   assert.equal(

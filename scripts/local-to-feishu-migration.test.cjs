@@ -278,7 +278,7 @@ test("local projects, people and news migrate to their Feishu destinations with 
 | Agent行业 | Agent |
 `);
 
-  const projectDir = path.join(libraryDir, "3.项目库", "AI", "Agent", "示例科技");
+  const projectDir = path.join(libraryDir, "07.模型层", "Agent", "示例科技");
   const notesDir = path.join(projectDir, "纪要");
   fs.mkdirSync(notesDir, { recursive: true });
   fs.writeFileSync(path.join(projectDir, "chart.png"), Buffer.from("image"));

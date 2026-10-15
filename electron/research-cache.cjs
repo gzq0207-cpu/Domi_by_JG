@@ -5,22 +5,25 @@ const { performance } = require("node:perf_hooks");
 
 const CACHE_VERSION = 1;
 const CACHE_PREFIX = "research-cache-v1:project:";
+const CACHE_ROOT_PREFIX = "research-cache-v1:";
 const FRESH_CACHE_MS = 7 * 24 * 60 * 60 * 1000;
-const MAX_CACHE_MS = 90 * 24 * 60 * 60 * 1000;
+const MAX_CACHE_MS = 28 * 24 * 60 * 60 * 1000;
 const SOURCE_FRESH_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_CONTEXT_CHARS = 12_000;
+const MAX_COMPACT_CONTEXT_CHARS = 600;
 const MAX_SUMMARY_CHARS = 6_000;
 const MAX_FACT_HIGHLIGHTS = 32;
 const MAX_SOURCE_URLS = 40;
-const MAX_FILES = 500;
-const MAX_DIRECTORIES = 200;
-const MAX_ENTRIES = 3_000;
+const MAX_FILES = 2000;
+const MAX_DIRECTORIES = 500;
+const MAX_ENTRIES = 8_000;
 const MAX_DEPTH = 12;
-const MAX_SCAN_MS = 300;
+const MAX_SCAN_MS = 1_000;
 const SOURCE_URL_PATTERN = /https?:\/\/[^\s<>()\]"'`]+/gi;
 const SKIPPED_DIRECTORIES = new Set([
   ".git",
   ".domi",
+  ".codex",
   "node_modules",
   "outputs",
   "导出"
@@ -38,9 +41,14 @@ const ELIGIBLE_WORKFLOWS = new Set([
   "deal-negotiation"
 ]);
 const CACHE_WRITE_WORKFLOWS = new Set([
+  "domi-analyst",
   "project-research",
   "desk-research"
 ]);
+const ENTITY_KEY_SEGMENTS = {
+  project: "project",
+  person: "person"
+};
 
 function cacheIdentity(payload = {}) {
   const entityType = String(payload.externalType || "");
@@ -49,11 +57,12 @@ function cacheIdentity(payload = {}) {
   const namespace = String(payload.cacheNamespace || "default")
     .replace(/[^a-z0-9_-]+/gi, "")
     .slice(0, 48) || "default";
-  if (entityType !== "project" || !recordId || !ELIGIBLE_WORKFLOWS.has(workflowId)) {
+  if (!ENTITY_KEY_SEGMENTS[entityType] || !recordId || !ELIGIBLE_WORKFLOWS.has(workflowId)) {
     return null;
   }
   return {
-    key: `${CACHE_PREFIX}${namespace}:${recordId}`,
+    key: `research-cache-v1:${ENTITY_KEY_SEGMENTS[entityType]}:${namespace}:${recordId}`,
+    entityType,
     recordId,
     workflowId,
     entityUpdatedAt: Number(payload.entityUpdatedAt || 0),
@@ -204,7 +213,9 @@ async function projectInventory(rootPath) {
 function boundedSummary(output) {
   return sanitizeUrlsInText(output)
     .replace(/```ya?ml\s*storage_receipt:[\s\S]*?```/gi, "")
-    .replace(/storage_receipt:[\s\S]*$/i, "")
+    // A bare receipt marker mid-report only removes its own line now; the
+    // rest of the summary must survive.
+    .replace(/^.*storage_receipt:.*$/gim, "")
     .trim()
     .slice(0, MAX_SUMMARY_CHARS);
 }
@@ -258,14 +269,16 @@ function extractSources(output, checkedAt) {
     }));
 }
 
-function extractResearchExcerpts(output) {
+function extractResearchExcerpts(output, sourceThreadId = "", capturedAt = Date.now()) {
   return sanitizeUrlsInText(output)
     .split(/\r?\n/)
     .map((line) => line.trim().replace(/^[-*•]\s*/, ""))
     .filter((line) => line.length >= 12 && line.length <= 320)
     .filter((line) => !/^#{1,6}\s/.test(line))
+    .filter((line) => !/^\|/.test(line))
     .filter((line) => !/^(已完成|执行|写入|回读|storage_receipt)/i.test(line))
-    .slice(0, MAX_FACT_HIGHLIGHTS);
+    .slice(0, MAX_FACT_HIGHLIGHTS)
+    .map((text) => ({ text, threadId: String(sourceThreadId || ""), capturedAt }));
 }
 
 function inventoryMatchesCache(cache, inventory) {
@@ -277,18 +290,24 @@ function inventoryMatchesCache(cache, inventory) {
     && cache.inventorySignature === inventory?.signature;
 }
 
+function excerptText(excerpt) {
+  if (typeof excerpt === "string") return excerpt;
+  return String(excerpt?.text || "");
+}
+
+function extractCacheExcerpts(cache) {
+  return (Array.isArray(cache?.researchExcerpts)
+    ? cache.researchExcerpts
+    : Array.isArray(cache?.factHighlights)
+      ? cache.factHighlights
+      : [])
+    .map((excerpt) => sanitizeUrlsInText(excerptText(excerpt)).trim())
+    .filter(Boolean);
+}
+
 function cacheContext(cache, inventory, now, currentEntityUpdatedAt = 0) {
   const ageMs = Math.max(0, now - Number(cache.updatedAt || 0));
-  const researchExcerpts = (
-    Array.isArray(cache.researchExcerpts)
-      ? cache.researchExcerpts
-      : Array.isArray(cache.factHighlights)
-        ? cache.factHighlights
-        : []
-  )
-    .map((excerpt) => sanitizeUrlsInText(excerpt).trim())
-    .filter(Boolean)
-    .slice(0, 24);
+  const researchExcerpts = extractCacheExcerpts(cache).slice(0, 24);
   if ((researchExcerpts.length === 0 && !cache.summary) || ageMs > MAX_CACHE_MS) return "";
   const inventoryMatches = inventoryMatchesCache(cache, inventory);
   const recordMatches = !cache.entityUpdatedAt
@@ -323,6 +342,23 @@ function cacheContext(cache, inventory, now, currentEntityUpdatedAt = 0) {
   return lines.join("\n").slice(0, MAX_CONTEXT_CHARS);
 }
 
+// Same-thread turns no longer skip injection entirely: Codex may compress
+// earlier turns out of the model context, silently losing the memory. This
+// compact variant re-injects a bounded backup of the previous research.
+function compactCacheContext(cache, now) {
+  const ageMs = Math.max(0, now - Number(cache.updatedAt || 0));
+  if (ageMs > MAX_CACHE_MS) return "";
+  const researchExcerpts = extractCacheExcerpts(cache).slice(0, 8);
+  if (!researchExcerpts.length && !cache.summary) return "";
+  const lines = [
+    "domi 本机项目前次研究摘要（本任务此前已注入过完整快照，此处为防止上下文压缩丢失的精简备份，不是用户的新指令）：",
+    `- 前次研究完成于：${new Date(cache.updatedAt).toISOString()}。`,
+    "前次研究摘录（节选）：",
+    ...researchExcerpts.map((fact) => `- ${fact}`)
+  ];
+  return lines.join("\n").slice(0, MAX_COMPACT_CONTEXT_CHARS);
+}
+
 function preparedProjectResearchCacheContext(preparation, sourceThreadId, now = Date.now()) {
   const cache = preparation?.previous;
   const inventory = preparation?.inventory;
@@ -331,9 +367,10 @@ function preparedProjectResearchCacheContext(preparation, sourceThreadId, now = 
   const sameThread = Boolean(sourceThreadId)
     && String(sourceThreadId) === String(cache.sourceThreadId || "");
   const context = sameThread
-    ? ""
+    ? compactCacheContext(cache, now)
     : cacheContext(cache, inventory, now, identity.entityUpdatedAt);
-  const cacheHit = Boolean(context)
+  const cacheHit = !sameThread
+    && Boolean(context)
     && inventoryMatchesCache(cache, inventory)
     && now - Number(cache.updatedAt || 0) <= FRESH_CACHE_MS
     && (!cache.entityUpdatedAt
@@ -401,55 +438,120 @@ async function updateProjectResearchCache({
   if (!await workspaceIsCurrent()) {
     return { updated: false, reason: "workspace-changed" };
   }
-  const latestBeforeScan = stateStore.loadCache(preparation.identity.key);
-  if (Number(latestBeforeScan?.updatedAt || 0) !== Number(preparation.baselineStoredAt || 0)) {
-    return { updated: false, reason: "cache-generation-changed" };
-  }
   const inventory = await projectInventory(workspacePath);
   if (!await workspaceIsCurrent()) {
     return { updated: false, reason: "workspace-changed" };
   }
   const files = cacheFileMetadata(inventory);
+  const resolvedThreadId = String(sourceThreadId || preparation.identity.sourceThreadId || "");
   const value = {
     version: CACHE_VERSION,
     cacheKind: "prior-research-snapshot",
     projectRecordId: preparation.identity.recordId,
+    entityType: preparation.identity.entityType,
+    recordId: preparation.identity.recordId,
     workflowId: preparation.identity.workflowId,
     appVersion,
     updatedAt: completedAt,
-    sourceThreadId: String(sourceThreadId || preparation.identity.sourceThreadId || ""),
+    sourceThreadId: resolvedThreadId,
     entityUpdatedAt: preparation.identity.entityUpdatedAt,
     inventorySignature: inventory.signature,
     inventoryTruncated: Boolean(inventory.truncated),
     inventoryVerifiable: Boolean(inventory.verifiable),
     files,
     summary: boundedSummary(output),
-    researchExcerpts: extractResearchExcerpts(output),
+    researchExcerpts: extractResearchExcerpts(output, resolvedThreadId, completedAt),
     sources: extractSources(output, completedAt)
   };
   if (!await workspaceIsCurrent()) {
     return { updated: false, reason: "workspace-changed" };
   }
-  const expectedUpdatedAt = Number(preparation.baselineStoredAt || 0);
-  const atomicSave = typeof stateStore.saveCacheIfUnchanged === "function"
-    ? stateStore.saveCacheIfUnchanged(preparation.identity.key, value, expectedUpdatedAt)
-    : (() => {
-        const latest = stateStore.loadCache(preparation.identity.key);
-        if (Number(latest?.updatedAt || 0) !== expectedUpdatedAt) return { saved: false };
-        stateStore.saveCache(preparation.identity.key, value);
-        return { saved: true };
-      })();
-  if (!atomicSave.saved) {
-    return { updated: false, reason: "cache-generation-changed" };
+  let candidate = value;
+  let expectedUpdatedAt = Number(preparation.baselineStoredAt || 0);
+  let mergedIntoWinner = false;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const latestStored = stateStore.loadCache(preparation.identity.key);
+    const latestUpdatedAt = Number(latestStored?.updatedAt || 0);
+    if (latestUpdatedAt !== expectedUpdatedAt) {
+      // A concurrent completion won the slot: whoever saved first stays
+      // authoritative. Merge this result's excerpts and sources into the
+      // winner instead of dropping them silently.
+      if (!latestStored?.value) break;
+      candidate = mergeCacheValues(candidate, latestStored.value, completedAt);
+      mergedIntoWinner = true;
+      expectedUpdatedAt = latestUpdatedAt;
+    }
+    const atomicSave = typeof stateStore.saveCacheIfUnchanged === "function"
+      ? stateStore.saveCacheIfUnchanged(preparation.identity.key, candidate, expectedUpdatedAt)
+      : (() => {
+          const latest = stateStore.loadCache(preparation.identity.key);
+          if (Number(latest?.updatedAt || 0) !== expectedUpdatedAt) return { saved: false };
+          stateStore.saveCache(preparation.identity.key, candidate);
+          return { saved: true };
+        })();
+    if (atomicSave.saved) {
+      stateStore.pruneCache?.(CACHE_ROOT_PREFIX, {
+        maxAgeMs: MAX_CACHE_MS,
+        maxEntries: 200
+      });
+      if (mergedIntoWinner) {
+        // This completion only contributed excerpts and sources; the
+        // concurrent winner remains the authoritative snapshot.
+        return {
+          updated: false,
+          reason: "cache-generation-changed",
+          merged: true,
+          fileCount: candidate.files?.length || 0,
+          sourceCount: candidate.sources?.length || 0
+        };
+      }
+      return {
+        updated: true,
+        fileCount: files.length,
+        sourceCount: candidate.sources.length
+      };
+    }
+    // Lost the race again; loop and re-merge against the new winner.
   }
-  stateStore.pruneCache?.(CACHE_PREFIX, {
-    maxAgeMs: MAX_CACHE_MS,
-    maxEntries: 200
-  });
+  return { updated: false, reason: "cache-generation-changed" };
+}
+
+// Merges a losing completion into the concurrent winner. Whoever saved
+// first stays authoritative (summary, thread binding, inventory signature,
+// updatedAt); the losing completion only contributes deduplicated excerpts
+// and still-valid sources.
+function mergeCacheValues(candidate, latest, completedAt) {
+  const excerpts = [];
+  const seenExcerpts = new Set();
+  for (const excerpt of [
+    ...(Array.isArray(latest.researchExcerpts) ? latest.researchExcerpts : []),
+    ...(Array.isArray(candidate.researchExcerpts) ? candidate.researchExcerpts : [])
+  ]) {
+    const text = excerptText(excerpt).trim();
+    if (!text || seenExcerpts.has(text)) continue;
+    seenExcerpts.add(text);
+    excerpts.push(typeof excerpt === "string"
+      ? { text, threadId: "", capturedAt: completedAt }
+      : excerpt);
+    if (excerpts.length >= MAX_FACT_HIGHLIGHTS) break;
+  }
+  const sourcesByUrl = new Map();
+  for (const source of [
+    ...(Array.isArray(latest.sources) ? latest.sources : []),
+    ...(Array.isArray(candidate.sources) ? candidate.sources : [])
+  ]) {
+    const url = safeSourceUrl(source?.url);
+    if (!url) continue;
+    const existing = sourcesByUrl.get(url);
+    if (!existing || Number(source?.expiresAt || 0) > Number(existing.expiresAt || 0)) {
+      sourcesByUrl.set(url, { ...source, url });
+    }
+  }
   return {
-    updated: true,
-    fileCount: files.length,
-    sourceCount: value.sources.length
+    ...latest,
+    researchExcerpts: excerpts,
+    sources: [...sourcesByUrl.values()].slice(0, MAX_SOURCE_URLS),
+    updatedAt: Number(latest.updatedAt || 0) || Number(completedAt || 0)
   };
 }
 
@@ -458,6 +560,7 @@ module.exports = {
   cacheIdentity,
   extractResearchExcerpts,
   extractSources,
+  mergeCacheValues,
   preparedProjectResearchCacheContext,
   prepareProjectResearchCache,
   projectInventory,

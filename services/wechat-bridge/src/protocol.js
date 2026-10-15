@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const TASK_REFERENCE_PATTERNS = [
   /(?:^|\s|【|\[|#)W0*(\d{1,6})(?:\b|】|\])/i,
@@ -374,7 +375,7 @@ function normalizeLinkedPath(rawPath) {
   if (value.startsWith("<") && value.endsWith(">")) value = value.slice(1, -1).trim();
   if (value.startsWith("file://")) {
     try {
-      value = decodeURIComponent(new URL(value).pathname);
+      value = fileURLToPath(new URL(value));
     } catch {
       return "";
     }
@@ -426,10 +427,11 @@ export function extractLocalAttachments(text, maximum = 3) {
     found.push({ filePath, label: label || path.basename(filePath), fullMatch });
   };
 
-  const markdownLink = /\[([^\]]+)\]\(\s*(<?(?:file:\/\/)?\/[^)\n]+>?)\s*\)/g;
+  // 同时接受 Unix 绝对路径（/…）与 Windows 盘符路径（C:\… 或 C:/…）。
+  const markdownLink = /\[([^\]]+)\]\(\s*(<?(?:file:\/\/)?(?:\/|[A-Za-z]:[\\/])[^)\n]+>?)\s*\)/g;
   for (const match of source.matchAll(markdownLink)) add(match[2], match[1], match[0]);
 
-  const codePath = /`((?:file:\/\/)?\/[^`\n]+\.(?:md|markdown|html?|pdf|docx?|xlsx?|pptx?|txt|csv|zip))`/gi;
+  const codePath = /`((?:file:\/\/)?(?:\/|[A-Za-z]:[\\/])[^`\n]+\.(?:md|markdown|html?|pdf|docx?|xlsx?|pptx?|txt|csv|zip))`/gi;
   for (const match of source.matchAll(codePath)) add(match[1], path.basename(match[1]), match[0]);
 
   for (const match of source.matchAll(CODEX_FILE_CITATION_PATTERN)) {

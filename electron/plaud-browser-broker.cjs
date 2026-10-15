@@ -192,9 +192,17 @@ class PlaudSessionBroker {
       }, this.shutdownTimeoutMs);
       forceTimer.unref?.();
       child.once("close", finish);
-      // SIGTERM invokes the worker's graceful PlaudClient.close() path. It has
-      // enough time to flush the private Profile before the bounded fallback.
-      child.kill("SIGTERM");
+      // Windows 没有可投递的 SIGTERM：kill() 会直接终止进程，worker 的
+      // 优雅关闭（冲刷私有 Profile、记录事件）不会执行。serve 模式的
+      // stdin EOF 是 worker 内建的跨平台优雅关闭通道；POSIX 继续用
+      // SIGTERM（worker 捕获后关闭 PlaudClient 并在限时内退出）。
+      if (process.platform === "win32") {
+        if (child.stdin?.writable) child.stdin.end();
+      } else {
+        // SIGTERM invokes the worker's graceful PlaudClient.close() path. It has
+        // enough time to flush the private Profile before the bounded fallback.
+        child.kill("SIGTERM");
+      }
     }).finally(() => {
       this.stopPromise = null;
       if (this.child === child) {

@@ -1,11 +1,21 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
+const { createSemanticSchema, replaceSemanticChunks } = require("./semantic-chunks.cjs");
 
 const SEARCHABLE_EXTENSIONS = new Set([".md", ".markdown", ".pdf"]);
 const MARKDOWN_EXTENSIONS = new Set([".md", ".markdown"]);
 const MAX_MARKDOWN_BYTES = 2 * 1024 * 1024;
+const MAX_PDF_BYTES = 20 * 1024 * 1024;
+const MAX_PDF_TEXT_CHARS = 200_000;
 const TRANSCRIPT_PATTERN = /(?:PLAUD\s*)?文字稿|transcript/i;
+const SCHEMA_VERSION = "5";
+const BM25_WEIGHTS = "0.0, 4.0, 2.0, 3.0";
+// Corpus budget (in content characters) for substring scans on queries that
+// cannot use the trigram FTS index. Exported so tests can tighten it.
+const SEARCH_LIMITS = {
+  shortQueryContentChars: 32 * 1024 * 1024
+};
 
 function pathInsideRoot(rootPath, candidatePath) {
   const root = path.resolve(rootPath);
@@ -14,7 +24,7 @@ function pathInsideRoot(rootPath, candidatePath) {
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-function initializeDocumentSearchIndex(database) {
+function createSearchSchema(database) {
   database.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
@@ -31,6 +41,8 @@ function initializeDocumentSearchIndex(database) {
       size INTEGER NOT NULL,
       mtime_ms REAL NOT NULL,
       content TEXT NOT NULL,
+      content_chars INTEGER NOT NULL DEFAULT 0,
+      content_status TEXT NOT NULL DEFAULT 'complete',
       is_transcript INTEGER NOT NULL DEFAULT 0,
       scan_generation TEXT NOT NULL,
       indexed_at INTEGER NOT NULL
@@ -43,6 +55,27 @@ function initializeDocumentSearchIndex(database) {
       tokenize='trigram'
     );
   `);
+  createSemanticSchema(database);
+}
+
+function initializeDocumentSearchIndex(database) {
+  createSearchSchema(database);
+  const schemaRow = database
+    .prepare("SELECT value FROM search_meta WHERE key = 'content_schema'")
+    .get();
+  if (schemaRow?.value === SCHEMA_VERSION) return;
+  // Older caches were built with different transcript/PDF/ranking semantics;
+  // they cannot be compared with the new index, so rebuild from scratch.
+  database.exec(`
+    DROP TABLE IF EXISTS search_documents_fts;
+    DROP TABLE IF EXISTS search_documents;
+    DELETE FROM semantic_chunks;
+  `);
+  createSearchSchema(database);
+  database.prepare(`
+    INSERT INTO search_meta(key, value) VALUES ('content_schema', ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(SCHEMA_VERSION);
 }
 
 function openDocumentSearchIndex(databasePath) {
@@ -76,7 +109,9 @@ function configureRoot(database, rootPath) {
   if (currentRoot(database) === resolvedRoot) return resolvedRoot;
   database.exec("BEGIN IMMEDIATE");
   try {
-    database.exec("DELETE FROM search_documents_fts; DELETE FROM search_documents;");
+    database.exec(
+      "DELETE FROM search_documents_fts; DELETE FROM semantic_chunks; DELETE FROM search_documents;"
+    );
     database.prepare(`
       INSERT INTO search_meta(key, value) VALUES ('root_path', ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
@@ -93,25 +128,65 @@ function shouldIndexFile(name) {
   return SEARCHABLE_EXTENSIONS.has(path.extname(name).toLocaleLowerCase("en-US"));
 }
 
+// Transcript detection is intentionally filename-scoped: a folder called
+// "文字稿" must not turn every document inside it into a transcript.
 function isTranscript(relativePath) {
-  return TRANSCRIPT_PATTERN.test(relativePath);
+  return TRANSCRIPT_PATTERN.test(path.basename(relativePath));
 }
 
 function isCloudPlaceholder(stat) {
+  // Windows 的 libuv 不填充 stat.blocks（恒为 0），无法据此检测
+  // 云盘占位文件；按实际文件处理。
+  if (process.platform === "win32") return false;
   return stat.size > 0 && Number.isFinite(stat.blocks) && stat.blocks === 0;
 }
 
-function readMarkdownContent(filePath, stat) {
+function readMarkdownContent(filePath, stat, { skipContent = false } = {}) {
+  // Cloud-guarded roots skip body reads entirely: reading a placeholder would
+  // trigger an on-demand download of the whole file on Windows.
+  if (skipContent) return "";
   if (stat.size > MAX_MARKDOWN_BYTES || isCloudPlaceholder(stat)) return "";
-  return fs.readFileSync(filePath, "utf8").replace(/\u0000/g, "");
+  return fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n").replace(/\u0000/g, "");
 }
 
-function upsertIndexedDocument(database, rootPath, filePath, stat, generation) {
+let unpdfModulePromise = null;
+
+function loadUnpdf() {
+  if (!unpdfModulePromise) {
+    unpdfModulePromise = import("unpdf").catch((error) => {
+      unpdfModulePromise = null;
+      throw error;
+    });
+  }
+  return unpdfModulePromise;
+}
+
+async function extractPdfText(filePath, stat, { skipContent = false } = {}) {
+  if (skipContent) return "";
+  if (!Number.isFinite(stat.size) || stat.size === 0 || stat.size > MAX_PDF_BYTES) return "";
+  if (isCloudPlaceholder(stat)) return "";
+  try {
+    const { extractText, getDocumentProxy } = await loadUnpdf();
+    const bytes = new Uint8Array(await fs.promises.readFile(filePath));
+    const proxy = await getDocumentProxy(bytes);
+    const { text } = await extractText(proxy, { mergePages: true });
+    return String(text || "")
+      .replace(/\u0000/g, "")
+      .slice(0, MAX_PDF_TEXT_CHARS);
+  } catch {
+    // Unreadable or encrypted PDFs stay name-only; extraction must never
+    // invalidate the rest of the index.
+    return "";
+  }
+}
+
+async function upsertIndexedDocument(database, rootPath, filePath, stat, generation, options = {}) {
   const resolvedPath = path.resolve(filePath);
   if (!pathInsideRoot(rootPath, resolvedPath)) return false;
   const relativePath = path.relative(rootPath, resolvedPath);
   const extension = path.extname(resolvedPath).toLocaleLowerCase("en-US");
   const kind = extension === ".pdf" ? "pdf" : "markdown";
+  const skipContent = options.skipContent === true;
   const existing = database.prepare(`
     SELECT size, mtime_ms FROM search_documents WHERE path = ?
   `).get(resolvedPath);
@@ -122,17 +197,23 @@ function upsertIndexedDocument(database, rootPath, filePath, stat, generation) {
     return false;
   }
   const transcript = isTranscript(relativePath);
-  const content = kind === "markdown" && !transcript
-    ? readMarkdownContent(resolvedPath, stat)
-    : "";
+  let content = "";
+  if (kind === "markdown") {
+    content = readMarkdownContent(resolvedPath, stat, { skipContent });
+  } else {
+    content = await extractPdfText(resolvedPath, stat, { skipContent });
+  }
+  const contentStatus = skipContent ? "blocked"
+    : !content && stat.size > 0 ? "unreadable"
+    : kind === "pdf" && content.length >= MAX_PDF_TEXT_CHARS ? "truncated" : "complete";
   database.exec("BEGIN IMMEDIATE");
   try {
     database.prepare("DELETE FROM search_documents_fts WHERE path = ?").run(resolvedPath);
     database.prepare(`
       INSERT INTO search_documents(
         path, root_path, name, relative_path, kind, size, mtime_ms,
-        content, is_transcript, scan_generation, indexed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        content, content_chars, content_status, is_transcript, scan_generation, indexed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(path) DO UPDATE SET
         root_path = excluded.root_path,
         name = excluded.name,
@@ -141,6 +222,8 @@ function upsertIndexedDocument(database, rootPath, filePath, stat, generation) {
         size = excluded.size,
         mtime_ms = excluded.mtime_ms,
         content = excluded.content,
+        content_chars = excluded.content_chars,
+        content_status = excluded.content_status,
         is_transcript = excluded.is_transcript,
         scan_generation = excluded.scan_generation,
         indexed_at = excluded.indexed_at
@@ -153,6 +236,8 @@ function upsertIndexedDocument(database, rootPath, filePath, stat, generation) {
       stat.size,
       stat.mtimeMs,
       content,
+      [...content].length,
+      contentStatus,
       transcript ? 1 : 0,
       generation,
       Date.now()
@@ -161,6 +246,7 @@ function upsertIndexedDocument(database, rootPath, filePath, stat, generation) {
       INSERT INTO search_documents_fts(path, name, relative_path, content)
       VALUES (?, ?, ?, ?)
     `).run(resolvedPath, path.basename(resolvedPath), relativePath, content);
+    replaceSemanticChunks(database, { path: resolvedPath, relativePath, content });
     database.exec("COMMIT");
   } catch (error) {
     database.exec("ROLLBACK");
@@ -178,9 +264,11 @@ function removeStaleDocuments(database, generation) {
   try {
     const deleteFts = database.prepare("DELETE FROM search_documents_fts WHERE path = ?");
     const deleteDocument = database.prepare("DELETE FROM search_documents WHERE path = ?");
+    const deleteChunks = database.prepare("DELETE FROM semantic_chunks WHERE path = ?");
     for (const row of stale) {
       deleteFts.run(row.path);
       deleteDocument.run(row.path);
+      deleteChunks.run(row.path);
     }
     database.exec("COMMIT");
   } catch (error) {
@@ -194,70 +282,178 @@ function compactWhitespace(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
-function resultSnippet(row, query) {
+function splitQueryTokens(query) {
+  const seen = new Set();
+  const tokens = [];
+  for (const raw of String(query || "").split(/[\s,，、;；]+/)) {
+    const token = raw.replace(/^["“”']+|["“”']+$/g, "").trim();
+    if (!token || seen.has(token)) continue;
+    seen.add(token);
+    tokens.push(token);
+  }
+  return tokens;
+}
+
+function codePointLength(value) {
+  return [...String(value || "")].length;
+}
+
+function ftsPhrase(token) {
+  return `"${token.replace(/"/g, '""')}"`;
+}
+
+function containsAsciiLetters(value) {
+  return /[a-z]/i.test(value);
+}
+
+// Short tokens (1–2 characters) cannot produce trigram tokens, so they are
+// matched with substring scans. CJK substrings skip case folding entirely.
+function shortTokenCondition(token, { includeContent }) {
+  const columns = includeContent
+    ? ["d.content", "d.name", "d.relative_path"]
+    : ["d.name", "d.relative_path"];
+  const fold = containsAsciiLetters(token);
+  return `(${columns
+    .map((column) => (fold ? `instr(lower(${column}), lower(?)) > 0` : `instr(${column}, ?) > 0`))
+    .join(" OR ")})`;
+}
+
+function shortTokenParamCount(token, { includeContent }) {
+  return (includeContent ? 3 : 2);
+}
+
+function resultSnippet(row, query, tokens) {
   const content = String(row.content || "");
-  const normalizedQuery = query.toLocaleLowerCase("zh-CN");
-  const contentIndex = content.toLocaleLowerCase("zh-CN").indexOf(normalizedQuery);
+  let lowerContent = null;
+  let contentIndex = -1;
+  let matched = "";
+  for (const candidate of [query, ...tokens]) {
+    if (!candidate) continue;
+    if (containsAsciiLetters(candidate)) {
+      lowerContent ??= content.toLocaleLowerCase("zh-CN");
+      const index = lowerContent.indexOf(candidate.toLocaleLowerCase("zh-CN"));
+      if (index >= 0) {
+        contentIndex = index;
+        matched = candidate;
+        break;
+      }
+    } else {
+      const index = content.indexOf(candidate);
+      if (index >= 0) {
+        contentIndex = index;
+        matched = candidate;
+        break;
+      }
+    }
+  }
   if (contentIndex < 0) {
     return {
-      snippet: row.kind === "pdf" ? "PDF 文件名匹配" : compactWhitespace(row.relative_path),
+      snippet: row.kind === "pdf" && !content ? "PDF 文件名匹配" : compactWhitespace(row.relative_path),
       line: undefined
     };
   }
   const before = content.slice(0, contentIndex);
   const line = before.split(/\r?\n/).length;
-  const start = Math.max(0, contentIndex - 70);
-  const end = Math.min(content.length, contentIndex + query.length + 110);
+  const start = Math.max(0, contentIndex - 240);
+  const end = Math.min(content.length, contentIndex + matched.length + 600);
   return {
     snippet: `${start > 0 ? "…" : ""}${compactWhitespace(content.slice(start, end))}${end < content.length ? "…" : ""}`,
-    line
+    line,
+    offset: contentIndex
   };
 }
 
 function searchIndexedDocuments(database, request = {}) {
   const query = String(request.query || "").trim();
-  if (!query) return [];
-  const limit = Math.max(1, Math.min(Number(request.limit) || 8, 20));
-  const includeTranscripts = request.includeTranscripts === true;
+  if (!query) return { results: [], degraded: false };
+  const limit = Math.max(1, Math.min(Number(request.limit) || 8, 60));
+  // Transcripts are now indexed and returned by default (ranked below regular
+  // documents). excludeTranscripts opts out; the legacy includeTranscripts
+  // value is still honoured when callers explicitly passed false.
+  const excludeTranscripts = request.excludeTranscripts === true
+    || request.includeTranscripts === false;
+  const tokens = splitQueryTokens(query);
+  const longTokens = tokens.filter((token) => codePointLength(token) >= 3);
+  const shortTokens = tokens.filter((token) => codePointLength(token) < 3);
+
+  let includeContent = true;
+  if (shortTokens.length) {
+    const contentChars = Number(
+      database
+        .prepare("SELECT COALESCE(SUM(content_chars), 0) AS total FROM search_documents")
+        .get()?.total || 0
+    );
+    includeContent = contentChars <= SEARCH_LIMITS.shortQueryContentChars;
+  }
+  const degraded = shortTokens.length > 0 && !includeContent;
+  const shortOptions = { includeContent };
   let rows;
-  if ([...query].length >= 3) {
-    const phrase = `"${query.replace(/"/g, '""')}"`;
+  if (longTokens.length) {
+    const conditions = ["search_documents_fts MATCH ?"];
+    const params = [longTokens.map(ftsPhrase).join(" AND ")];
+    if (excludeTranscripts) conditions.push("d.is_transcript = 0");
+    for (const token of shortTokens) {
+      conditions.push(shortTokenCondition(token, shortOptions));
+      for (let index = 0; index < shortTokenParamCount(token, shortOptions); index += 1) {
+        params.push(token);
+      }
+    }
+    params.push(limit);
     rows = database.prepare(`
-      SELECT d.*, bm25(search_documents_fts, 0.0, 9.0, 4.0, 1.0) AS rank
+      SELECT d.*,
+        CASE WHEN d.is_transcript = 1
+          THEN bm25(search_documents_fts, ${BM25_WEIGHTS}) * 0.5
+          ELSE bm25(search_documents_fts, ${BM25_WEIGHTS})
+        END AS rank
       FROM search_documents_fts
       JOIN search_documents d ON d.path = search_documents_fts.path
-      WHERE search_documents_fts MATCH ?
-        AND (? = 1 OR d.is_transcript = 0)
+      WHERE ${conditions.join(" AND ")}
       ORDER BY rank ASC, d.mtime_ms DESC
       LIMIT ?
-    `).all(phrase, includeTranscripts ? 1 : 0, limit);
+    `).all(...params);
   } else {
-    const pattern = `%${query.toLocaleLowerCase("zh-CN")}%`;
+    const conditions = [];
+    const params = [];
+    if (excludeTranscripts) conditions.push("d.is_transcript = 0");
+    const nameHitParts = [];
+    const nameHitParams = [];
+    for (const token of tokens) {
+      conditions.push(shortTokenCondition(token, shortOptions));
+      for (let index = 0; index < shortTokenParamCount(token, shortOptions); index += 1) {
+        params.push(token);
+      }
+      nameHitParts.push(containsAsciiLetters(token)
+        ? "instr(lower(d.name), lower(?)) > 0"
+        : "instr(d.name, ?) > 0");
+      nameHitParams.push(token);
+    }
+    params.push(...nameHitParams, limit);
     rows = database.prepare(`
       SELECT d.*, 0 AS rank
       FROM search_documents d
-      WHERE (? = 1 OR d.is_transcript = 0)
-        AND (
-          lower(d.name) LIKE ?
-          OR lower(d.relative_path) LIKE ?
-        )
-      ORDER BY d.mtime_ms DESC
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY CASE WHEN ${nameHitParts.join(" OR ")} THEN 0 ELSE 1 END, d.mtime_ms DESC
       LIMIT ?
-    `).all(includeTranscripts ? 1 : 0, pattern, pattern, limit);
+    `).all(...params);
   }
-  return rows.map((row) => ({
-    path: row.path,
-    name: row.name,
-    relativePath: row.relative_path,
-    kind: row.kind,
-    size: row.size,
-    mtimeMs: row.mtime_ms,
-    ...resultSnippet(row, query)
-  }));
+  return {
+    degraded,
+    results: rows.map((row) => ({
+      path: row.path,
+      name: row.name,
+      relativePath: row.relative_path,
+      kind: row.kind,
+      contentStatus: row.content_status,
+      size: row.size,
+      mtimeMs: row.mtime_ms,
+      ...resultSnippet(row, query, tokens)
+    }))
+  };
 }
 
 module.exports = {
   MAX_MARKDOWN_BYTES,
+  SEARCH_LIMITS,
   configureRoot,
   openDocumentSearchIndex,
   pathInsideRoot,

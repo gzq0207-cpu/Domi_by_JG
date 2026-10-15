@@ -26,7 +26,9 @@ test("local document resources accept encoded paths, file URLs, anchors and quer
   const fileUrl = `${pathToFileURL("/tmp/report.pdf").href}?line=8&column=2`;
   assert.deepEqual(
     normalizeLocalDocumentResource(fileUrl),
-    { path: "/tmp/report.pdf", extension: ".pdf", line: 8, column: 2 }
+    // pathToFileURL 在 Windows 上把 /tmp 映射到当前盘符，产品解析结果
+    // 与之一致，期望值需用 path.resolve 同样计算。
+    { path: path.resolve("/tmp/report.pdf"), extension: ".pdf", line: 8, column: 2 }
   );
 });
 
@@ -37,7 +39,8 @@ test("local document resources unwrap Markdown and angle-bracket destinations", 
   );
   assert.equal(
     normalizeLocalDocumentResource("</tmp/full-notes.md:3>").path,
-    path.normalize("/tmp/full-notes.md")
+    // 产品保留主机提供的路径形式（仅做 URI 解码），不重写分隔符。
+    "/tmp/full-notes.md"
   );
 });
 

@@ -28,7 +28,11 @@ const updateServiceSource = fs.readFileSync(
 const packageJson = require("../package.json");
 const packageLock = require("../package-lock.json");
 
-execFileSync("/bin/bash", ["-n", packageMacPath]);
+// package-mac.sh 仅在 macOS 发布流程中使用；Windows 上没有 /bin/bash，
+// 跳过 shell 语法检查，保留下方全部静态契约断言。
+if (process.platform !== "win32") {
+  execFileSync("/bin/bash", ["-n", packageMacPath]);
+}
 
 const distCase = source.indexOf("  dist)");
 const buildLoop = source.indexOf('build_app_for_arch "$arch"', distCase);

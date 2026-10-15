@@ -1,0 +1,13 @@
+{
+  "name": "domi-feishu-query-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "domi 收件箱云端查询 worker：bot 身份轮询群内查询指令，用本机推送的资料库快照作答，关机可查。零依赖，Node >= 18。",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

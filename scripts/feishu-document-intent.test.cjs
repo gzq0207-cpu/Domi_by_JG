@@ -101,7 +101,7 @@ test("source candidates only use host-provided Markdown paths", () => {
   assert.deepEqual(feishuMarkdownSourceCandidates({
     activeDocumentPath: "/tmp/current.md",
     attachmentPaths: ["/tmp/current.md", "/tmp/other.markdown", "/tmp/image.png"]
-  }), ["/tmp/current.md", "/tmp/other.markdown"]);
+  }), ["/tmp/current.md", "/tmp/other.markdown"].map((value) => path.resolve(value)));
 });
 
 test("ambiguous export context never claims a remote write", () => {

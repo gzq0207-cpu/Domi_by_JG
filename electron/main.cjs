@@ -34,15 +34,35 @@ const {
 const { DomiPluginManager } = require("./domi-plugin-manager.cjs");
 const {
   AppSettingsService,
-  parseCalendarRecipients
+  parseCalendarRecipients,
+  normalizeAgentProvider
 } = require("./app-settings.cjs");
 const { UpdateService } = require("./update-service.cjs");
+const {
+  agentCliLoginStatus,
+  buildAgentCliArgs,
+  discoverAgentCli,
+  runAgentCliVersion,
+  spawnAgentRun
+} = require("./agent-adapter.cjs");
 const { ServiceCoordinator } = require("./service-coordinator.cjs");
 const {
   classifyCodexTurnStatus,
   codexReconnectNotice
 } = require("./codex-turn-status.cjs");
 const { isSelectedCodexConnectionReady } = require("./codex-protocol.cjs");
+const { startIntakeServer, DEFAULT_PORT: INTAKE_DEFAULT_PORT } = require("./intake-server.cjs");
+const { FeishuIntakePoller } = require("./intake-feishu.cjs");
+const { FeishuWikiMirror } = require("./feishu-wiki-mirror.cjs");
+const { KnowledgeTranslationService } = require("./knowledge-translation.cjs");
+const { ChineseTranslator } = require("./chinese-translation.cjs");
+const { finalizeSubscriptionDigest, digestDisplayTitle } = require("./subscription-digest.cjs");
+const { buildQuerySnapshot, snapshotSha256 } = require("./query-snapshot.cjs");
+const {
+  buildKnowledgeDailyReport,
+  coverageWindow,
+  shouldGenerateDailyReport
+} = require("./knowledge-daily-report.cjs");
 const {
   createRunUsageTracker,
   observeRawResponseUsage,
@@ -55,7 +75,9 @@ const {
   partitionCodexRuns,
   requestCodexTurn,
   resolveCodexActiveRun,
-  threadPersistenceOptions
+  threadPersistenceOptions,
+  sourceScopedThreadKey,
+  sourceScopeAllowsResume
 } = require("./codex-run-context.cjs");
 const {
   buildMarkdownClipboardPayload,
@@ -79,6 +101,14 @@ const {
   prepareProjectResearchCache,
   updateProjectResearchCache
 } = require("./research-cache.cjs");
+const { buildDocumentContext } = require("./document-context.cjs");
+const { LibrarySession, libraryToolSpecs, libraryInstructions, startLibraryThread,
+  normalizeSourceScope, isRestrictedSourceScope, restrictedLibraryConfig, verifyCitationOriginal } = require("./library-tools.cjs");
+const { DocumentReader } = require("./document-reader.cjs");
+const { LibraryToolGateway } = require("./library-tool-gateway.cjs");
+const libraryToolGateway = new LibraryToolGateway();
+const libraryToolThreads = new Set();
+const completedLibraryUsage = new Map();
 const {
   isEntityWorkspace: workspaceIsEntity,
   pathIsWithin,
@@ -92,6 +122,27 @@ const hasSingleInstanceLock = app.requestSingleInstanceLock();
 const execFileAsync = promisify(execFile);
 const pdfProtocol = "domi-pdf";
 const markdownAssetProtocol = "domi-asset";
+
+// 打包环境下主进程的 stdout/stderr 可能连接到已退出的终端（管道断开），
+// 写入会抛 EPIPE 并以未捕获异常的形式杀死主进程。同步写入用
+// safeStderrWrite 防护，异步错误通过 error 监听忽略 EPIPE。
+function safeStderrWrite(text) {
+  const stream = process.stderr;
+  if (!stream || stream.destroyed || typeof stream.write !== "function") return;
+  try {
+    stream.write(text);
+  } catch {
+    // stderr 已断开时丢弃日志即可，不影响主进程。
+  }
+}
+
+for (const stream of [process.stdout, process.stderr]) {
+  if (!stream || typeof stream.on !== "function") continue;
+  stream.on("error", (error) => {
+    if (error && error.code === "EPIPE") return;
+    throw error;
+  });
+}
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -816,10 +867,25 @@ function currentDocumentLibraryLocation() {
 function getDocumentSearchService() {
   if (!documentSearchService) {
     documentSearchService = new DocumentSearchService({
-      databasePath: path.join(app.getPath("cache"), "domi", "document-search.sqlite3")
+      databasePath: path.join(app.getPath("cache"), "domi", "document-search.sqlite3"),
+      cloudContentAllowed: () => getAppSettings().load().settings.documentSearchCloudContent === true,
+      semanticEnabled: () => getAppSettings().load().settings.semanticSearchEnabled !== false,
+      semanticCacheDir: path.join(app.getPath("cache"), "domi", "semantic-models")
     });
   }
   return documentSearchService;
+}
+
+function semanticSearchDocumentLibrary(request = {}) {
+  try {
+    const location = currentDocumentLibraryLocation();
+    return getDocumentSearchService().semanticSearch(location.rootPath, {
+      query: String(request?.query || ""),
+      limit: request?.limit
+    });
+  } catch {
+    return { ok: true, available: false, results: [], degraded: false };
+  }
 }
 
 function searchDocumentLibrary(request = {}) {
@@ -828,7 +894,8 @@ function searchDocumentLibrary(request = {}) {
     return getDocumentSearchService().search(location.rootPath, {
       query: String(request?.query || ""),
       limit: request?.limit,
-      includeTranscripts: request?.includeTranscripts === true
+      includeTranscripts: request?.includeTranscripts === true,
+      excludeTranscripts: request?.excludeTranscripts === true
     });
   } catch (error) {
     return {
@@ -840,6 +907,71 @@ function searchDocumentLibrary(request = {}) {
       error: error instanceof Error ? error.message : String(error)
     };
   }
+}
+
+async function prepareLibraryAccess(settings, sender, runId, payload = {}) {
+  const restricted = isRestrictedSourceScope(payload);
+  if (payload.sourceScope !== "selected" && (settings.storageBackend !== "local" || !settings.localRepositoryDir)) {
+    if (restricted) throw new Error("全库资料模式需要已连接的本地资料库，本轮未改用飞书或联网。");
+    return null;
+  }
+  const attachmentPaths = Array.isArray(payload.attachmentPaths) ? payload.attachmentPaths : [];
+  if (payload.sourceScope === "selected" && !attachmentPaths.length) throw new Error("请先添加选定材料；本轮不会自动检索全库。");
+  if (attachmentPaths.length > 64) throw new Error("本轮材料超过 64 份，请缩小来源范围后重试。");
+  const supportedPaths = [];
+  for (const filePath of attachmentPaths) {
+    if (typeof filePath !== "string" || !path.isAbsolute(filePath)) throw new Error("所选材料缺少有效的绝对路径，请重新添加。");
+    const canonical = fs.realpathSync(filePath);
+    const supported = [".md", ".markdown", ".txt", ".pdf"].includes(path.extname(canonical).toLowerCase());
+    if (!supported && restricted) throw new Error(`受限来源暂不支持 ${path.basename(filePath)}，请转换为 Markdown、文本或 PDF；不会扩大来源范围。`);
+    if (supported) supportedPaths.push(filePath);
+  }
+  const { rootPath } = documentLibraryLocation(settings);
+  const session = new LibrarySession({
+    rootPath, settings,
+    sourceScope: normalizeSourceScope(payload.sourceScope, payload.webSearch),
+    selectedPaths: payload.sourceScope === "selected" ? supportedPaths : [],
+    attachmentPaths: supportedPaths,
+    search: (query, options) => searchDocumentLibrary({ query, ...options }),
+    semanticSearch: (query, options) => semanticSearchDocumentLibrary({ query, ...options }),
+    isCurrent: () => {
+      const current = getAppSettings().load().settings;
+      return current.storageBackend === "local" && documentLibraryLocation(current).rootPath === rootPath;
+    },
+    onUpdate: (libraryUsage) => {
+      const run = activeRuns.get(runId);
+      if (run && !run.finished && payload.privateOutput !== true) {
+        armRunIdleTimeout(run);
+        publishCodexEvent(sender, runId, { type: "library-usage", threadId: run.threadId, libraryUsage });
+      }
+    }
+  });
+  let access;
+  try {
+    access = await libraryToolGateway.add(session);
+    // Materialize this small public helper outside app.asar so packaged
+    // Electron can also execute it in Node mode. It contains no user data.
+    const cliPath = path.join(app.getPath("cache"), "domi", "library-tool-cli.cjs");
+    fs.mkdirSync(path.dirname(cliPath), { recursive: true });
+    const cli = fs.readFileSync(path.join(__dirname, "library-tool-cli.cjs"), "utf8");
+    if (!fs.existsSync(cliPath) || fs.readFileSync(cliPath, "utf8") !== cli) fs.writeFileSync(cliPath, cli, { mode: 0o600 });
+    const quote = (value) => `'${String(value).replace(/'/g, process.platform === "win32" ? "''" : "'\\''")}'`;
+    const command = process.platform === "win32"
+      ? `$env:ELECTRON_RUN_AS_NODE='1'; & ${quote(process.execPath)} ${quote(cliPath)} --endpoint ${quote(access.endpoint)}`
+      : `ELECTRON_RUN_AS_NODE=1 ${quote(process.execPath)} ${quote(cliPath)} --endpoint ${quote(access.endpoint)}`;
+    return { ...access, session, command, rootPath };
+  } catch (error) { if (access) access.revoke(); else session.close(); throw error; }
+}
+
+async function handleLibraryToolCall(params) {
+  const route = resolveCodexActiveRun(activeRuns.values(), params);
+  const run = route.run;
+  if (!run || run.finished || run.finishing || run.stopRequested || !run.libraryAccess
+    || run.threadId !== params.threadId || (run.turnId && run.turnId !== params.turnId)
+    || !libraryToolSpecs.some((tool) => tool.name === params.tool) || params.namespace) {
+    return { ok: false, error: "本轮未授权该资料工具或对话路由不匹配。" };
+  }
+  return run.libraryAccess.session.call(params.tool, params.arguments);
 }
 
 function invalidateDocumentLibraryCache() {
@@ -2043,6 +2175,13 @@ function armRunIdleTimeout(run) {
     return;
   }
   run.idleTimer = setTimeout(() => {
+    if (run.cliProcess) {
+      try {
+        run.cliProcess.kill();
+      } catch {}
+      finishRun(run, "failed", { error: "本地客户端任务长时间没有返回事件，已停止等待。可以在当前对话中继续执行。" });
+      return;
+    }
     if (run.finished || activeRuns.get(run.runId) !== run) return;
     const error = "Codex 任务长时间没有返回事件，已停止等待。可以在当前对话中继续执行。";
     const interrupt = run.turnId
@@ -2123,12 +2262,25 @@ function queueRunPostProcessing(run, type, completedAt) {
   return task;
 }
 
-function finishRun(run, type, details = {}) {
-  if (run.finished) {
+async function finishRun(run, type, details = {}) {
+  if (run.finished || run.finishing) {
     return;
   }
-  run.finished = true;
+  run.finishing = true;
   clearTimeout(run.idleTimer);
+  if (run.libraryAccess) {
+    // Seal writes to the read/citation ledger before the final audit. Keep the
+    // run registered until the checked result is delivered so queue replay
+    // cannot start another turn during validation.
+    run.libraryAccess.session.closed = true;
+    try { await run.libraryAccess.session.checkCitations(run.output, { complete: type === "completed" }); }
+    catch (error) {
+      run.libraryAccess.session.citationCheck = { checked: false, referencedCount: 0, verifiedCount: 0, invalidCount: 0,
+        missing: true, issues: [`引用校验未完成：${error.message}`] };
+      run.libraryAccess.session.warnings.add(`引用校验未完成：${error.message}`);
+    }
+  }
+  run.finished = true;
   for (const request of run.pendingUserInputs.values()) {
     codexClient?.cancelUserInput(request.requestId, "对应的 domi 任务已经结束。");
   }
@@ -2151,8 +2303,20 @@ function finishRun(run, type, details = {}) {
     workspacePath: run.workspacePath || demoWorkspace,
     outputPath: "",
     eventCount: run.eventCount,
-    usage
+    usage,
+    sourceScope: run.sourceScope,
+    sourceScopeIsolated: run.sourceScopeIsolated === true,
+    libraryUsage: run.libraryAccess?.session.snapshot()
   };
+  if (result.libraryUsage && !run.privateOutput) {
+    completedLibraryUsage.set(run.runId, { usage: result.libraryUsage, rootPath: run.libraryAccess.rootPath });
+    while (completedLibraryUsage.size > 100) completedLibraryUsage.delete(completedLibraryUsage.keys().next().value);
+    // Host-owned cache survives renderer/app restart; the renderer only sends
+    // run/citation IDs when reopening evidence, never arbitrary file paths.
+    try { getStateStore().saveCache(`library-usage-v2:${run.runId}`, { usage: result.libraryUsage, rootPath: run.libraryAccess.rootPath });
+      getStateStore().pruneCache("library-usage-v2:", { maxEntries: 500 }); }
+    catch (error) { appendRuntimeLog("library-usage-cache-failed", { error: boundedRuntimeText(error.message, 500) }); }
+  }
   const finishedAt = Date.now();
   appendRuntimeLog("codex-run-performance", {
     runId: run.runId,
@@ -2183,10 +2347,14 @@ function finishRun(run, type, details = {}) {
     error: result.error,
     outputPath: "",
     eventCount: run.eventCount,
-    usage
+    usage,
+    sourceScope: run.sourceScope,
+    sourceScopeIsolated: run.sourceScopeIsolated === true,
+    libraryUsage: run.privateOutput ? undefined : result.libraryUsage
   });
+  run.libraryAccess?.revoke();
   run.resolve(result);
-  queueRunPostProcessing(run, type, finishedAt);
+  if (!run.sourceScopeIsolated) queueRunPostProcessing(run, type, finishedAt);
 }
 
 function prepareCodexConnectionMaintenance(blockedError) {
@@ -2347,13 +2515,15 @@ function getCodexClient() {
       onNotification: handleCodexNotification,
       onUserInputRequest: handleCodexUserInputRequest,
       onUserInputRequestClosed: handleCodexUserInputRequestClosed,
+      onDynamicToolCall: handleLibraryToolCall,
       onLog: (text) => {
         if (process.env.NODE_ENV !== "production") {
-          process.stderr.write(`[codex app-server] ${text}`);
+          safeStderrWrite(`[codex app-server] ${text}`);
         }
       },
       onExit: ({ error, intentional }) => {
         liveCodexThreads.clear();
+        libraryToolThreads.clear();
         if (!intentional) {
           failAllRuns(error);
         }
@@ -2367,6 +2537,7 @@ function resetCodexClient() {
   codexClient?.close();
   codexClient = null;
   liveCodexThreads.clear();
+  libraryToolThreads.clear();
   resolvedCodexUserInputs.clear();
   serviceCoordinator.invalidate("codex:check");
 }
@@ -2384,6 +2555,29 @@ function codexCheckTimeout(deadlineAt, maximumMs) {
   return Math.max(1, Math.min(maximumMs, deadlineAt - Date.now()));
 }
 
+async function listAvailableCodexModels(client, { signal, deadlineAt }) {
+  const models = [];
+  const visitedCursors = new Set();
+  const modelDeadlineAt = Math.min(deadlineAt, Date.now() + CODEX_HEALTH_REQUEST_TIMEOUT_MS);
+  let cursor = null;
+  do {
+    throwIfCodexCheckAborted(signal);
+    if (Date.now() >= modelDeadlineAt) throw new Error("Codex 模型列表查询超时。");
+    const page = await client.request("model/list", {
+      cursor,
+      limit: 50,
+      includeHidden: false
+    }, { timeoutMs: codexCheckTimeout(modelDeadlineAt, CODEX_HEALTH_REQUEST_TIMEOUT_MS) });
+    models.push(...(page?.data || []));
+    cursor = page?.nextCursor || null;
+    if (cursor && visitedCursors.has(cursor)) {
+      throw new Error("Codex model/list 返回了重复的分页游标。");
+    }
+    if (cursor) visitedCursors.add(cursor);
+  } while (cursor);
+  return models;
+}
+
 async function runCodexCheck({ signal, deadlineAt = Number.POSITIVE_INFINITY } = {}) {
   const startedAt = Date.now();
   throwIfCodexCheckAborted(signal);
@@ -2398,6 +2592,7 @@ async function runCodexCheck({ signal, deadlineAt = Number.POSITIVE_INFINITY } =
     authMode: "chatgpt",
     providerLabel: "个人 ChatGPT",
     apiBaseUrl: "",
+    apiWireApi: "",
     hasApiKey: false,
     codexPath: loaded.settings.codexPath,
     env: {}
@@ -2443,11 +2638,7 @@ async function runCodexCheck({ signal, deadlineAt = Number.POSITIVE_INFINITY } =
             timeoutMs: healthTimeoutMs
           })
         : Promise.resolve({ account: null, requiresOpenaiAuth: false }),
-      client.request("model/list", {
-        cursor: null,
-        limit: 50,
-        includeHidden: false
-      }, { timeoutMs: healthTimeoutMs }),
+      listAvailableCodexModels(client, { signal, deadlineAt }),
       client.request("config/read", { includeLayers: false }, {
         timeoutMs: healthTimeoutMs
       })
@@ -2477,13 +2668,14 @@ async function runCodexCheck({ signal, deadlineAt = Number.POSITIVE_INFINITY } =
       authMode: runtime.authMode,
       providerLabel: runtime.providerLabel,
       apiBaseUrl: runtime.apiBaseUrl,
+      apiWireApi: runtime.apiWireApi,
       credentialStored: Boolean(account || runtime.hasApiKey),
       requiresOpenaiAuth,
       configuredModel: config.model || "",
       configuredReasoningEffort: config.model_reasoning_effort || "medium",
       configuredServiceTier: config.service_tier || "standard",
       pluginSetup,
-      models: (modelResult?.data || []).map((item) => ({
+      models: modelResult.map((item) => ({
         id: item.id || item.model,
         name: item.displayName || item.model || item.id,
         description: item.description || "",
@@ -2543,11 +2735,12 @@ async function runCodexCheck({ signal, deadlineAt = Number.POSITIVE_INFINITY } =
   }
 }
 
-function runCodexCheckCached() {
+function runCodexCheckCached(_event, request = {}) {
   return serviceCoordinator.run(
     "codex:check",
     runCodexCheck,
     {
+      force: request?.refreshModels === true,
       ttlMs: CODEX_CHECK_CACHE_TTL_MS,
       ttlForValue: (value) => value?.ok ? CODEX_CHECK_CACHE_TTL_MS : 5_000,
       retries: 0,
@@ -2556,8 +2749,8 @@ function runCodexCheckCached() {
   );
 }
 
-function codexThreadRuntimeKey(workspacePath, sandbox) {
-  return `${path.resolve(workspacePath)}\u0000${sandbox}`;
+function codexThreadRuntimeKey(workspacePath, sandbox, payload = {}) {
+  return sourceScopedThreadKey(path.resolve(workspacePath), sandbox, payload);
 }
 
 async function resolveThread(client, payload, workspacePath, sandbox) {
@@ -2570,8 +2763,15 @@ async function resolveThread(client, payload, workspacePath, sandbox) {
     : payload.serviceTier && payload.serviceTier !== "default"
       ? payload.serviceTier
       : undefined;
-  if (payload.threadId && payload.ephemeral !== true) {
-    const runtimeKey = codexThreadRuntimeKey(workspacePath, sandbox);
+  const restricted = isRestrictedSourceScope(payload);
+  const threadConfig = {
+    web_search: payload.webSearch === false ? "disabled" : "live",
+    ...(restricted ? restrictedLibraryConfig(payload.effectiveCodexConfig || {}) : {}),
+    ...(effort ? { model_reasoning_effort: effort } : {})
+  };
+  if (restricted && !client.capabilities().experimentalApi) throw new Error("当前 Codex 连接不支持受限资料工具，请更新 Codex 后重试；不会放宽来源权限。");
+  if (payload.threadId && sourceScopeAllowsResume(payload)) {
+    const runtimeKey = codexThreadRuntimeKey(workspacePath, sandbox, payload);
     if (liveCodexThreads.get(payload.threadId) === runtimeKey) {
       return payload.threadId;
     }
@@ -2580,7 +2780,7 @@ async function resolveThread(client, payload, workspacePath, sandbox) {
         threadId: payload.threadId,
         model,
         serviceTier,
-        config: effort ? { model_reasoning_effort: effort } : undefined,
+        config: threadConfig,
         cwd: workspacePath,
         approvalPolicy: "never",
         sandbox
@@ -2592,23 +2792,23 @@ async function resolveThread(client, payload, workspacePath, sandbox) {
     }
   }
 
-  const started = await client.request("thread/start", {
+  const { response: started, toolsRegistered } = await startLibraryThread(client, {
     model,
     serviceTier,
     cwd: workspacePath,
     approvalPolicy: "never",
     sandbox,
     serviceName: "domi",
+    ...(payload.libraryTools && client.capabilities().experimentalApi ? { dynamicTools: libraryToolSpecs } : {}),
     ...threadPersistenceOptions(payload),
-    config: {
-      web_search: payload.webSearch === false ? "disabled" : "live",
-      ...(effort ? { model_reasoning_effort: effort } : {})
-    }
-  });
-  if (payload.ephemeral !== true) {
+    config: threadConfig
+  }, { requireDynamicTools: restricted });
+  if (restricted && (!toolsRegistered || started.instructionSources?.length)) throw new Error("受限来源隔离未能生效：存在未授权的工作区指令或缺少资料工具，本轮未运行。");
+  if (toolsRegistered) libraryToolThreads.add(started.thread.id);
+  if (sourceScopeAllowsResume(payload)) {
     liveCodexThreads.set(
       started.thread.id,
-      codexThreadRuntimeKey(workspacePath, sandbox)
+      codexThreadRuntimeKey(workspacePath, sandbox, payload)
     );
   }
   return started.thread.id;
@@ -2638,6 +2838,8 @@ async function saveRuntimeSettings(request) {
     "authMode",
     "apiBaseUrl",
     "apiModel",
+    "apiWireApi",
+    "agentProvider",
     "relayCredentialConfigured"
   ].some((key) => Object.prototype.hasOwnProperty.call(settingsRequest, key)
     && settingsRequest[key] !== current[key]);
@@ -2774,8 +2976,10 @@ async function configureCodexRelay(request = {}) {
     // write. Validation below is still abortable and does not mark it verified.
     getAppSettings().save({
       authMode: "relay",
+      agentProvider: normalizeAgentProvider(request.agentProvider),
       apiBaseUrl: result.baseUrl,
       apiModel: result.model,
+      apiWireApi: result.wireApi,
       relayCredentialConfigured: true,
       codexPath: result.codexPath
     });
@@ -2859,7 +3063,8 @@ async function startChatGptLogin() {
       authMode: "chatgpt",
       apiBaseUrl: "",
       apiModel: "",
-      relayCredentialConfigured: false
+        relayCredentialConfigured: false,
+        agentProvider: "codex"
     });
     if (restored.changed) resetCodexClient();
     const response = await getCodexClient().request("account/login/start", {
@@ -2886,7 +3091,7 @@ async function runSystemDiagnostics() {
   const settings = getAppSettings().load();
   push(
     "secure-storage",
-    "macOS Keychain",
+    process.platform === "darwin" ? "macOS Keychain" : "系统加密存储",
     settings.secureStorageAvailable,
     settings.secureStorageAvailable ? "加密存储可用" : "系统加密存储不可用"
   );
@@ -2919,9 +3124,11 @@ async function runSystemDiagnostics() {
     "domi-plugin-package",
     "内置 domi 插件",
     Boolean(codex.pluginSetup?.ok),
-    codex.pluginSetup?.ok
-      ? `v${codex.pluginSetup.version || codex.pluginSetup.bundledVersion || "未知"}${codex.pluginSetup.gitCommit ? ` · ${codex.pluginSetup.gitCommit.slice(0, 8)}` : ""}`
-      : codex.pluginSetup?.error || "尚未完成内置插件安装"
+    codex.pluginSetup?.skipped && codex.pluginSetup.ok
+      ? "开发模式未启用内置插件安装（已跳过）"
+      : codex.pluginSetup?.ok
+        ? `v${codex.pluginSetup.version || codex.pluginSetup.bundledVersion || "未知"}${codex.pluginSetup.gitCommit ? ` · ${codex.pluginSetup.gitCommit.slice(0, 8)}` : ""}`
+        : codex.pluginSetup?.error || "Codex 检查未完成，无法确认内置插件状态"
   );
 
   try {
@@ -2958,6 +3165,7 @@ async function runSystemDiagnostics() {
       authMode: settings.settings.authMode,
       providerLabel: codex.providerLabel,
       apiBaseUrl: codex.apiBaseUrl || "",
+      apiWireApi: codex.apiWireApi || "",
       credentialStored: codex.credentialStored
     },
     checks
@@ -2986,6 +3194,7 @@ function explicitFeishuWriteIntent(payload) {
 }
 
 function needsLarkAccess(payload) {
+  if (isRestrictedSourceScope(payload)) return false;
   const requestText = String(payload?.requestText || "");
   const backend = getAppSettings().load().settings.storageBackend;
   // Read/reference access and write authorization are separate. A generated
@@ -3002,6 +3211,7 @@ function needsLarkAccess(payload) {
 }
 
 function repositoryRuntimeContext(payload) {
+  if (isRestrictedSourceScope(payload)) return "";
   if (!externalDomiWorkflows.has(payload?.workflowId)
     && !larkRequestPattern.test(String(payload?.requestText || ""))) {
     return "";
@@ -3078,6 +3288,7 @@ async function larkRuntimeContext(required) {
 }
 
 async function feishuDocumentWriteContext(payload) {
+  if (isRestrictedSourceScope(payload)) return "";
   const intent = classifyFeishuDocumentIntentFromRun(payload);
   if (!intent) return "";
   const candidates = feishuMarkdownSourceCandidates(payload);
@@ -3102,6 +3313,7 @@ async function feishuDocumentWriteContext(payload) {
 }
 
 async function confirmExternalDomiRun(sender, payload) {
+  if (isRestrictedSourceScope(payload)) return { allowed: true, sandbox: "read-only" };
   // The setup guidance assistant receives only a fixed phase and a locally
   // classified error. Keep it read-only and offline even when the user has
   // globally enabled external access; it must never inspect credentials or
@@ -3149,7 +3361,12 @@ async function runCodex(sender, payload) {
   }
   ensureDemoWorkspace();
   const settings = getAppSettings().load().settings;
-  const localEntityRequest = settings.storageBackend === "local"
+  try { normalizeSourceScope(payload?.sourceScope, payload?.webSearch); }
+  catch (error) { return { ok: false, runId: payload?.runId || "", output: "", error: error.message }; }
+  const restricted = isRestrictedSourceScope(payload);
+  if (restricted && settings.authMode === "agent-cli") return { ok: false, runId: payload?.runId || "", output: "", error: "当前 CLI 执行器无法证明受限来源权限，请选择 Codex 后重试；本轮未放宽来源范围。" };
+  if (restricted) payload = { ...payload, webSearch: false, ephemeral: true, externalType: undefined, externalRecordId: undefined, activeDocumentPath: undefined };
+  const localEntityRequest = !restricted && settings.storageBackend === "local"
     && ["project", "person"].includes(payload?.externalType)
     && String(payload?.externalRecordId || "").trim()
     ? {
@@ -3173,7 +3390,10 @@ async function runCodex(sender, payload) {
 
   const runId = payload?.runId || `run-${Date.now()}`;
   const acceptedAt = Date.now();
-  const prompt = String(payload?.prompt || "").trim();
+  const prompt = restricted
+    ? `请在本轮锁定的来源范围内，以只读资料问答方式完成以下用户问题。不要调用投资入库、外部连接或其他工作流。关键结论必须绑定已提供原文，缺少证据时明确说明。\n\n${String(payload?.requestText || "").trim() || "请分析选定材料。"}`
+    : String(payload?.prompt || "").trim();
+  let libraryAccess = null;
   if (localEntityRequest && !canonicalEntityWorkspace) {
     return {
       ok: false,
@@ -3216,17 +3436,20 @@ async function runCodex(sender, payload) {
         workspacePath
       };
     }
-    if (
+    if (!restricted && (
       ["domi-router", "plaud-connection-assist"].includes(String(payload?.workflowId || ""))
       || /\bPLAUD\b/i.test(prompt)
-    ) {
+    )) {
       // Codex PLAUD skills own the same private Profile. Release the renderer's
       // hidden read session first so the task never sees a false profile lock.
       await getDomiIntegration().stopPlaudBackgroundSession("codex-plaud-workflow");
     }
     const client = getCodexClient();
-    const researchCacheScope = projectResearchCacheScope(payload, workspacePath);
-    const researchCachePromise = prepareProjectResearchCache({
+    libraryAccess = !restricted && (payload?.workflowId === "connection-guidance" || payload?.privateOutput === true)
+      ? null : await prepareLibraryAccess(settings, sender, runId, payload);
+    if (restricted && !libraryAccess) throw new Error("未能建立本轮受限资料会话，本轮未运行。");
+    const researchCacheScope = restricted ? { allowed: false, workspacePath: "" } : projectResearchCacheScope(payload, workspacePath);
+    const researchCachePromise = restricted ? Promise.resolve({ context: "", cacheHit: false, identity: null, inventory: null, previous: null }) : prepareProjectResearchCache({
       stateStore: getStateStore(),
       payload: {
         ...payload,
@@ -3244,24 +3467,58 @@ async function runCodex(sender, payload) {
     const repositoryContextPromise = Promise.resolve(repositoryRuntimeContext(payload));
     const larkContextPromise = larkRuntimeContext(larkRequired);
     const feishuWriteContextPromise = feishuDocumentWriteContext(payload);
-    const threadPromise = client.start().then(() =>
-      resolveThread(client, payload, workspacePath, execution.sandbox)
-    );
-    const [threadId, repositoryContext, larkContext, feishuWriteContext, preparedResearchCache] = await Promise.all([
+    // Retrieval bridge: retrieve local-library leads from the request text
+    // itself. Failures degrade to an empty context — they must never block
+    // the run from starting.
+    const documentContextPromise = libraryAccess
+      ? libraryAccess.session.initialContext(payload?.requestText).catch(() => ({ context: "本轮自动资料读取失败，请使用资料工具重新检索并核验正文。", keywords: [] }))
+      : Promise.resolve({ context: "", keywords: [] });
+    const threadPromise = client.start().then(async () => {
+      let effectiveCodexConfig;
+      if (restricted) {
+        const effective = await client.request("config/read", { includeLayers: false, cwd: workspacePath });
+        if (!effective?.config) throw new Error("无法核实 Codex 外部工具配置，受限来源模式已安全停止。");
+        effectiveCodexConfig = effective.config;
+      }
+      return resolveThread(client, { ...payload, effectiveCodexConfig, libraryTools: Boolean(libraryAccess) }, workspacePath, execution.sandbox);
+    });
+    const [
+      threadId,
+      repositoryContext,
+      larkContext,
+      feishuWriteContext,
+      preparedResearchCache,
+      documentContext
+    ] = await Promise.all([
       threadPromise,
       repositoryContextPromise,
       larkContextPromise,
       feishuWriteContextPromise,
-      researchCachePromise
+      researchCachePromise,
+      documentContextPromise
     ]);
     const actualCacheContext = preparedProjectResearchCacheContext(
       preparedResearchCache,
       threadId
     );
     const researchCache = { ...preparedResearchCache, ...actualCacheContext };
-    const runtimeContext = [repositoryContext, larkContext, feishuWriteContext, researchCache.context]
+    const runtimeContext = [
+      repositoryContext,
+      larkContext,
+      feishuWriteContext,
+      researchCache.context,
+      documentContext?.context,
+      libraryAccess ? libraryInstructions({ fallbackCommand: restricted ? "" : libraryAccess.command,
+        dynamicTools: libraryToolThreads.has(threadId), sourceScope: libraryAccess.session.sourceScope }) : ""
+    ]
       .filter(Boolean)
       .join("\n\n");
+    if (documentContext?.context) {
+      appendRuntimeLog("document-context-injected", {
+        keywords: documentContext.keywords || [],
+        contextChars: documentContext.context.length
+      });
+    }
     const threadReadyAt = Date.now();
 
     const completion = new Promise((resolve) => {
@@ -3286,6 +3543,9 @@ async function runCodex(sender, payload) {
         threadReadyAt,
         turnAcceptedAt: null,
         researchCache,
+        libraryAccess,
+        sourceScope: payload.sourceScope,
+        sourceScopeIsolated: restricted,
         pendingUserInputs: new Map(),
         stopRequested: false,
         resolve
@@ -3297,8 +3557,11 @@ async function runCodex(sender, payload) {
     publishCodexEvent(sender, runId, {
       type: "thread",
       threadId,
-      summary: payload.threadId ? "已恢复 Codex 对话" : "已创建 Codex 对话"
+      sourceScope: payload.sourceScope,
+      sourceScopeIsolated: restricted,
+      summary: restricted ? "已建立本轮来源隔离对话（不复用旧资料）" : payload.threadId ? "已恢复 Codex 对话" : "已创建 Codex 对话"
     });
+    if (libraryAccess && !payload?.privateOutput) publishCodexEvent(sender, runId, { type: "library-usage", threadId, libraryUsage: libraryAccess.session.snapshot() });
 
     const model = payload.model && payload.model !== "default" ? payload.model : undefined;
     const effort = payload.reasoningEffort && payload.reasoningEffort !== "default"
@@ -3316,11 +3579,12 @@ async function runCodex(sender, payload) {
         effort,
         serviceTier,
         cwd: workspacePath,
-        approvalPolicy: "never"
+        approvalPolicy: "never",
+        ...(restricted ? { sandboxPolicy: { type: "readOnly", access: { type: "restricted", includePlatformDefaults: true, readableRoots: [] } } } : {})
       }, prompt, runtimeContext, {
         onCompatibility: ({ message, error }) => {
           if (process.env.NODE_ENV !== "production" && error) {
-            process.stderr.write(
+            safeStderrWrite(
               `[codex compatibility] ${error instanceof Error ? error.message : String(error)}\n`
             );
           }
@@ -3347,6 +3611,7 @@ async function runCodex(sender, payload) {
 
     return completion;
   } catch (error) {
+    libraryAccess?.revoke();
     return {
       ok: false,
       runId,
@@ -3357,12 +3622,248 @@ async function runCodex(sender, payload) {
   }
 }
 
+// 把 Claude / WorkBuddy 本地客户端的一次无头运行接入 domi 任务协议：
+// 复用 codex 的 run 生命周期（activeRuns、事件发布、空闲超时、停止、
+// 后处理），renderer 不感知引擎差异。
+async function runAgentCli(sender, payload, {
+  engine, settings, runId, prompt, workspacePath, acceptedAt }) {
+  if (isRestrictedSourceScope(payload)) return { ok: false, runId, output: "", error: "当前 CLI 执行器无法证明受限来源权限，请使用 Codex；本轮未扩大范围。" };
+  const customPath = engine === "claude" ? settings.claudeCliPath : settings.workbuddyCliPath;
+  const discovery = discoverAgentCli(engine, customPath);
+  if (!discovery.ok) {
+    return {
+      ok: false,
+      runId,
+      output: "",
+      error: discovery.error,
+      workspacePath
+    };
+  }
+  const login = agentCliLoginStatus(engine);
+  if (login.loggedIn === false) {
+    return {
+      ok: false,
+      runId,
+      output: "",
+      error: login.detail,
+      workspacePath
+    };
+  }
+  const args = buildAgentCliArgs(engine, settings, payload);
+  const researchCacheScope = projectResearchCacheScope(payload, workspacePath);
+  const researchCachePromise = prepareProjectResearchCache({
+    stateStore: getStateStore(),
+    payload: {
+      ...payload,
+      ...(researchCacheScope.allowed ? {} : { externalType: undefined }),
+      cacheNamespace: researchCacheNamespace()
+    },
+    workspacePath: researchCacheScope.workspacePath
+  }).catch(() => ({
+    context: "",
+    cacheHit: false,
+    identity: null,
+    inventory: null,
+    previous: null
+  }));
+  const repositoryContextPromise = Promise.resolve(repositoryRuntimeContext(payload));
+  const documentContextPromise = buildDocumentContext({
+    search: (query, options) => searchDocumentLibrary({ query, ...options }),
+    semanticSearch: (query, options) => semanticSearchDocumentLibrary({ query, ...options }),
+    requestText: payload?.requestText,
+    settings
+  }).catch(() => ({ context: "", keywords: [] }));
+  const [
+    repositoryContext,
+    preparedResearchCache,
+    documentContext
+  ] = await Promise.all([
+    repositoryContextPromise,
+    researchCachePromise,
+    documentContextPromise
+  ]);
+  const actualCacheContext = preparedProjectResearchCacheContext(
+    preparedResearchCache,
+    payload.threadId
+  );
+  const researchCache = { ...preparedResearchCache, ...actualCacheContext };
+  const runtimeContext = [
+    repositoryContext,
+    researchCache.context,
+    documentContext?.context
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  const engineLabel = engine === "claude" ? "Claude" : "WorkBuddy";
+  const fullPrompt = runtimeContext
+    ? `${prompt}\n\n${runtimeContext}`
+    : prompt;
+
+  const completion = new Promise((resolve) => {
+    const run = {
+      runId,
+      sender,
+      threadId: String(payload.threadId || ""),
+      turnId: "",
+      executionMode: codexRunExecutionMode(payload),
+      output: "",
+      eventCount: 0,
+      tokenUsageTracker: createRunUsageTracker(),
+      workspacePath,
+      privateOutput: payload?.privateOutput === true,
+      externalType: payload?.externalType || "",
+      externalRecordId: payload?.externalRecordId || "",
+      workflowId: payload?.workflowId || "",
+      allowUserInput: payload?.allowUserInput !== false,
+      workspaceIdentity: directoryIdentity(workspacePath),
+      finished: false,
+      acceptedAt,
+      threadReadyAt: Date.now(),
+      turnAcceptedAt: Date.now(),
+      researchCache,
+      pendingUserInputs: new Map(),
+      stopRequested: false,
+      resolve,
+      agentEngine: engine,
+      cliProcess: null
+    };
+    activeRuns.set(runId, run);
+    armRunIdleTimeout(run);
+    publishCodexEvent(sender, runId, {
+      type: "started",
+      threadId: run.threadId,
+      summary: `${engineLabel} 已开始执行`
+    });
+    const handle = spawnAgentRun({
+      engineId: engine,
+      cliPath: discovery.path,
+      args,
+      workspacePath,
+      prompt: fullPrompt,
+      onEvent: (event) => handleAgentCliEvent(run, event),
+      onExit: (outcome) => {
+        if (run.finished) return;
+        if (outcome.type === "completed") {
+          finishRun(run, "completed");
+        } else if (outcome.type === "stopped") {
+          finishRun(run, "stopped");
+        } else {
+          finishRun(run, "failed", { error: outcome.error || `${engineLabel} 执行失败。` });
+        }
+      }
+    });
+    run.cliProcess = handle;
+  });
+  return completion;
+}
+
+function handleAgentCliEvent(run, event) {
+  if (run.finished || !event) return;
+  run.eventCount += 1;
+  armRunIdleTimeout(run);
+  if (event.type === "session") {
+    if (event.sessionId) {
+      run.threadId = event.sessionId;
+      run.turnId = event.sessionId;
+    }
+    publishCodexEvent(run.sender, run.runId, {
+      type: "thread",
+      threadId: run.threadId,
+      summary: "已连接本地客户端会话"
+    });
+    return;
+  }
+  if (event.type === "assistant") {
+    if (event.text) {
+      run.output += event.text;
+      publishCodexEvent(run.sender, run.runId, {
+        type: "assistant-delta",
+        threadId: run.threadId,
+        turnId: run.turnId,
+        text: event.text
+      });
+    }
+    if (event.usage) {
+      const observed = observeRawResponseUsage(run.tokenUsageTracker, event.usage);
+      if (observed) publishRunUsage(run, false);
+    }
+    return;
+  }
+  if (event.type === "result") {
+    if (event.sessionId) {
+      run.threadId = event.sessionId;
+      run.turnId = event.sessionId;
+    }
+    if (event.usage) {
+      const observed = observeRawResponseUsage(run.tokenUsageTracker, event.usage);
+      if (observed) publishRunUsage(run, true);
+    }
+    if (event.text && !run.output.trim()) {
+      run.output = event.text;
+    }
+    return;
+  }
+  if (event.type === "raw" && event.text) {
+    run.output += event.text;
+    publishCodexEvent(run.sender, run.runId, {
+      type: "assistant-delta",
+      threadId: run.threadId,
+      turnId: run.turnId,
+      text: event.text
+    });
+  }
+}
+
+// 状态卡：检测本地客户端路径、版本与登录态。
+async function agentCliStatus(engineId) {
+  const settings = getAppSettings().load().settings;
+  const engine = ["claude", "workbuddy"].includes(engineId)
+    ? engineId
+    : settings.agentProvider;
+  if (!["claude", "workbuddy"].includes(engine)) {
+    return {
+      ok: false,
+      engine: "codex",
+      error: "只有 Claude 和 WorkBuddy 引擎使用本地客户端。"
+    };
+  }
+  const customPath = engine === "claude" ? settings.claudeCliPath : settings.workbuddyCliPath;
+  const discovery = discoverAgentCli(engine, customPath);
+  const login = agentCliLoginStatus(engine);
+  const version = discovery.ok ? await runAgentCliVersion(engine, discovery.path) : "";
+  return {
+    ok: true,
+    engine,
+    detected: discovery.ok,
+    path: discovery.ok ? discovery.path : "",
+    via: discovery.via || "",
+    version,
+    login,
+    error: discovery.ok ? "" : discovery.error
+  };
+}
+
+
 async function stopCodex(runId) {
   let run = activeRuns.get(runId);
   if (!run) {
     return { ok: false, error: "没有找到正在执行的任务。" };
   }
 
+  // CLI 引擎：直接终止子进程，由退出回调结算 stopped。
+  if (run.cliProcess) {
+    run.stopRequested = true;
+    try {
+      run.cliProcess.kill();
+    } catch {}
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      if (!activeRuns.has(runId)) return { ok: true };
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const unfinished = activeRuns.get(runId);
+    if (unfinished) finishRun(unfinished, "stopped");
+    return { ok: true };
+  }
   for (let attempt = 0; attempt < 25 && !run.turnId; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 200));
     run = activeRuns.get(runId);
@@ -3410,6 +3911,14 @@ async function recoverCodexThread(threadId) {
     return { ok: false, threadId: "", status: "unknown", error: "Codex 对话 ID 不能为空。" };
   }
 
+  {
+    const cliSettings = getAppSettings().load().settings;
+    if (["claude", "workbuddy"].includes(cliSettings.agentProvider)
+      && cliSettings.authMode === "agent-cli") {
+      // CLI 引擎的会话由其客户端在磁盘上持久化；重启后经 --resume 续接。
+      return { ok: true, threadId: normalizedThreadId, status: "unknown" };
+    }
+  }
   const activeResolution = resolveCodexActiveRun(activeRuns.values(), {
     threadId: normalizedThreadId
   });
@@ -3459,6 +3968,9 @@ async function recoverCodexThread(threadId) {
       error: status === "failed"
         ? lastTurn?.error?.message || `Codex turn 状态：${turnStatus || "unknown"}`
         : "",
+      sourceScope: activeRun?.sourceScope,
+      sourceScopeIsolated: activeRun?.sourceScopeIsolated === true,
+      libraryUsage: activeRun?.libraryAccess?.session.snapshot(),
       pendingUserInputRequests: activeRun
         ? [...activeRun.pendingUserInputs.values()]
         : []
@@ -3477,6 +3989,9 @@ async function recoverCodexThread(threadId) {
         status: "running",
         output: activeRun.output || "",
         error: "",
+        sourceScope: activeRun.sourceScope,
+        sourceScopeIsolated: activeRun.sourceScopeIsolated === true,
+        libraryUsage: activeRun.libraryAccess?.session.snapshot(),
         pendingUserInputRequests: [...activeRun.pendingUserInputs.values()]
       };
     }
@@ -3497,6 +4012,7 @@ function bindCodexRun(runId, sender) {
   // The renderer installs its run context before invoking this handshake. From this point
   // onward no live delta can be delivered to a window that has not registered the run yet.
   run.sender = sender;
+  if (run.libraryAccess && !run.privateOutput) publishCodexEvent(sender, run.runId, { type: "library-usage", threadId: run.threadId, libraryUsage: run.libraryAccess.session.snapshot() });
   for (const request of run.pendingUserInputs.values()) {
     publishCodexUserInputRequest(run, request);
   }
@@ -3548,6 +4064,7 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
     app.dock.setIcon(nativeImage.createFromPath(appIconPath));
   }
   createWindow();
+  void startDomiIntakeServer();
   getUpdateService().start();
   void ensureCodexRuntimeReady().catch((error) => {
     appendRuntimeLog("codex-runtime-repair-failed", {
@@ -3583,6 +4100,611 @@ async function drainRunPostProcessing(timeoutMs = 5_000) {
     });
   }
   return pendingRunPostProcessing.size;
+}
+
+let intakeServerHandle = null;
+let intakeFeishuPoller = null;
+
+// Feishu Wiki mirror (方案 A): local library stays authoritative; a sha256
+// ledger mirrors the cognition news, subscription digests and entity
+// homepages into the "domi资料库镜像" wiki space so they remain readable and
+// searchable from the phone even while this computer is off.
+let feishuWikiMirror = null;
+let knowledgeTranslationService = null;
+let knowledgeTranslationTimer = null;
+
+function translateKnowledgeInBackground() {
+  if (!knowledgeTranslationService) {
+    knowledgeTranslationService = new KnowledgeTranslationService({
+      settingsProvider: () => getAppSettings().load().settings,
+      configPath: path.join(app.getPath("userData"), "domi-plugin-config.json"),
+      repoScriptPath: path.join(app.isPackaged ? process.resourcesPath : path.join(__dirname, "..", "build"), "domi-plugin", "scripts", "domi-repo.cjs"),
+      stateRoot: path.join(app.getPath("userData"), "chinese-translation"),
+      runtimeProvider: getCodexRuntime,
+      onProgress: (progress) => {
+        if (progress.phase !== "blocks") appendRuntimeLog("knowledge-translation", progress);
+      }
+    });
+  }
+  void knowledgeTranslationService.runOnce().then((result) => {
+    if (!result.skipped) appendRuntimeLog("knowledge-translation-scan", result);
+  }).catch((error) => appendRuntimeLog("knowledge-translation-failed", { error: error.message || String(error) }));
+}
+let feishuWikiMirrorSyncing = false;
+// 云端查询 worker 的快照推送状态（关机可查）：只记内存 + 落盘 sha，
+// 未配置 DOMI_QUERY_WORKER_URL 时全部无行为。
+const querySnapshotLastShaRef = { current: "" };
+
+function getFeishuWikiMirror() {
+  if (!feishuWikiMirror) {
+    feishuWikiMirror = new FeishuWikiMirror({
+      statePath: path.join(app.getPath("userData"), "feishu-wiki-mirror.json"),
+      libraryRoot: getAppSettings().load().settings.localRepositoryDir || "",
+      runLark: (args, options) => getDomiIntegration().lark(args, options),
+      logger: (message, details = {}) => appendRuntimeLog("feishu-wiki-mirror", { message, ...details })
+    });
+  }
+  return feishuWikiMirror;
+}
+
+async function syncFeishuWikiMirror(trigger = "manual") {
+  if (feishuWikiMirrorSyncing) {
+    return { ok: true, skipped: true, reason: "already-running" };
+  }
+  feishuWikiMirrorSyncing = true;
+  try {
+    const result = await getFeishuWikiMirror().sync();
+    appendRuntimeLog("feishu-wiki-mirror-synced", {
+      trigger,
+      created: result.created,
+      updated: result.updated,
+      skipped: result.skipped,
+      failed: result.failed,
+      total: result.total,
+      spaceId: result.spaceId || "",
+      error: result.error || ""
+    });
+    // 镜像同步成功后顺手把查询快照推给云端 worker（配置了才生效；
+    // sha 未变时零流量）。
+    if (result.ok !== false) pushQuerySnapshot(trigger);
+    return result;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    appendRuntimeLog("feishu-wiki-mirror-failed", { trigger, error: message });
+    return { ok: false, error: message };
+  } finally {
+    feishuWikiMirrorSyncing = false;
+  }
+}
+
+function querySnapshotLastShaPath() {
+  return path.join(app.getPath("userData"), "query-snapshot-last-push.json");
+}
+
+function loadQuerySnapshotLastSha() {
+  try {
+    return String(JSON.parse(fs.readFileSync(querySnapshotLastShaPath(), "utf8")).sha || "");
+  } catch {
+    return "";
+  }
+}
+
+function saveQuerySnapshotLastSha(sha) {
+  try {
+    fs.writeFileSync(
+      querySnapshotLastShaPath(),
+      `${JSON.stringify({ sha, pushedAt: new Date().toISOString() }, null, 2)}\n`,
+      "utf8"
+    );
+  } catch {
+    // 持久化失败只影响下次启动多推一次，无副作用。
+  }
+}
+
+// 把资料库查询快照（行业动态卡片/项目/人脉/订阅日报 + 镜像链接）推给云端
+// worker；worker 用它应答群内查询，PC 关机后依然可查。仅当配置了
+// DOMI_QUERY_WORKER_URL 才生效；sha 未变时跳过，无额外流量。
+function pushQuerySnapshot(trigger) {
+  const workerUrl = String(process.env.DOMI_QUERY_WORKER_URL || "").trim();
+  const workerToken = String(process.env.DOMI_QUERY_WORKER_TOKEN || "").trim();
+  if (!/^https?:\/\//i.test(workerUrl)) return;
+  (async () => {
+    const settings = getAppSettings().load().settings;
+    const libraryRoot = String(settings.localRepositoryDir || "");
+    if (!libraryRoot) return;
+    let databasePath = "";
+    try {
+      const configPath = path.join(app.getPath("userData"), "domi-plugin-config.json");
+      databasePath = String(JSON.parse(fs.readFileSync(configPath, "utf8")).localDatabasePath || "");
+    } catch {
+      return;
+    }
+    if (!databasePath || !fs.existsSync(databasePath)) return;
+    if (!querySnapshotLastShaRef.current) querySnapshotLastShaRef.current = loadQuerySnapshotLastSha();
+    const snapshot = buildQuerySnapshot({ databasePath, libraryRoot, mirror: getFeishuWikiMirror() });
+    const sha = snapshotSha256(snapshot);
+    if (sha === querySnapshotLastShaRef.current) return;
+    const response = await fetch(`${workerUrl.replace(/\/$/, "")}/snapshot`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${workerToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify(snapshot),
+      signal: AbortSignal.timeout(30_000)
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    querySnapshotLastShaRef.current = sha;
+    saveQuerySnapshotLastSha(sha);
+    appendRuntimeLog("query-snapshot-pushed", { trigger, sha: sha.slice(0, 12) });
+  })().catch((error) => {
+    appendRuntimeLog("query-snapshot-push-failed", {
+      trigger,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  });
+}
+
+// 每日知识库日报：汇总自上次日报以来资料库的全部新增（行业认知/订阅日报/项目/人物），
+// 先增量镜像（保证新条目带上飞书链接），归档进 13.认知库/知识库日报/，推送
+// 到收件箱群。每本地日最多一份，09:00 后的第一个检查点出报；整天关机时窗口
+// 自动顺延，开机后的第一份日报覆盖关机期间漏掉的全部新增。纯 SQL，零 AI 消耗。
+function knowledgeReportStatePath() {
+  return path.join(app.getPath("userData"), "knowledge-daily-report.json");
+}
+
+function loadKnowledgeReportState() {
+  try {
+    const stored = JSON.parse(fs.readFileSync(knowledgeReportStatePath(), "utf8"));
+    return {
+      lastReportDay: String(stored?.lastReportDay || ""),
+      lastCoveredAt: Number(stored?.lastCoveredAt) || 0,
+      lastReportAt: Number(stored?.lastReportAt) || 0
+    };
+  } catch {
+    return { lastReportDay: "", lastCoveredAt: 0, lastReportAt: 0 };
+  }
+}
+
+function saveKnowledgeReportState(state) {
+  try {
+    fs.writeFileSync(
+      knowledgeReportStatePath(),
+      `${JSON.stringify(state, null, 2)}\n`,
+      "utf8"
+    );
+  } catch {
+    // 状态丢失只影响下次多出一份日报，无副作用。
+  }
+}
+
+function readInboxChatId() {
+  try {
+    return String(JSON.parse(
+      fs.readFileSync(path.join(app.getPath("userData"), "intake-feishu.json"), "utf8")
+    ).chatId || "");
+  } catch {
+    return "";
+  }
+}
+
+async function generateKnowledgeDailyReport() {
+  const state = loadKnowledgeReportState();
+  const now = new Date();
+  const reportHour = Number(process.env.DOMI_KNOWLEDGE_REPORT_HOUR) || 9;
+  if (!shouldGenerateDailyReport(state, now, reportHour)) return;
+  const settings = getAppSettings().load().settings;
+  const libraryRoot = String(settings.localRepositoryDir || "");
+  let databasePath = "";
+  try {
+    const configPath = path.join(app.getPath("userData"), "domi-plugin-config.json");
+    databasePath = String(JSON.parse(fs.readFileSync(configPath, "utf8")).localDatabasePath || "");
+  } catch {
+    // 库配置缺失时本 tick 放弃，下一轮重试。
+  }
+  if (!libraryRoot || !databasePath || !fs.existsSync(databasePath)) return;
+  const { since, until } = coverageWindow(state, now);
+  // 先增量镜像：新条目拿到飞书链接后日报里才能直接点开阅读。
+  try {
+    await syncFeishuWikiMirror("knowledge-report");
+  } catch {
+    // 镜像失败不阻塞出报，条目退化为不带链接。
+  }
+  const report = buildKnowledgeDailyReport({
+    databasePath,
+    libraryRoot,
+    since,
+    until,
+    mirror: getFeishuWikiMirror(),
+    now
+  });
+  const reportDirectory = path.join(libraryRoot, "13.认知库", "知识库日报");
+  fs.mkdirSync(reportDirectory, { recursive: true });
+  fs.writeFileSync(
+    path.join(reportDirectory, `${report.dayKey}.md`),
+    report.archiveMarkdown,
+    "utf8"
+  );
+  const chatId = readInboxChatId();
+  if (chatId) {
+    try {
+      await getDomiIntegration().lark(
+        ["im", "+messages-send", "--chat-id", chatId, "--text", report.messageMarkdown],
+        { label: "知识库日报" }
+      );
+    } catch (error) {
+      appendRuntimeLog("knowledge-report-send-failed", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+      throw error;
+    }
+  }
+  appendRuntimeLog("knowledge-report-generated", {
+    day: report.dayKey,
+    news: report.counts.news,
+    digests: report.counts.digests,
+    projects: report.counts.projects,
+    people: report.counts.people
+  });
+  saveKnowledgeReportState({
+    lastReportDay: report.dayKey,
+    lastCoveredAt: until,
+    lastReportAt: Date.now()
+  });
+}
+
+// 方案 B：收件箱查询指令应答。只读打开本地资料库 SQLite，检索项目／人脉／
+// 行业事件，把带镜像链接的摘要回复到群里；纯 SQL，不消耗任何 AI 额度。
+function inboxQueryDatabase() {
+  try {
+    const configPath = path.join(app.getPath("userData"), "domi-plugin-config.json");
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    const databasePath = String(config?.localDatabasePath || "");
+    if (!databasePath || !fs.existsSync(databasePath)) return null;
+    const { DatabaseSync } = require("node:sqlite");
+    return new DatabaseSync(databasePath, { readOnly: true });
+  } catch {
+    return null;
+  }
+}
+
+function inboxQueryDateString(timestamp) {
+  const value = Number(timestamp);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  const date = new Date(value);
+  const pad = (part) => String(part).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function inboxQueryExcerpt(value, maxLength = 90) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text;
+}
+
+function inboxQueryMirrorLink(absolutePath) {
+  try {
+    return getFeishuWikiMirror().mirroredUrlFor(absolutePath) || "";
+  } catch {
+    return "";
+  }
+}
+
+function formatInboxQueryNewsRow(row) {
+  const domains = (() => {
+    try {
+      return (JSON.parse(row.domains_json || "[]") || []).join("／") || "未分类";
+    } catch {
+      return "未分类";
+    }
+  })();
+  const published = inboxQueryDateString(row.published_at);
+  const link = inboxQueryMirrorLink(row.content_path || row.document_path || "");
+  const lines = [
+    `【${row.title}】`,
+    `${domains}${published ? ` · ${published}` : ""}`,
+    inboxQueryExcerpt(row.summary)
+  ];
+  if (link) lines.push(`阅读全文：${link}`);
+  else if (row.url) lines.push(`原文：${row.url}`);
+  return lines.join("\n");
+}
+
+async function answerInboxQuery(query) {
+  const messageId = String(query?.messageId || "");
+  if (!messageId) return;
+  const keyword = String(query?.keyword || "").trim();
+  let replyText = "";
+  const db = inboxQueryDatabase();
+  try {
+    if (query?.kind === "digest") {
+      // 最近一份订阅日报（今天优先，找不到就回退最新镜像过的日报）。
+      const today = inboxQueryDateString(Date.now());
+      const libraryRoot = getAppSettings().load().settings.localRepositoryDir || "";
+      const digestDir = libraryRoot ? path.join(libraryRoot, "13.认知库", "订阅日报") : "";
+      const candidates = digestDir && fs.existsSync(digestDir)
+        ? fs.readdirSync(digestDir).filter((name) => name.endsWith(".md")).sort().reverse()
+        : [];
+      const todayFile = candidates.find((name) => name.includes(today)) || candidates[0] || "";
+      const link = todayFile ? inboxQueryMirrorLink(path.join(digestDir, todayFile)) : "";
+      const title = todayFile ? digestDisplayTitle(fs.readFileSync(path.join(digestDir, todayFile), "utf8"), todayFile) : "";
+      replyText = todayFile
+        ? `最新订阅日报：《${title}》${link ? `\n阅读：${link}` : ""}\n发送「查 关键词」可检索资料库。`
+        : "还没有生成订阅日报。电脑打开时说一声「生成订阅日报」，或发送「动态」看最新行业内容。";
+    } else {
+      const rows = [];
+      if (db) {
+        if (query?.kind === "news") {
+          rows.push(...db.prepare(
+            "SELECT event_id, title, domains_json, published_at, summary, url, content_path, document_path FROM news_events ORDER BY published_at DESC LIMIT 5"
+          ).all());
+          replyText = rows.length
+            ? [`最近行业动态（${rows.length} 条）：`, "", ...rows.map(formatInboxQueryNewsRow)].join("\n\n")
+            : "资料库还没有行业动态。转发文章到这个群即可自动入库。";
+        } else if (keyword) {
+          const pattern = `%${keyword.replace(/[%_]/g, "")}%`;
+          const newsHits = db.prepare(
+            "SELECT event_id, title, domains_json, published_at, summary, url, content_path, document_path FROM news_events WHERE title LIKE ? OR summary LIKE ? OR companies LIKE ? ORDER BY published_at DESC LIMIT 5"
+          ).all(pattern, pattern, pattern);
+          const projectHits = db.prepare(
+            "SELECT name, domain, status, rating, notes, document_path FROM projects WHERE name LIKE ? OR notes LIKE ? LIMIT 3"
+          ).all(pattern, pattern);
+          const peopleHits = db.prepare(
+            "SELECT name, organization, status, rating, document_path FROM people WHERE name LIKE ? OR organization LIKE ? LIMIT 3"
+          ).all(pattern, pattern);
+          const sections = [];
+          if (projectHits.length) {
+            sections.push(...projectHits.map((row) => {
+              const link = inboxQueryMirrorLink(row.document_path || "");
+              return [`【项目】${row.name}`, `${row.domain || "未分类"} · ${row.status || ""}${row.rating ? ` · ${row.rating}` : ""}`, inboxQueryExcerpt(row.notes, 70), link ? `主页：${link}` : ""].filter(Boolean).join("\n");
+            }));
+          }
+          if (peopleHits.length) {
+            sections.push(...peopleHits.map((row) => {
+              const link = inboxQueryMirrorLink(row.document_path || "");
+              return [`【人物】${row.name}${row.organization ? `（${row.organization}）` : ""}`, row.status || "", link ? `主页：${link}` : ""].filter(Boolean).join("\n");
+            }));
+          }
+          if (newsHits.length) {
+            sections.push(...newsHits.map(formatInboxQueryNewsRow));
+          }
+          replyText = sections.length
+            ? [`「${keyword}」检索结果（${sections.length} 条）：`, "", ...sections].join("\n\n")
+            : `没有找到与「${keyword}」相关的项目、人物或行业动态。换个关键词试试，或直接把相关内容转发进来。`;
+        }
+      }
+      if (!replyText) {
+        replyText = "本地资料库暂不可用，请确认 domi 已完成本地库初始化后重试。";
+      }
+    }
+  } catch (error) {
+    replyText = `查询失败：${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // read-only connection; best-effort close.
+    }
+  }
+  try {
+    await getDomiIntegration().lark(
+      ["im", "+messages-reply", "--message-id", messageId, "--text", replyText],
+      { label: "收件箱查询应答" }
+    );
+    appendRuntimeLog("intake-query-answered", { kind: query?.kind, keyword });
+  } catch (error) {
+    appendRuntimeLog("intake-query-reply-failed", {
+      kind: query?.kind,
+      keyword,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+// CatPaw intake mode: when the marker file exists, forwarded items (Feishu
+// inbox links/files and bookmarklet posts) are queued for the CatPaw assistant
+// instead of opening a Codex task — the archival pipeline runs on CatPaw's own
+// quota (fetch via scripts, summary by CatPaw, upsert through the local
+// domi-repo gateway) and consumes zero ChatGPT/Codex credits. Delete the marker
+// to return to native Codex dispatch; the check is per item, no restart needed.
+const CATPAW_INTAKE_MARKER = path.join(os.homedir(), ".domi", "catpaw-intake.enabled");
+const CATPAW_INTAKE_QUEUE = path.join(os.homedir(), ".domi", "catpaw-intake-queue.json");
+const CATPAW_INTAKE_QUEUE_MAX_ITEMS = 100;
+const CATPAW_QUEUE_LOCK = `${CATPAW_INTAKE_QUEUE}.lock`;
+
+async function withCatPawQueueLock(action) {
+  const deadline = Date.now() + 5_000;
+  while (true) {
+    try {
+      fs.mkdirSync(CATPAW_QUEUE_LOCK);
+      break;
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      if (Date.now() >= deadline) throw new Error("CatPaw intake queue is busy; check the queue lock before retrying");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  try {
+    return await action();
+  } finally {
+    fs.rmdirSync(CATPAW_QUEUE_LOCK);
+  }
+}
+
+async function queueIntakeItemForCatPaw(item) {
+  try {
+    fs.mkdirSync(path.dirname(CATPAW_INTAKE_QUEUE), { recursive: true });
+    return await withCatPawQueueLock(() => {
+      let state = { version: 1, items: [] };
+      try {
+        state = JSON.parse(fs.readFileSync(CATPAW_INTAKE_QUEUE, "utf8"));
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      if (!Array.isArray(state?.items)) throw new Error("CatPaw intake queue has an invalid format");
+      const items = state.items;
+      const dedupeKey = item?.kind === "file"
+        ? `file:${item?.filePath || item?.fileName || ""}`
+        : `url:${item?.url || ""}`;
+      const alreadyPending = items.some((entry) =>
+        entry?.dedupeKey === dedupeKey && entry?.status === "pending");
+      if (!alreadyPending) {
+        items.push({ ...item, dedupeKey, status: "pending", queuedAt: new Date().toISOString() });
+      }
+      const outstanding = items.filter((entry) => !["done", "failed"].includes(entry.status));
+      const history = items.filter((entry) => ["done", "failed"].includes(entry.status))
+        .slice(-CATPAW_INTAKE_QUEUE_MAX_ITEMS);
+      const temporaryPath = `${CATPAW_INTAKE_QUEUE}.${process.pid}.tmp`;
+      try {
+        fs.writeFileSync(temporaryPath, `${JSON.stringify({ version: 1, items: [...history, ...outstanding] }, null, 2)}\n`, "utf8");
+        fs.renameSync(temporaryPath, CATPAW_INTAKE_QUEUE);
+      } finally {
+        fs.rmSync(temporaryPath, { force: true });
+      }
+      return true;
+    });
+  } catch (error) {
+    appendRuntimeLog("intake-catpaw-queue-failed", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return false;
+  }
+}
+
+async function dispatchIntakeItem(item) {
+  const kind = item?.kind === "file" ? "file" : "url";
+  appendRuntimeLog("intake-item", { kind, url: item?.url || "", file: item?.fileName || "", source: item?.source || "" });
+  if (fs.existsSync(CATPAW_INTAKE_MARKER)) {
+    if (!await queueIntakeItemForCatPaw(item)) throw new Error("CatPaw 转发队列写入失败");
+    appendRuntimeLog("intake-item-queued-catpaw", { kind });
+    try {
+      new Notification({
+        title: kind === "file" ? "domi 已收到转发文件（CatPaw 待处理）" : "domi 已收到转发内容（CatPaw 待处理）",
+        body: kind === "file"
+          ? (item.fileName || item.title || "PDF 文件")
+          : (item.title || item.url)
+      }).show();
+    } catch {
+      // Best-effort notification only.
+    }
+    return;
+  }
+  const win = BrowserWindow.getAllWindows().find((candidate) => !candidate.isDestroyed());
+  if (!win || win.webContents.isLoading()) throw new Error("domi 窗口尚未准备好，转发未被接收");
+  win.webContents.send("app:intake-item", item);
+  try {
+    new Notification({
+      title: kind === "file" ? "domi 已收到转发文件" : "domi 已收到转发内容",
+      body: kind === "file"
+        ? (item.fileName || item.title || "PDF 文件")
+        : (item.title || item.url)
+    }).show();
+  } catch {
+    // Notifications are best-effort; the task still opens in the app.
+  }
+}
+
+function resolveIntakeConfig() {
+  const bind = String(process.env.DOMI_INTAKE_BIND || "").trim().toLowerCase() === "lan"
+    ? "0.0.0.0"
+    : "127.0.0.1";
+  const port = Number(process.env.DOMI_INTAKE_PORT) || INTAKE_DEFAULT_PORT;
+  let token = String(process.env.DOMI_INTAKE_TOKEN || "").trim();
+  if (bind === "0.0.0.0" && !token) {
+    // LAN exposure is opt-in and always authenticated. The token persists in
+    // userData so phone shortcuts keep working across restarts.
+    try {
+      const tokenPath = path.join(app.getPath("userData"), "intake-token.json");
+      if (fs.existsSync(tokenPath)) {
+        token = String(JSON.parse(fs.readFileSync(tokenPath, "utf8")).token || "");
+      }
+      if (!token) {
+        token = crypto.randomBytes(24).toString("hex");
+        fs.mkdirSync(path.dirname(tokenPath), { recursive: true });
+        fs.writeFileSync(
+          tokenPath,
+          `${JSON.stringify({ token, createdAt: new Date().toISOString() }, null, 2)}\n`,
+          { encoding: "utf8", mode: 0o600 }
+        );
+      }
+    } catch {
+      token = "";
+    }
+  }
+  return { bind, port, token };
+}
+
+async function startDomiIntakeServer() {
+  const { bind, port, token } = resolveIntakeConfig();
+  try {
+    intakeServerHandle = await startIntakeServer({
+      port,
+      bind,
+      token,
+      onItem: dispatchIntakeItem
+    });
+    appendRuntimeLog("intake-server-started", {
+      bind: intakeServerHandle.bind,
+      port: intakeServerHandle.port,
+      requiresToken: intakeServerHandle.requiresToken
+    });
+  } catch (error) {
+    appendRuntimeLog("intake-server-failed", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+  // Feishu inbox poller: picks up links shared to the dedicated group chat.
+  // Stays dormant (auth check only) until the user connects lark-cli.
+  try {
+intakeFeishuPoller = new FeishuIntakePoller({
+  statePath: path.join(app.getPath("userData"), "intake-feishu.json"),
+  // Shared drop folder for files sent to the inbox; each message gets its
+  // own subdirectory so the renderer can hand the absolute path to the task.
+  filesDir: path.join(app.getPath("userData"), "intake-files"),
+  onItem: dispatchIntakeItem,
+  onQuery: (query) => {
+    // 云端 worker 接管群内查询时（DOMI_QUERY_DELEGATED=1）本机保持静默，
+    // 避免 PC 与云端双响应。未配置时维持本机应答。
+    if (String(process.env.DOMI_QUERY_DELEGATED || "").trim() === "1") return undefined;
+    return answerInboxQuery(query);
+  },
+  logger: (message) => appendRuntimeLog("intake-feishu", { message })
+});
+    if (intakeFeishuPoller.start()) {
+      appendRuntimeLog("intake-feishu-poller-started", {});
+    }
+  } catch (error) {
+    appendRuntimeLog("intake-feishu-poller-failed", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+  // 启动后延迟几分钟跑一次增量镜像：把本地库最新内容镜像到飞书 Wiki，
+  // 让手机端随时可读。sha256 账本保证无变化时几乎零 API 调用。
+  const mirrorStartupTimer = setTimeout(() => {
+    void syncFeishuWikiMirror("startup");
+  }, 3 * 60_000);
+  mirrorStartupTimer.unref?.();
+  // 中文正文与摘要独立处理：Luna/medium/standard，不运行本地推理。
+  // 首次补译历史材料；之后检查新增和变更内容，缓存复用已完成段落。
+  const translationStartupTimer = setTimeout(translateKnowledgeInBackground, 20_000);
+  translationStartupTimer.unref?.();
+  knowledgeTranslationTimer = setInterval(translateKnowledgeInBackground, 60_000);
+  knowledgeTranslationTimer.unref?.();
+  // 周期增量镜像（30 分钟）：雷达等写库路径没有独立的镜像触发点，靠这条
+  // 兜底；同步成功后顺带推送查询快照（sha 未变时零流量）。
+  const mirrorIntervalTimer = setInterval(() => {
+    void syncFeishuWikiMirror("interval");
+  }, 30 * 60_000);
+  mirrorIntervalTimer.unref?.();
+  // 每日知识库日报：每 15 分钟检查一次，09:00 后的当日首检出报
+  //（含开机补报：整天关机时窗口自动顺延）。
+  const knowledgeReportTick = () => {
+    void generateKnowledgeDailyReport().catch((error) => {
+      appendRuntimeLog("knowledge-report-failed", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
+  };
+  const knowledgeReportFirst = setTimeout(knowledgeReportTick, 10 * 60_000);
+  knowledgeReportFirst.unref?.();
+  const knowledgeReportTimer = setInterval(knowledgeReportTick, 15 * 60_000);
+  knowledgeReportTimer.unref?.();
 }
 
 app.on("before-quit", (event) => {
@@ -3629,11 +4751,23 @@ app.on("before-quit", (event) => {
       return;
     }
 
+    if (intakeFeishuPoller) {
+      intakeFeishuPoller.stop();
+      intakeFeishuPoller = null;
+    }
+    if (intakeServerHandle) {
+      const closing = intakeServerHandle.close();
+      intakeServerHandle = null;
+      await closing;
+    }
     const remaining = await drainRunPostProcessing();
     appendRuntimeLog("app-postprocess-drained", { remaining });
     await domiIntegration?.shutdownAllPlaudOperations("app-quit");
     await documentSearchService?.close();
+    await libraryToolGateway.close();
     updateService?.stop();
+    clearInterval(knowledgeTranslationTimer);
+    knowledgeTranslationService?.close();
     codexClient?.close();
     if (remaining === 0) stateStore?.close();
     applicationQuitFlushComplete = true;
@@ -3694,9 +4828,26 @@ ipcMain.handle("app:notify", (_event, request = {}) => {
   return { ok: true };
 });
 
+ipcMain.handle("agent:cli-status", (_event, engineId) => agentCliStatus(engineId));
 ipcMain.handle("codex:check", runCodexCheckCached);
 ipcMain.handle("codex:run", (event, payload) => runCodex(event.sender, payload));
 ipcMain.handle("codex:stop", (_event, runId) => stopCodex(runId));
+ipcMain.handle("library:citation-verify", async (_event, request = {}) => {
+  if (typeof request.runId !== "string" || !request.runId || request.runId.length > 160
+    || typeof request.citationId !== "string" || !/^E[a-f0-9]{12}$/.test(request.citationId)) return { ok: false, error: "无效的引用回查标识。" };
+  try {
+    const active = activeRuns.get(request.runId);
+    const saved = active?.libraryAccess
+      ? { usage: active.libraryAccess.session.snapshot(), rootPath: active.libraryAccess.rootPath }
+      : completedLibraryUsage.get(request.runId) || getStateStore().loadCache(`library-usage-v2:${request.runId}`)?.value;
+    const citation = saved?.usage?.citations?.find((item) => item.id === request.citationId);
+    if (!citation || !saved.rootPath || active?.privateOutput) return { ok: false, error: "该引用不在宿主保存的本轮证据记录中。" };
+    const reader = new DocumentReader({ rootPath: saved.rootPath, allowedPaths: [citation.path],
+      cloudContentAllowed: getAppSettings().load().settings.documentSearchCloudContent === true });
+    const checked = await verifyCitationOriginal(citation, reader);
+    return { ok: true, citation: checked };
+  } catch (error) { return { ok: false, error: error.message || "引用原文回查失败，不能认定当前版本已核验。" }; }
+});
 ipcMain.handle("codex:recover-thread", (_event, threadId) => recoverCodexThread(threadId));
 ipcMain.handle("codex:bind-run", (event, runId) => bindCodexRun(runId, event.sender));
 ipcMain.handle("codex:answer-user-input", (event, request) =>
@@ -3766,6 +4917,21 @@ ipcMain.handle("document-library:search", (_event, request) => searchDocumentLib
 ipcMain.handle("document-library:create", (_event, request) =>
   createDocumentLibraryItem(request)
 );
+ipcMain.handle("domi:subscription-digest-finalize", async (_event, request) => {
+  const settings = getAppSettings().load().settings;
+  if (settings.storageBackend !== "local" || !settings.localRepositoryDir) return { ok: false, error: "订阅日报需要本地资料库。" };
+  const libraryRoot = settings.localRepositoryDir;
+  const translator = new ChineseTranslator({
+    cacheRoot: path.join(app.getPath("userData"), "chinese-translation", "blocks"), runtimeProvider: getCodexRuntime
+  });
+  try {
+    return await finalizeSubscriptionDigest({ libraryRoot, day: request?.day, translator, beforeWrite: () => {
+      if (getAppSettings().load().settings.localRepositoryDir !== libraryRoot) throw new Error("资料库配置已变化，本轮未发布。");
+    } });
+  } catch (error) {
+    return { ok: false, error: error.message || String(error) };
+  } finally { translator.close(); }
+});
 ipcMain.handle("markdown:read", (_event, request) => readMarkdownDocument(request));
 ipcMain.handle("markdown:save", (_event, request) => saveMarkdownDocument(request));
 ipcMain.handle("markdown:rename", (_event, request) => renameMarkdownDocument(request));
@@ -3824,6 +4990,9 @@ ipcMain.handle("workspace:open", async (_event, requestedWorkspacePath) => {
 });
 
 ipcMain.handle("domi:cache", () => getDomiIntegration().loadCache());
+ipcMain.handle("feishu:wiki-mirror-sync", async (_event, request = {}) =>
+  syncFeishuWikiMirror(String(request?.trigger || "manual"))
+);
 ipcMain.handle("domi:database-list", async (_event, request = {}) => {
   try {
     return await serviceCoordinator.run(
@@ -4049,7 +5218,16 @@ ipcMain.handle("domi:radar-source-sync", async (_event, request) => {
       { force: request?.fresh === true, ttlMs: 30_000, retries: 0, allowStale: false }
     );
   } catch (error) {
-    return { ok: false, sources: [], jobs: [], results: [], updatedAt: Date.now(), error: error instanceof Error ? error.message : String(error) };
+    return { ok: false, sources: [], jobs: [], twitterItems: [], results: [], updatedAt: Date.now(), error: error instanceof Error ? error.message : String(error) };
+  }
+});
+ipcMain.handle("domi:radar-source-twitter-token", (_event, request) => {
+  try {
+    const result = getDomiIntegration().radarSourceService.saveTwitterToken(request?.token);
+    serviceCoordinator.invalidate("domi:radar-source-sync:");
+    return result;
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
 });
 ipcMain.handle("domi:podcast-process", async (_event, request) => {

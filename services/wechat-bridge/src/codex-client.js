@@ -17,10 +17,28 @@ function executable(filePath) {
 }
 
 export function resolveManagedCodexPath({ homeDir = os.homedir(), environment = process.env } = {}) {
+  const suffix = process.platform === "win32" ? ".exe" : "";
   const candidates = [
     environment.CODEX_WECHAT_CODEX_PATH,
+    // 同时接受带后缀与原始 Unix 命名的托管运行时。
+    path.join(homeDir, ".codex", "packages", "standalone", "current", "bin", `codex${suffix}`),
     path.join(homeDir, ".codex", "packages", "standalone", "current", "bin", "codex"),
+    path.join(homeDir, ".local", "bin", `codex${suffix}`),
     path.join(homeDir, ".local", "bin", "codex"),
+    ...(process.platform === "win32" ? [
+      // 开发模式：@openai/codex-sdk 的平台分包内置了完整的 Codex 运行时。
+      (() => {
+        try {
+          const vendorTriple = process.arch === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc";
+          return path.join(
+            process.cwd(), "node_modules", `@openai/codex-win32-${process.arch}`,
+            "vendor", vendorTriple, "bin", "codex.exe",
+          );
+        } catch {
+          return "";
+        }
+      })(),
+    ] : []),
   ].filter(Boolean);
   return candidates.find((candidate) => path.isAbsolute(candidate) && executable(candidate)) || "";
 }

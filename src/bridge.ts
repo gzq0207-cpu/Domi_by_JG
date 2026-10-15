@@ -26,10 +26,16 @@ const browserFallback: Window["workbench"] = {
       authMode: "chatgpt",
       apiBaseUrl: "",
       apiModel: "",
+      apiWireApi: "responses",
       relayCredentialConfigured: false,
       codexPath: "",
       plaudConnectionMode: "disabled",
-      plaudBrowser: "chrome",
+  agentProvider: "codex",
+  claudeCliPath: "",
+  workbuddyCliPath: "",
+  workbuddyArgs: "",
+  claudeModel: "",
+  plaudBrowser: "chrome",
       storageBackend: "local",
       projectBaseToken: "",
       projectTableId: "",
@@ -47,7 +53,9 @@ const browserFallback: Window["workbench"] = {
       localRepositoryDir: "",
       localDatabasePath: "",
       externalAccessMode: "always",
-      radarFollowedDomains: ["AI", "半导体", "智能出行", "前沿科技", "具身智能&机器人"],
+      radarFollowedDomains: ["算力芯片", "数据中心基础设施", "模型层", "Agent与平台", "应用"],
+      documentSearchCloudContent: false,
+      semanticSearchEnabled: true,
       updateChannel: "stable"
     },
     hasApiKey: false,
@@ -59,9 +67,15 @@ const browserFallback: Window["workbench"] = {
     settings: {
       version: 9,
       onboardingComplete: Boolean(request.onboardingComplete),
-      authMode: request.authMode === "relay" ? "relay" : "chatgpt",
+      authMode: request.authMode === "agent-cli" ? "agent-cli" : request.authMode === "relay" ? "relay" : "chatgpt",
+      agentProvider: request.agentProvider === "claude" || request.agentProvider === "workbuddy" ? request.agentProvider : "codex",
+      claudeCliPath: request.claudeCliPath || "",
+      workbuddyCliPath: request.workbuddyCliPath || "",
+      workbuddyArgs: request.workbuddyArgs || "",
+      claudeModel: request.claudeModel || "",
       apiBaseUrl: request.authMode === "relay" ? request.apiBaseUrl || "" : "",
       apiModel: request.authMode === "relay" ? request.apiModel || "" : "",
+      apiWireApi: request.authMode === "relay" && request.apiWireApi === "chat" ? "chat" : "responses",
       relayCredentialConfigured: request.authMode === "relay" && Boolean(request.relayCredentialConfigured),
       codexPath: request.codexPath || "",
       plaudConnectionMode: request.plaudConnectionMode === "enabled" ? "enabled" : "disabled",
@@ -87,7 +101,9 @@ const browserFallback: Window["workbench"] = {
       externalAccessMode: request.externalAccessMode === "ask" ? "ask" : "always",
       radarFollowedDomains: Array.isArray(request.radarFollowedDomains)
         ? request.radarFollowedDomains
-        : ["AI", "半导体", "智能出行", "前沿科技", "具身智能&机器人"],
+        : ["算力芯片", "数据中心基础设施", "模型层", "Agent与平台", "应用"],
+      documentSearchCloudContent: request.documentSearchCloudContent === true,
+      semanticSearchEnabled: request.semanticSearchEnabled !== false,
       updateChannel: request.updateChannel === "beta" ? "beta" : "stable"
     },
     hasApiKey: false,
@@ -192,7 +208,7 @@ const browserFallback: Window["workbench"] = {
     status: await browserFallback.getUpdateStatus(),
     error: "浏览器预览模式不能安装更新。"
   }),
-  checkCodex: async () => ({
+  checkCodex: async (_request?: { refreshModels?: boolean }) => ({
     ok: false,
     path: "",
     version: "Browser preview mode",
@@ -202,6 +218,7 @@ const browserFallback: Window["workbench"] = {
     authMode: "chatgpt",
     providerLabel: "浏览器预览",
     apiBaseUrl: "",
+    apiWireApi: "",
     credentialStored: false,
     requiresOpenaiAuth: true,
     configuredModel: "",
@@ -210,14 +227,37 @@ const browserFallback: Window["workbench"] = {
     models: [],
     error: "请使用 Electron 窗口运行本地 Codex。"
   }),
+  checkAgentCli: async () => ({
+    ok: false,
+    engine: "codex",
+    detected: false,
+    path: "",
+    via: "",
+    version: "",
+    login: { loggedIn: null, detail: "" },
+    error: "浏览器预览模式不能检测本地客户端。"
+  }),
   runCodex: async (payload: CodexRunRequest) => ({
+  checkAgentCli: async () => ({
+    ok: true,
+    engine: "codex",
+    detected: false,
+    path: "",
+    via: "",
+    version: "",
+    login: { loggedIn: null, detail: "浏览器预览模式不能检测本地客户端。" },
+    error: "浏览器预览模式不能检测本地客户端。"
+  }),
     ok: true,
     runId: payload.runId,
+    sourceScope: payload.sourceScope,
+    sourceScopeIsolated: payload.sourceScope === "selected" || payload.sourceScope === "library",
     output:
       "当前是浏览器预览模式，界面已正常渲染，但不能直接调用本地 Codex。\n\n请使用 `npm run dev` 自动打开的 Electron 窗口，或运行 `npm run preview`，即可通过 Electron 主进程连接 `codex app-server`。",
     workspacePath: "demo-workspace",
     eventCount: 0
   }),
+  verifyLibraryCitation: async () => ({ ok: false, error: "浏览器预览不能核验本地引用版本，请在 Electron 窗口中回查。" }),
   stopCodex: async () => ({ ok: true }),
   recoverCodexThread: async (threadId) => ({
     ok: false,
@@ -287,6 +327,8 @@ const browserFallback: Window["workbench"] = {
   searchDocumentLibrary: async (_request) => ({
     ok: false,
     results: [],
+    degraded: false,
+    partial: false,
     indexing: false,
     indexedCount: 0,
     lastIndexedAt: 0,
@@ -295,6 +337,10 @@ const browserFallback: Window["workbench"] = {
   createDocumentLibraryEntry: async () => ({
     ok: false,
     error: "请在 Electron 窗口中新建本地文档。"
+  }),
+  finalizeSubscriptionDigest: async () => ({
+    ok: false,
+    error: "请在 Electron 窗口中翻译并发布订阅日报。"
   }),
   readMarkdown: async () => ({
     ok: false,
@@ -349,6 +395,10 @@ const browserFallback: Window["workbench"] = {
     ok: false,
     error: "浏览器预览模式不能读取 domi 缓存。"
   }),
+  syncFeishuWikiMirror: async () => ({
+    ok: false,
+    error: "浏览器预览模式不能同步飞书镜像。"
+  }),
   checkDomi: async () => ({
     ok: false,
     error: "浏览器预览模式不能检查本地 domi 插件。"
@@ -390,6 +440,8 @@ const browserFallback: Window["workbench"] = {
     ok: true,
     sources: [],
     jobs: [],
+    twitterItems: [],
+    twitterTokenConfigured: false,
     updatedAt: Date.now()
   }),
   saveRadarSource: async () => ({
@@ -422,9 +474,14 @@ const browserFallback: Window["workbench"] = {
     ok: false,
     sources: [],
     jobs: [],
+    twitterItems: [],
     results: [],
     updatedAt: Date.now(),
     error: "请在 Electron 窗口中同步行业信源。"
+  }),
+  saveRadarTwitterToken: async () => ({
+    ok: false,
+    error: "请在 Electron 窗口中配置 X API 凭证。"
   }),
   processPodcastEpisode: async () => ({
     ok: false,
@@ -677,8 +734,9 @@ const browserFallback: Window["workbench"] = {
     documentCount: 0,
     projects: []
   }),
-  onCodexEvent: () => () => undefined,
-  onUpdateStatus: () => () => undefined
+onCodexEvent: () => () => undefined,
+onUpdateStatus: () => () => undefined,
+onIntakeItem: () => () => undefined
 };
 
 export const workbench = nativeWorkbench ?? browserFallback;

@@ -6,11 +6,54 @@ const { pathToFileURL } = require("node:url");
 const { DatabaseSync } = require("node:sqlite");
 const { ensureDocumentLibraryStructure } = require("./document-library.cjs");
 const CANONICAL_PROJECT_TAXONOMY = require("../shared/investment-taxonomy.json");
+const CHAIN_SEGMENTS = require("../shared/investment-chain-segments.json");
+const SEGMENT_DIRECTORY_BY_NAME = new Map(
+  CHAIN_SEGMENTS.segments.map((segment) => [segment.name, segment.directory])
+);
+const LEGACY_DOMAIN_ALIASES = CHAIN_SEGMENTS.legacyDomainAliases;
+const CHAIN_SEGMENT_DIRECTORY_NAMES = new Set(
+  CHAIN_SEGMENTS.segments.map((segment) => segment.directory)
+);
+const SEGMENT_NAME_BY_DIRECTORY = new Map(
+  CHAIN_SEGMENTS.segments.map((segment) => [segment.directory, segment.name])
+);
+// Directory name "01.能源与电力" → logical segment name "能源与电力"；
+// "_其他行业" 等非编号目录通过链段表反查。
+function segmentNameForDirectory(directoryName) {
+  const value = String(directoryName || "").trim();
+  if (SEGMENT_NAME_BY_DIRECTORY.has(value)) return SEGMENT_NAME_BY_DIRECTORY.get(value);
+  const match = value.match(/^\d{2}\.(.+)$/);
+  return match ? match[1] : "";
+}
+// Resolves any stored or scanned domain value (chain segment, legacy domain,
+// or numbered directory name) to a canonical chain segment name.
+function canonicalSegmentName(domain) {
+  const value = String(domain || "").trim();
+  if (!value) return "其他行业";
+  if (SEGMENT_DIRECTORY_BY_NAME.has(value)) return value;
+  if (CHAIN_SEGMENT_DIRECTORY_NAMES.has(value)) return segmentNameForDirectory(value);
+  const aliased = LEGACY_DOMAIN_ALIASES[value] || "";
+  if (SEGMENT_DIRECTORY_BY_NAME.has(aliased)) return aliased;
+  return "其他行业";
+}
+function segmentDirectoryForDomain(domain) {
+  return SEGMENT_DIRECTORY_BY_NAME.get(canonicalSegmentName(domain)) || "_其他行业";
+}
 
 const LOCAL_REPOSITORY_SCHEMA = 6;
-const PROJECTS_DIRECTORY = "3.项目库";
-const PEOPLE_DIRECTORY = "4.人脉库";
-const NEWS_DIRECTORY = "2.行业动态";
+const PROJECTS_DIRECTORY = ""; // deprecated: projects live under chain segment directories
+const PEOPLE_DIRECTORY = "12.人脉";
+const PEOPLE_ROOTS = Object.freeze([
+  "12.人脉",
+  // Pre-chain layout (kept until the library migration relocates it).
+  "4.人脉库"
+]);
+const NEWS_DIRECTORY = ""; // deprecated: news lives under <链段>/_行业认知/动态
+const CHAIN_PROJECT_ROOTS = Object.freeze([
+  ...CHAIN_SEGMENTS.segments.map((segment) => segment.directory),
+  // Pre-chain layout (kept until the library migration relocates them).
+  "3.项目库"
+]);
 const PROJECT_PAGE_NAME = "项目主页.md";
 const PERSON_PAGE_NAME = "人物主页.md";
 const PROJECT_STRUCTURE_DIRECTORIES = new Set(["原始材料", "研究", "纪要", "导出"]);
@@ -79,24 +122,36 @@ const CLASSIFICATION_REVIEW_STATUSES = new Set(["pending", "deferred", "confirme
 const CANONICAL_PROJECT_DOMAINS = new Set(Object.keys(CANONICAL_PROJECT_TAXONOMY));
 const LEGACY_CONSUMER_TECH_DOMAIN = "消费科技";
 const CLASSIFICATION_KEYWORD_RULES = [
-  { domain: "AI", subdomain: "AI视频", keywords: ["视频生成", "视频模型", "数字人", "文生视频"] },
-  { domain: "AI", subdomain: "AI社交", keywords: ["ai社交", "社交产品", "社交网络", "陌生人社交"] },
-  { domain: "AI", subdomain: "Agent", keywords: ["agent", "智能体", "自主执行", "工作流自动化"] },
-  { domain: "AI", subdomain: "AI基础设施", keywords: ["ai基础设施", "推理平台", "训练平台", "算力集群"] },
-  { domain: "AI", subdomain: "AI制药", keywords: ["ai制药", "药物发现", "蛋白质", "分子生成"] },
-  { domain: "AI", subdomain: "AI数据", keywords: ["数据标注", "合成数据", "训练数据", "数据闭环"] },
-  { domain: "半导体", subdomain: "EDA&IP", keywords: ["eda", "芯片设计自动化", "ip授权", "芯片ip"] },
-  { domain: "半导体", subdomain: "算力芯片", keywords: ["算力芯片", "gpu", "npu", "ai芯片", "加速卡"] },
-  { domain: "半导体", subdomain: "通信芯片", keywords: ["通信芯片", "基带", "射频芯片", "光通信芯片"] },
-  { domain: "半导体", subdomain: "光电芯片", keywords: ["光电芯片", "硅光", "光模块", "光子芯片"] },
-  { domain: "半导体", subdomain: "模拟芯片", keywords: ["模拟芯片", "电源管理", "adc", "dac"] },
-  { domain: "半导体", subdomain: "半导体设备", keywords: ["半导体设备", "刻蚀机", "薄膜沉积", "清洗设备"] },
-  { domain: "半导体", subdomain: "半导体材料", keywords: ["半导体材料", "光刻胶", "抛光液", "电子特气"] },
-  { domain: "智能出行", subdomain: "自动驾驶", keywords: ["自动驾驶", "辅助驾驶", "智驾", "adas"] },
-  { domain: "具身智能&机器人", subdomain: "工业机器人", keywords: ["工业机器人", "机械臂", "机器人本体"] },
-  { domain: "前沿科技", subdomain: "卫星互联网", keywords: ["卫星互联网", "卫星通信", "星座"] },
-  { domain: "前沿科技", subdomain: "商业航天", keywords: ["商业航天", "火箭", "卫星制造"] },
-  { domain: "消费科技", subdomain: "可穿戴", keywords: ["可穿戴", "智能眼镜", "智能手表"] }
+  { domain: "模型层", subdomain: "闭源基础模型", keywords: ["基础模型", "大模型", "预训练", "多模态模型"] },
+  { domain: "模型层", subdomain: "开源模型与生态", keywords: ["开源模型", "开源大模型", "模型开源"] },
+  { domain: "Agent与平台", subdomain: "Agent框架与编排", keywords: ["agent", "智能体", "自主执行", "工作流自动化"] },
+  { domain: "Agent与平台", subdomain: "垂直Agent平台", keywords: ["垂直agent", "行业agent", "agent平台"] },
+  { domain: "应用", subdomain: "消费应用", keywords: ["ai社交", "社交产品", "ai陪伴", "ai视频", "视频生成", "数字人", "文生视频"] },
+  { domain: "应用", subdomain: "企业应用与生产力", keywords: ["ai效率工具", "ai coding", "办公ai", "企业级ai"] },
+  { domain: "应用", subdomain: "垂直行业应用", keywords: ["ai制药", "药物发现", "ai医疗", "ai金融", "ai教育"] },
+  { domain: "基础软件与工具链", subdomain: "推理优化与serving", keywords: ["推理框架", "推理优化", "serving", "算力集群", "推理平台"] },
+  { domain: "基础软件与工具链", subdomain: "数据与向量基础设施", keywords: ["数据标注", "合成数据", "训练数据", "向量数据库", "数据闭环"] },
+  { domain: "基础软件与工具链", subdomain: "MLOps与可观测", keywords: ["mlops", "模型可观测", "模型评估"] },
+  { domain: "算力芯片", subdomain: "GPU与ASIC", keywords: ["gpu", "npu", "ai芯片", "加速卡", "算力芯片", "eda", "ip授权"] },
+  { domain: "算力芯片", subdomain: "HBM与存储", keywords: ["hbm", "显存", "存储芯片"] },
+  { domain: "算力芯片", subdomain: "先进封装与制造", keywords: ["cowos", "先进封装", "刻蚀机", "薄膜沉积", "光刻胶", "半导体设备", "半导体材料", "晶圆制造"] },
+  { domain: "算力芯片", subdomain: "国产算力", keywords: ["国产算力", "国产gpu", "自主可控算力"] },
+  { domain: "服务器与整机制造", subdomain: "ODM与品牌服务器", keywords: ["服务器", "odm", "整机柜", "整机"] },
+  { domain: "服务器与整机制造", subdomain: "交换机与网络硬件", keywords: ["交换机", "网络硬件"] },
+  { domain: "服务器与整机制造", subdomain: "光模块与铜连接", keywords: ["光模块", "硅光", "光子芯片", "铜连接", "光电芯片"] },
+  { domain: "服务器与整机制造", subdomain: "电源", keywords: ["服务器电源", "机房电源"] },
+  { domain: "服务器与整机制造", subdomain: "PCB", keywords: ["pcb", "高速板材"] },
+  { domain: "数据中心基础设施", subdomain: "IDC", keywords: ["idc", "数据中心", "智算中心"] },
+  { domain: "数据中心基础设施", subdomain: "液冷与温控", keywords: ["液冷", "温控", "冷板"] },
+  { domain: "云与算力服务", subdomain: "云厂商", keywords: ["云厂商", "公有云", "超大规模云"] },
+  { domain: "云与算力服务", subdomain: "算力租赁与推理服务", keywords: ["算力租赁", "推理服务", "算力运营"] },
+  { domain: "终端与具身", subdomain: "AI终端", keywords: ["ai手机", "ai pc", "智能眼镜", "智能手表", "可穿戴", "ai玩具"] },
+  { domain: "终端与具身", subdomain: "机器人", keywords: ["工业机器人", "机械臂", "机器人本体", "人形机器人", "具身智能"] },
+  { domain: "终端与具身", subdomain: "自动驾驶", keywords: ["自动驾驶", "辅助驾驶", "智驾", "adas"] },
+  { domain: "能源与电力", subdomain: "核电与SMR", keywords: ["核电", "smr", "小型堆"] },
+  { domain: "能源与电力", subdomain: "燃气轮机", keywords: ["燃气轮机", "燃机"] },
+  { domain: "能源与电力", subdomain: "电网与变压器", keywords: ["变压器", "电网设备", "输配电"] },
+  { domain: "能源与电力", subdomain: "电气设备", keywords: ["电气设备", "开关柜", "功率模块"] }
 ];
 
 function resolveHomePath(value) {
@@ -362,7 +417,7 @@ function previewDocumentScore(filePath, canonicalPath) {
   if (/(?:投委会|ic[\s_-]*memo|investment[\s_-]*memo)/i.test(normalizedPath)) score += 1_000;
   else if (/(?:深度研究|研究报告|桌面研究|投资分析)/.test(normalizedPath)) score += 900;
   else if (/(?:交流纪要|会议纪要|访谈纪要|纪要)/.test(normalizedPath)) score += 800;
-  else if (/(?:商业计划|pitch[\s_-]*deck|(^|[/_-])bp(?:[._/-]|$))/i.test(normalizedPath)) score += 700;
+  else if (/(?:商业计划|pitch[\s_-]*deck|(^|[\\/_-])bp(?:[._/\\-]|$))/i.test(normalizedPath)) score += 700;
   else if (path.resolve(filePath) === path.resolve(canonicalPath || "")) score += 500;
   else if (/\.(?:md|markdown)$/i.test(fileName)) score += 300;
   else if (/\.pdf$/i.test(fileName)) score += 250;
@@ -418,8 +473,6 @@ function scanWorkspaceEntities(libraryDir) {
   const projects = [];
   const people = [];
   const projectNameReviews = [];
-  const projectRoot = path.join(libraryDir, PROJECTS_DIRECTORY);
-  const peopleRoot = path.join(libraryDir, PEOPLE_DIRECTORY);
   const indexedProjectPaths = new Set();
 
   function addProject(projectPath, domainName, subdomainName, fallbackName) {
@@ -479,28 +532,76 @@ function scanWorkspaceEntities(libraryDir) {
     });
   }
 
-  for (const domainEntry of listDirectories(projectRoot)) {
-    const domainPath = path.join(projectRoot, domainEntry.name);
-    for (const subdomainEntry of listDirectories(domainPath)) {
-      const subdomainPath = path.join(domainPath, subdomainEntry.name);
-      const directProject = fs.existsSync(path.join(subdomainPath, PROJECT_PAGE_NAME))
-        || (domainEntry.name === "_未分类" && subdomainEntry.name !== "_未分类")
-        || (Boolean(firstMarkdownFile(subdomainPath)) && listDirectories(subdomainPath).length === 0);
-      if (directProject) {
-        addProject(subdomainPath, domainEntry.name, "", subdomainEntry.name);
+  // Chain layout: <NN.链段>/<环节>/<公司>，或无环节时 <NN.链段>/<公司>。
+  // 兼容旧 <领域>/<子领域>/<公司>（3.项目库 根，迁移前仍可能出现）。
+  // 每个链段目录下的 _行业认知 是资料目录而非项目目录，跳过。
+  for (const rootDirectory of CHAIN_PROJECT_ROOTS) {
+    const projectRoot = path.join(libraryDir, rootDirectory);
+    if (!fs.existsSync(projectRoot)) continue;
+      const chainRootName = SEGMENT_NAME_BY_DIRECTORY.get(rootDirectory) || "";
+    for (const domainEntry of listDirectories(projectRoot)) {
+      if (domainEntry.name === "_行业认知") continue;
+      const domainPath = path.join(projectRoot, domainEntry.name);
+      if (!chainRootName) {
+        // 旧 3.项目库 根：<领域>/<子领域>/<公司>，<领域>/_未分类/<公司>，
+        // 或 <领域>/<公司>（仅有根材料文件时）。
+        const domainName = segmentNameForDirectory(domainEntry.name) || domainEntry.name;
+        for (const subdomainEntry of listDirectories(domainPath)) {
+          const subdomainPath = path.join(domainPath, subdomainEntry.name);
+          const directProject = fs.existsSync(path.join(subdomainPath, PROJECT_PAGE_NAME))
+            || (domainEntry.name === "_未分类" && subdomainEntry.name !== "_未分类")
+            || (Boolean(firstMarkdownFile(subdomainPath)) && listDirectories(subdomainPath).length === 0);
+          if (directProject) {
+            addProject(subdomainPath, domainName, "", subdomainEntry.name);
+            continue;
+          }
+          for (const projectEntry of listDirectories(subdomainPath)) {
+            addProject(
+              path.join(subdomainPath, projectEntry.name),
+              domainName,
+              subdomainEntry.name,
+              projectEntry.name
+            );
+          }
+        }
         continue;
       }
-      for (const projectEntry of listDirectories(subdomainPath)) {
+      // 链段根：<环节>/<公司>、直接项目 <公司>，或 _未分类/<公司> 占位层。
+      const domainName = chainRootName;
+      if (domainEntry.name === "_未分类") {
+        for (const projectEntry of listDirectories(domainPath)) {
+          addProject(
+            path.join(domainPath, projectEntry.name),
+            domainName,
+            "",
+            projectEntry.name
+          );
+        }
+        continue;
+      }
+      const childDirectories = listDirectories(domainPath);
+      const isProjectShell = childDirectories.every((entry) =>
+        PROJECT_STRUCTURE_DIRECTORIES.has(entry.name)
+      );
+      const directProject = fs.existsSync(path.join(domainPath, PROJECT_PAGE_NAME))
+        || Boolean(firstMarkdownFile(domainPath))
+        || isProjectShell;
+      if (directProject) {
+        addProject(domainPath, domainName, "", domainEntry.name);
+        continue;
+      }
+      for (const projectEntry of childDirectories) {
         addProject(
-          path.join(subdomainPath, projectEntry.name),
+          path.join(domainPath, projectEntry.name),
+          domainName,
           domainEntry.name,
-          subdomainEntry.name,
           projectEntry.name
         );
       }
     }
   }
 
+  const scanPeopleDirectory = (peopleRoot) => {
   for (const personEntry of listDirectories(peopleRoot)) {
     const personPath = path.join(peopleRoot, personEntry.name);
     const canonicalPath = path.join(personPath, PERSON_PAGE_NAME);
@@ -526,6 +627,13 @@ function scanWorkspaceEntities(libraryDir) {
       interactionDocuments: personDocuments,
       createdAt: fileCreatedAt(personPath)
     });
+  }
+  };
+
+  for (const peopleRootDirectory of PEOPLE_ROOTS) {
+    const peopleRoot = path.join(libraryDir, peopleRootDirectory);
+    if (!fs.existsSync(peopleRoot)) continue;
+    scanPeopleDirectory(peopleRoot);
   }
 
   return { projects, people, projectNameReviews };
@@ -565,16 +673,18 @@ function scanManagedEntityIdentityCandidates(
   }
 
   if (type === "person") {
-    const peopleRoot = path.join(libraryDir, PEOPLE_DIRECTORY);
-    for (const personEntry of listDirectories(peopleRoot)) {
-      addCandidate(path.join(peopleRoot, personEntry.name));
+    for (const peopleRootDirectory of PEOPLE_ROOTS) {
+      const peopleRoot = path.join(libraryDir, peopleRootDirectory);
+      if (!fs.existsSync(peopleRoot)) continue;
+      for (const personEntry of listDirectories(peopleRoot)) {
+        addCandidate(path.join(peopleRoot, personEntry.name));
+      }
     }
   } else if (type === "project") {
-    const projectRoot = path.join(libraryDir, PROJECTS_DIRECTORY);
     const scopedParent = String(projectParentDirectory || "").trim();
     if (scopedParent) {
       const resolvedParent = path.resolve(scopedParent);
-      if (!isWithin(projectRoot, resolvedParent) || !directoryExists(resolvedParent)) return [];
+      if (!isWithin(libraryDir, resolvedParent) || !directoryExists(resolvedParent)) return [];
       addCandidate(resolvedParent);
       for (const projectEntry of listDirectories(resolvedParent)) {
         addCandidate(path.join(resolvedParent, projectEntry.name));
@@ -583,16 +693,26 @@ function scanManagedEntityIdentityCandidates(
         left.documentPath.localeCompare(right.documentPath, "zh-CN")
       );
     }
-    for (const domainEntry of listDirectories(projectRoot)) {
-      const domainPath = path.join(projectRoot, domainEntry.name);
-      for (const subdomainEntry of listDirectories(domainPath)) {
-        const subdomainPath = path.join(domainPath, subdomainEntry.name);
-        if (fs.existsSync(path.join(subdomainPath, PROJECT_PAGE_NAME))) {
-          addCandidate(subdomainPath);
+    for (const rootDirectory of CHAIN_PROJECT_ROOTS) {
+      const projectRoot = path.join(libraryDir, rootDirectory);
+      if (!fs.existsSync(projectRoot)) continue;
+      for (const domainEntry of listDirectories(projectRoot)) {
+        if (domainEntry.name === "_行业认知") continue;
+        const domainPath = path.join(projectRoot, domainEntry.name);
+        // 链段根下的直接项目（<链段>/<公司>/项目主页.md）在 domain 层就要识别。
+        if (fs.existsSync(path.join(domainPath, PROJECT_PAGE_NAME))) {
+          addCandidate(domainPath);
           continue;
         }
-        for (const projectEntry of listDirectories(subdomainPath)) {
-          addCandidate(path.join(subdomainPath, projectEntry.name));
+        for (const subdomainEntry of listDirectories(domainPath)) {
+          const subdomainPath = path.join(domainPath, subdomainEntry.name);
+          if (fs.existsSync(path.join(subdomainPath, PROJECT_PAGE_NAME))) {
+            addCandidate(subdomainPath);
+            continue;
+          }
+          for (const projectEntry of listDirectories(subdomainPath)) {
+            addCandidate(path.join(subdomainPath, projectEntry.name));
+          }
         }
       }
     }
@@ -677,6 +797,27 @@ function safePathSegment(value, fallback = "_未分类") {
     .replace(/^\.+$/, "")
     .slice(0, 160);
   return normalized || fallback;
+}
+
+// 动态文档统一命名：YYYYMMDD + 标题（如 20260924携程反垄断调查），
+// 目录只按年分（动态/YYYY/）。清洗规则与 domi-repo.cjs 网关的 safeSegment 保持一致。
+function newsDocumentBaseName(publishedAt, title, fallbackId) {
+  const published = new Date(publishedAt);
+  const date = Number.isFinite(published.getTime())
+    ? [
+      String(published.getFullYear()).padStart(4, "0"),
+      String(published.getMonth() + 1).padStart(2, "0"),
+      String(published.getDate()).padStart(2, "0")
+    ].join("")
+    : "";
+  const cleaned = `${date}${String(title || "").trim()}`
+    .trim()
+    .replace(/\//g, "／")
+    .replace(/[<>:"\\|?*\u0000-\u001f]/g, "-")
+    .replace(/\s+/g, " ")
+    .replace(/\.+$/g, "")
+    .slice(0, 96);
+  return cleaned || String(fallbackId || "event");
 }
 
 function normalizedTaxonomyLabel(value) {
@@ -1040,11 +1181,44 @@ last_contact_at: ${JSON.stringify(person.lastContact ? new Date(person.lastConta
 }
 
 function renderNewsManagedBlock(item) {
+  const isArticle = item.articleType === "article";
+  const articleFields = isArticle
+    ? `article_type: "article"
+`
+    : "";
+  const articleBody = `## 行业认知文章
+
+- 行业：${item.domains.join("、") || "未分类"}
+${item.companies ? `- 公司：${item.companies}\n` : ""}- 来源：${item.source || "未知"} · [原文链接](${item.url || ""})
+- 发布时间：${new Date(item.publishedAt).toISOString().slice(0, 10)}
+${isArticle ? `- 原文存档：本文下方「原文存档」章节\n` : ""}
+## 摘要
+
+${item.summary || "未填写"}
+
+## 值得关注的信号
+
+${item.investmentMeaning || "未填写"}
+
+## 后续动作
+
+${item.action || "未填写"}`;
+  const eventBody = `## 核心事实
+
+${item.summary || "未填写"}
+
+## 投资含义
+
+${item.investmentMeaning || "未填写"}
+
+## 建议动作
+
+${item.action || "未填写"}`;
   return `<!-- domi:managed:start -->
 ---
 domi_schema: ${LOCAL_REPOSITORY_SCHEMA}
 entity_type: "news_event"
-event_id: ${JSON.stringify(item.recordId)}
+${articleFields}event_id: ${JSON.stringify(item.recordId)}
 title: ${JSON.stringify(item.title)}
 domains: ${JSON.stringify(item.domains)}
 subdomains: ${JSON.stringify(item.subdomains)}
@@ -1062,17 +1236,7 @@ worth_following: ${item.worthFollowing ? "true" : "false"}
 
 # ${item.title}
 
-## 核心事实
-
-${item.summary || "未填写"}
-
-## 投资含义
-
-${item.investmentMeaning || "未填写"}
-
-## 建议动作
-
-${item.action || "未填写"}
+${isArticle ? articleBody : eventBody}
 <!-- domi:managed:end -->`;
 }
 
@@ -1194,6 +1358,14 @@ function newsRow(row) {
     evidenceStatus: row.evidence_status,
     action: row.action,
     worthFollowing: Boolean(row.worth_following),
+    articleType: row.article_type === "article" ? "article" : "event",
+    contentPath: String(row.content_path || ""),
+    contentLink: row.content_path && path.isAbsolute(row.content_path)
+      ? pathToFileURL(row.content_path).href
+      : "",
+    documentLink: row.document_path && path.isAbsolute(row.document_path)
+      ? pathToFileURL(row.document_path).href
+      : "",
     updatedAt: row.updated_at || 0
   };
 }
@@ -1383,6 +1555,15 @@ class LocalDomiRepository {
       this.database.exec(
         "ALTER TABLE people ADD COLUMN interaction_documents_json TEXT NOT NULL DEFAULT '[]'"
       );
+    }
+    const newsColumns = new Set(
+      this.database.prepare("PRAGMA table_info(news_events)").all().map((column) => column.name)
+    );
+    if (!newsColumns.has("article_type")) {
+      this.database.exec("ALTER TABLE news_events ADD COLUMN article_type TEXT NOT NULL DEFAULT 'event'");
+    }
+    if (!newsColumns.has("content_path")) {
+      this.database.exec("ALTER TABLE news_events ADD COLUMN content_path TEXT NOT NULL DEFAULT ''");
     }
     this.reconcileLegacyBulkIntakeTimestamps();
     this.upgradeReadableProjectHomepages();
@@ -1602,22 +1783,37 @@ class LocalDomiRepository {
 
   staleEntityRelinkPlans(discovered, onlyEntityType = "", onlyRecordId = "") {
     const plans = [];
+    const projectRoots = CHAIN_PROJECT_ROOTS
+      .map((directory) => path.join(this.libraryDir, directory))
+      .filter(directoryExists);
+    const peopleRoots = PEOPLE_ROOTS
+      .map((directory) => path.join(this.libraryDir, directory))
+      .filter(directoryExists);
     const definitions = [
       {
         entityType: "project",
         table: "projects",
-        root: path.join(this.libraryDir, PROJECTS_DIRECTORY),
+        root: projectRoots[0] || path.join(this.libraryDir, "_其他行业"),
+        roots: projectRoots,
         idKey: "project_id",
         items: discovered?.projects || []
       },
       {
         entityType: "person",
         table: "people",
-        root: path.join(this.libraryDir, PEOPLE_DIRECTORY),
+        root: peopleRoots[0] || path.join(this.libraryDir, PEOPLE_DIRECTORY),
+        roots: peopleRoots,
         idKey: "person_id",
         items: discovered?.people || []
       }
     ];
+    const assertWithinAny = (roots, candidate) => {
+      const resolved = path.resolve(candidate);
+      if (!roots.some((root) => isWithin(root, resolved))) {
+        throw new Error("实体文档必须在当前本地资料库对应目录内。");
+      }
+      return resolved;
+    };
 
     for (const definition of definitions) {
       if (onlyEntityType && onlyEntityType !== definition.entityType) continue;
@@ -1626,7 +1822,7 @@ class LocalDomiRepository {
         const frontmatterRecordId = String(item.frontmatterRecordId || "").trim();
         const documentPath = String(item.documentPath || "").trim();
         if (!frontmatterRecordId || !documentPath) continue;
-        assertWithin(definition.root, documentPath);
+        assertWithinAny(definition.roots, documentPath);
         const candidates = candidatesById.get(frontmatterRecordId) || new Set();
         candidates.add(path.resolve(documentPath));
         candidatesById.set(frontmatterRecordId, candidates);
@@ -1652,7 +1848,7 @@ class LocalDomiRepository {
         if (!sourcePath) continue;
         const sourceDirectory = path.dirname(sourcePath);
         if (
-          isWithin(definition.root, sourcePath)
+          definition.roots.some((root) => isWithin(root, sourcePath))
           && managedEntityPageMatches(
             sourcePath,
             definition.entityType,
@@ -1671,6 +1867,7 @@ class LocalDomiRepository {
           entityType: definition.entityType,
           table: definition.table,
           root: definition.root,
+          roots: definition.roots,
           idKey: definition.idKey,
           recordId: String(row.id),
           sourcePath,
@@ -1713,7 +1910,12 @@ class LocalDomiRepository {
       `);
 
       for (const plan of preparedPlans) {
-        assertWithin(plan.root, plan.targetPath);
+        // 项目可能落在任一链段根（或旧 3.项目库/4.人脉库）下，逐一根校验。
+        const planRoots = plan.roots?.length ? plan.roots : [plan.root];
+        const resolvedTargetPath = path.resolve(plan.targetPath);
+        if (!planRoots.some((root) => isWithin(root, resolvedTargetPath))) {
+          throw new Error("资料库路径超出允许范围。");
+        }
         const metadata = readManagedFrontmatter(plan.targetPath);
         if (String(metadata[plan.idKey] || "").trim() !== plan.recordId) {
           throw entityDirectoryChangedError();
@@ -2064,7 +2266,7 @@ class LocalDomiRepository {
       SELECT event_id, title, domains_json, subdomains_json, types_json,
         published_at, summary, investment_meaning, url, source, companies,
         institutions, importance, confidence, evidence_status, action,
-        worth_following, updated_at
+        worth_following, article_type, content_path, document_path, updated_at
       FROM news_events
       WHERE published_at >= ? AND published_at < ? AND worth_following = 1
       ORDER BY published_at DESC, importance DESC, event_id
@@ -2078,7 +2280,7 @@ class LocalDomiRepository {
       SELECT event_id, title, domains_json, subdomains_json, types_json,
         published_at, summary, investment_meaning, url, source, companies,
         institutions, importance, confidence, evidence_status, action,
-        worth_following, updated_at
+        worth_following, article_type, content_path, document_path, updated_at
       FROM news_events
       ORDER BY published_at DESC, importance DESC, event_id
       LIMIT ?
@@ -2096,16 +2298,22 @@ class LocalDomiRepository {
       ).get(id);
       if (!row) return "";
       const person = personRow(row);
-      const peopleRoot = path.join(this.libraryDir, PEOPLE_DIRECTORY);
+      const peopleRoots = PEOPLE_ROOTS
+        .map((directory) => path.join(this.libraryDir, directory))
+        .filter(directoryExists);
+      const withinPeopleRoots = (candidate) =>
+        peopleRoots.some((root) => isWithin(root, path.resolve(candidate)));
       const directory = row.document_path
         ? path.dirname(row.document_path)
         : this.personDirectory(person);
       if (!row.document_path) {
-        assertWithin(peopleRoot, directory);
+        if (!withinPeopleRoots(directory)) {
+          throw new Error("人物文档必须在 12.人脉 目录内。");
+        }
         return directoryExists(directory) ? directory : "";
       }
       if (
-        isWithin(peopleRoot, row.document_path)
+        withinPeopleRoots(row.document_path)
         && managedEntityPageMatches(
           row.document_path,
           "person",
@@ -2123,7 +2331,9 @@ class LocalDomiRepository {
         "SELECT document_path FROM people WHERE id = ?"
       ).get(id);
       const resolvedDirectory = row?.document_path ? path.dirname(row.document_path) : directory;
-      assertWithin(peopleRoot, resolvedDirectory);
+      if (!withinPeopleRoots(resolvedDirectory)) {
+        throw new Error("人物文档必须在 12.人脉 目录内。");
+      }
       return directoryExists(resolvedDirectory)
         && (!row?.document_path || managedEntityPageMatches(
           row.document_path,
@@ -2142,16 +2352,22 @@ class LocalDomiRepository {
     ).get(id);
     if (!row) return "";
     const project = projectRow(row);
-    const projectRoot = path.join(this.libraryDir, PROJECTS_DIRECTORY);
+    const projectRoots = CHAIN_PROJECT_ROOTS
+      .map((directory) => path.join(this.libraryDir, directory))
+      .filter(directoryExists);
+    const withinProjectRoots = (candidate) =>
+      projectRoots.some((root) => isWithin(root, path.resolve(candidate)));
     const directory = row.document_path
       ? path.dirname(row.document_path)
       : this.projectDirectory(project);
     if (!row.document_path) {
-      assertWithin(projectRoot, directory);
+      if (!withinProjectRoots(directory)) {
+        throw new Error("项目文档必须在产业链链段目录内。");
+      }
       return directoryExists(directory) ? directory : "";
     }
     if (
-      isWithin(projectRoot, row.document_path)
+      withinProjectRoots(row.document_path)
       && managedEntityPageMatches(
         row.document_path,
         "project",
@@ -2174,9 +2390,11 @@ class LocalDomiRepository {
     row = this.database.prepare(
       "SELECT document_path FROM projects WHERE id = ?"
     ).get(id);
-    const resolvedDirectory = row?.document_path ? path.dirname(row.document_path) : directory;
-    assertWithin(projectRoot, resolvedDirectory);
-    return directoryExists(resolvedDirectory)
+const resolvedDirectory = row?.document_path ? path.dirname(row.document_path) : directory;
+if (!withinProjectRoots(resolvedDirectory)) {
+throw new Error("项目文档必须在产业链链段目录内。");
+}
+return directoryExists(resolvedDirectory)
       && (!row?.document_path || managedEntityPageMatches(
         row.document_path,
         "project",
@@ -2207,12 +2425,8 @@ class LocalDomiRepository {
     const canonicalPath = String(row.document_path || "").trim();
     const directory = this.recordDirectory(type, id)
       || (canonicalPath ? path.dirname(canonicalPath) : "");
-    if (!directory) throw new Error("该记录尚未关联本地资料目录。");
-    const root = path.join(
-      this.libraryDir,
-      type === "project" ? PROJECTS_DIRECTORY : PEOPLE_DIRECTORY
-    );
-    assertWithin(root, directory);
+if (!directory) throw new Error("该记录尚未关联本地资料目录。");
+assertWithin(this.libraryDir, directory);
     const previewPath = bestPreviewDocument(directory, canonicalPath);
     if (!previewPath) {
       throw new Error("该资料目录中还没有可在 domi 内预览的 Markdown 或 PDF 文档。");
@@ -2455,7 +2669,7 @@ class LocalDomiRepository {
       subdomains = parseList(review.previous_subdomains_json);
     } else {
       if (domain === LEGACY_CONSUMER_TECH_DOMAIN) {
-        throw new Error("“消费科技”仅用于兼容旧项目；新分类请选择“消费”。");
+        throw new Error("“消费科技”仅用于兼容旧项目；新分类请从产业链链段词表（01.能源与电力 … 11.终端与具身）中选择。");
       }
       if (!CANONICAL_PROJECT_DOMAINS.has(domain)) {
         throw new Error("一级领域必须从现有正式领域中选择。");
@@ -2529,15 +2743,16 @@ class LocalDomiRepository {
   }
 
   projectDirectory(project) {
-    const root = path.join(this.libraryDir, PROJECTS_DIRECTORY);
-    const domain = safePathSegment(project.domain);
+    // Chain layout: <NN.链段>/[<环节>/]<公司>。未知或旧词表领域先映射到链段。
+    const segmentDirectory = segmentDirectoryForDomain(project.domain);
+    const root = path.join(this.libraryDir, segmentDirectory);
     const mainSubdomain = project.subdomains[0]
       ? safePathSegment(project.subdomains[0])
       : "";
     const projectName = safePathSegment(project.name, "未命名项目");
     const directory = !mainSubdomain || mainSubdomain === "_未分类"
-      ? path.join(root, domain, projectName)
-      : path.join(root, domain, mainSubdomain, projectName);
+      ? path.join(root, projectName)
+      : path.join(root, mainSubdomain, projectName);
     assertWithin(root, directory);
     return directory;
   }
@@ -2550,13 +2765,18 @@ class LocalDomiRepository {
   }
 
   newsDocumentPath(item) {
-    const root = path.join(this.libraryDir, NEWS_DIRECTORY);
+    // News flows into <链段>/_行业认知/动态/YYYY/（只按年分）；未知领域归 _其他行业。
+    // 文档名统一为 YYYYMMDD+标题，与 domi-repo.cjs 网关保持一致。
+    const segmentDirectory = segmentDirectoryForDomain(
+      Array.isArray(item.domains) ? item.domains[0] : ""
+    );
+    const root = path.join(this.libraryDir, segmentDirectory, "_行业认知", "动态");
     const published = new Date(item.publishedAt);
     if (!Number.isFinite(published.getTime())) throw new Error("行业信息发布时间无效。");
-    const year = String(published.getUTCFullYear()).padStart(4, "0");
-    const month = String(published.getUTCMonth() + 1).padStart(2, "0");
-    const filePath = path.join(root, year, month, `${safePathSegment(item.recordId, "event")}.md`);
-    assertWithin(root, filePath);
+    const year = String(published.getFullYear()).padStart(4, "0");
+    const baseName = newsDocumentBaseName(item.publishedAt, item.title, item.recordId);
+    const filePath = path.join(root, year, `${baseName}.md`);
+    assertWithin(this.libraryDir, filePath);
     return filePath;
   }
 
@@ -2745,17 +2965,9 @@ class LocalDomiRepository {
       : entityType === "person"
         ? changedFields.includes("name")
         : true;
-    const targetPath = sourcePath && !locationChanged ? sourcePath : canonicalTargetPath;
-    const root = path.join(
-      this.libraryDir,
-      entityType === "project"
-        ? PROJECTS_DIRECTORY
-        : entityType === "person"
-          ? PEOPLE_DIRECTORY
-          : NEWS_DIRECTORY
-    );
-    if (sourcePath) assertWithin(root, sourcePath);
-    assertWithin(root, targetPath);
+const targetPath = sourcePath && !locationChanged ? sourcePath : canonicalTargetPath;
+if (sourcePath) assertWithin(this.libraryDir, sourcePath);
+assertWithin(this.libraryDir, targetPath);
     if (sourcePath && sourcePath !== targetPath) {
       const sourceContainer = entityType === "news" ? sourcePath : path.dirname(sourcePath);
       const targetContainer = entityType === "news" ? targetPath : path.dirname(targetPath);
@@ -3089,7 +3301,7 @@ class LocalDomiRepository {
       domain === LEGACY_CONSUMER_TECH_DOMAIN
       && String(row.domain || "").trim() !== LEGACY_CONSUMER_TECH_DOMAIN
     ) {
-      throw new Error("“消费科技”仅用于兼容旧项目；新分类请选择“消费”。");
+      throw new Error("“消费科技”仅用于兼容旧项目；新分类请从产业链链段词表（01.能源与电力 … 11.终端与具身）中选择。");
     }
     const subdomains = stringList(request.subdomains);
     const status = normalizedProjectStatus(request.status);
@@ -3132,11 +3344,10 @@ class LocalDomiRepository {
       createdAt: row.created_at || null,
       lastUpdatedAt: now
     };
-    const targetDirectory = this.projectDirectory(project);
-    const currentDocumentPath = String(row.document_path || "").trim();
-    const currentDirectory = currentDocumentPath ? path.dirname(currentDocumentPath) : "";
-    const projectRoot = path.join(this.libraryDir, PROJECTS_DIRECTORY);
-    if (currentDirectory) assertWithin(projectRoot, currentDirectory);
+const targetDirectory = this.projectDirectory(project);
+const currentDocumentPath = String(row.document_path || "").trim();
+const currentDirectory = currentDocumentPath ? path.dirname(currentDocumentPath) : "";
+if (currentDirectory) assertWithin(this.libraryDir, currentDirectory);
     if (
       currentDirectory
       && targetDirectory !== currentDirectory
@@ -3317,11 +3528,10 @@ class LocalDomiRepository {
       lastContact,
       cities: stringList(request.cities)
     };
-    const targetDirectory = this.personDirectory(person);
-    const currentDocumentPath = String(row.document_path || "").trim();
-    const currentDirectory = currentDocumentPath ? path.dirname(currentDocumentPath) : "";
-    const peopleRoot = path.join(this.libraryDir, PEOPLE_DIRECTORY);
-    if (currentDirectory) assertWithin(peopleRoot, currentDirectory);
+const targetDirectory = this.personDirectory(person);
+const currentDocumentPath = String(row.document_path || "").trim();
+const currentDirectory = currentDocumentPath ? path.dirname(currentDocumentPath) : "";
+if (currentDirectory) assertWithin(this.libraryDir, currentDirectory);
     if (
       currentDirectory
       && targetDirectory !== currentDirectory
@@ -3429,9 +3639,11 @@ class LocalDomiRepository {
     const importance = Math.min(Math.max(Number(request.importance) || 0, 0), 10);
     const confidence = Math.min(Math.max(Number(request.confidence) || 0, 0), 10);
     const now = Date.now();
+    const articleType = row.article_type === "article" ? "article" : "event";
     const item = {
       recordId: id,
       title,
+      articleType,
       domains: stringList(request.domains),
       subdomains: stringList(request.subdomains),
       types: stringList(request.types),
@@ -3451,10 +3663,10 @@ class LocalDomiRepository {
     if (item.url && !/^https?:\/\//i.test(item.url)) {
       throw new Error("来源链接必须使用 HTTP 或 HTTPS。");
     }
-    const targetPath = this.newsDocumentPath(item);
     const currentPath = String(row.document_path || "").trim();
-    const newsRoot = path.join(this.libraryDir, NEWS_DIRECTORY);
-    if (currentPath) assertWithin(newsRoot, currentPath);
+    // 原文与摘要统一存放在同一份文档里；标题/日期/行业变更时整份文档一起移动。
+    const targetPath = this.newsDocumentPath(item);
+    if (currentPath) assertWithin(this.libraryDir, currentPath);
     if (currentPath && currentPath !== targetPath && fs.existsSync(targetPath)) {
       throw new Error("目标行业信息文档已存在。");
     }
@@ -3525,7 +3737,7 @@ class LocalDomiRepository {
       SELECT event_id, title, domains_json, subdomains_json, types_json,
         published_at, summary, investment_meaning, url, source, companies,
         institutions, importance, confidence, evidence_status, action,
-        worth_following, updated_at
+        worth_following, article_type, content_path, document_path, updated_at
       FROM news_events WHERE event_id = ?
     `).get(id));
   }

@@ -1,4 +1,22 @@
 const CODEX_FILE_CITATION_PREFIX = "domi-file-citation:";
+const DOMI_EVIDENCE_PREFIX = "domi-evidence:";
+
+export function domiEvidenceId(href?: string) {
+  const id = href?.startsWith(DOMI_EVIDENCE_PREFIX) ? href.slice(DOMI_EVIDENCE_PREFIX.length) : "";
+  return /^E[a-f0-9]{12}$/.test(id) ? id : "";
+}
+
+export function splitDomiEvidenceMarkers(value: string) {
+  const segments: Array<{ type: "text"; value: string } | { type: "evidence"; value: string }> = [];
+  let cursor = 0;
+  for (const match of value.matchAll(/:domi-cite\{\s*id="(E[a-f0-9]{12})"\s*\}/g)) {
+    if (match.index > cursor) segments.push({ type: "text", value: value.slice(cursor, match.index) });
+    segments.push({ type: "evidence", value: match[1] });
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < value.length) segments.push({ type: "text", value: value.slice(cursor) });
+  return segments;
+}
 
 export type CodexFileCitation = {
   path: string;
@@ -105,12 +123,14 @@ export function remarkCodexFileCitations() {
       if (node.type === "link" || node.type === "linkReference") return;
       if (!node.children) return;
       node.children = node.children.flatMap((child) => {
-        if (child.type !== "text" || !child.value?.includes(":codex-file-citation{")) {
+        if (child.type !== "text" || (!child.value?.includes(":codex-file-citation{") && !child.value?.includes(":domi-cite{"))) {
           visit(child);
           return [child];
         }
-        return splitCodexFileCitations(child.value).map((segment): MessageAstNode => {
-          if (segment.type === "text") return { type: "text", value: segment.value };
+        return splitCodexFileCitations(child.value).flatMap((segment): MessageAstNode | MessageAstNode[] => {
+          if (segment.type === "text") return splitDomiEvidenceMarkers(segment.value).map((part): MessageAstNode => part.type === "text"
+            ? { type: "text", value: part.value }
+            : { type: "link", url: `${DOMI_EVIDENCE_PREFIX}${part.value}`, children: [{ type: "text", value: "引用" }] });
           return {
             type: "link",
             url: codexFileCitationHref(segment.value.path),

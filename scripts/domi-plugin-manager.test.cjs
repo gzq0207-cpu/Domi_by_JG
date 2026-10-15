@@ -96,7 +96,7 @@ try {
   committedTransaction.finalize();
   assert.equal(recoveredManager.installedInfo().manifest.version, remoteInfo.manifest.version);
 } finally {
-  fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  fs.rmSync(temporaryRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
 }
 
 async function verifyBoundedRemoteStartup() {

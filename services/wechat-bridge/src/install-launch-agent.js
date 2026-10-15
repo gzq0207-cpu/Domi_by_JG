@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +8,8 @@ import { STATE_DIR, ensurePrivateDir, migrateLegacyState } from "./state.js";
 import { resolvedProxyEnvironment } from "./proxy-environment.js";
 
 const LABEL = "com.codex.wechat-bridge";
+const WINDOWS_RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const WINDOWS_RUN_VALUE = "DomiWeChatBridge";
 const currentFile = fileURLToPath(import.meta.url);
 const serviceRoot = path.resolve(path.dirname(currentFile), "..");
 const repositoryRoot = path.resolve(serviceRoot, "../..");
@@ -33,10 +35,52 @@ function environmentEntries(environment) {
     .join("\n");
 }
 
+function quotedWindowsCommand() {
+  // 注册表 Run 键的值是一个命令行字符串；路径带空格时必须加引号。
+  const segments = [process.execPath, entryPath].map((part) => {
+    const normalized = String(part);
+    return /\s/.test(normalized) ? `"${normalized}"` : normalized;
+  });
+  return segments.join(" ");
+}
+
+function installWindowsBackgroundService(environment) {
+  const logDirectory = path.join(STATE_DIR, "logs");
+  fs.mkdirSync(logDirectory, { recursive: true });
+  const command = [
+    quotedWindowsCommand(),
+    `>> "${path.join(logDirectory, "bridge.log")}"`,
+    `2>> "${path.join(logDirectory, "bridge-error.log")}"`,
+  ].join(" ");
+  execFileSync("reg", [
+    "add",
+    WINDOWS_RUN_KEY,
+    "/v",
+    WINDOWS_RUN_VALUE,
+    "/t",
+    "REG_SZ",
+    "/d",
+    command,
+    "/f",
+  ], { stdio: "inherit" });
+
+  // Run 键只在登录时生效；安装后立即以分离进程启动一次。
+  const child = spawn(process.execPath, [entryPath], {
+    cwd: repositoryRoot,
+    detached: true,
+    stdio: ["ignore", "ignore", "ignore"],
+    windowsHide: true,
+    env: { ...process.env, ...environment },
+  });
+  child.unref();
+
+  console.log(`微信桥接后台服务已安装：${WINDOWS_RUN_KEY} \\ ${WINDOWS_RUN_VALUE}`);
+  console.log(`运行状态目录：${STATE_DIR}`);
+  console.log("注意：Windows 不支持 launchd 的 KeepAlive；服务崩溃后需重新登录或手动启动。");
+}
+
 ensurePrivateDir();
 const migrated = migrateLegacyState();
-fs.mkdirSync(launchAgentsDirectory, { recursive: true });
-fs.mkdirSync(workspace, { recursive: true });
 
 const environment = {
   ...resolvedProxyEnvironment(process.env),
@@ -46,7 +90,15 @@ const environment = {
   CODEX_WECHAT_STATE_DIR: STATE_DIR,
 };
 
-const plist = `<?xml version="1.0" encoding="UTF-8"?>
+if (process.platform === "win32") {
+  fs.mkdirSync(workspace, { recursive: true });
+  installWindowsBackgroundService(environment);
+  if (migrated.length) console.log(`已迁移${migrated.length}项原运行状态，无需重新扫码。`);
+} else {
+  fs.mkdirSync(launchAgentsDirectory, { recursive: true });
+  fs.mkdirSync(workspace, { recursive: true });
+
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
   <dict>
@@ -77,21 +129,22 @@ ${environmentEntries(environment)}
 </plist>
 `;
 
-const backupPath = `${plistPath}.pre-domi`;
-if (fs.existsSync(plistPath) && !fs.existsSync(backupPath)) {
-  fs.copyFileSync(plistPath, backupPath);
-  fs.chmodSync(backupPath, 0o600);
-}
-try {
-  execFileSync("/bin/launchctl", ["bootout", `gui/${process.getuid()}`, plistPath], { stdio: "ignore" });
-} catch {
-  // A service that is not currently loaded needs no bootout.
-}
-fs.writeFileSync(plistPath, plist, { encoding: "utf8", mode: 0o600 });
-fs.chmodSync(plistPath, 0o600);
-execFileSync("/bin/launchctl", ["bootstrap", `gui/${process.getuid()}`, plistPath], { stdio: "inherit" });
-execFileSync("/bin/launchctl", ["kickstart", "-k", `gui/${process.getuid()}/${LABEL}`], { stdio: "inherit" });
+  const backupPath = `${plistPath}.pre-domi`;
+  if (fs.existsSync(plistPath) && !fs.existsSync(backupPath)) {
+    fs.copyFileSync(plistPath, backupPath);
+    fs.chmodSync(backupPath, 0o600);
+  }
+  try {
+    execFileSync("/bin/launchctl", ["bootout", `gui/${process.getuid()}`, plistPath], { stdio: "ignore" });
+  } catch {
+    // A service that is not currently loaded needs no bootout.
+  }
+  fs.writeFileSync(plistPath, plist, { encoding: "utf8", mode: 0o600 });
+  fs.chmodSync(plistPath, 0o600);
+  execFileSync("/bin/launchctl", ["bootstrap", `gui/${process.getuid()}`, plistPath], { stdio: "inherit" });
+  execFileSync("/bin/launchctl", ["kickstart", "-k", `gui/${process.getuid()}/${LABEL}`], { stdio: "inherit" });
 
-console.log(`微信桥接后台服务已安装：${plistPath}`);
-console.log(`运行状态目录：${STATE_DIR}`);
-if (migrated.length) console.log(`已迁移${migrated.length}项原运行状态，无需重新扫码。`);
+  console.log(`微信桥接后台服务已安装：${plistPath}`);
+  console.log(`运行状态目录：${STATE_DIR}`);
+  if (migrated.length) console.log(`已迁移${migrated.length}项原运行状态，无需重新扫码。`);
+}

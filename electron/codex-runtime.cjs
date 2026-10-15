@@ -8,19 +8,35 @@ const { promisify } = require("node:util");
 const execFileAsync = promisify(execFile);
 const RUNTIME_STATE_VERSION = 1;
 const RUNTIME_TARGETS = Object.freeze({
-  arm64: Object.freeze({
+  "darwin/arm64": Object.freeze({
     target: "aarch64-apple-darwin",
     assetName: "codex-package-aarch64-apple-darwin.tar.gz"
   }),
-  x64: Object.freeze({
+  "darwin/x64": Object.freeze({
     target: "x86_64-apple-darwin",
     assetName: "codex-package-x86_64-apple-darwin.tar.gz"
+  }),
+  "win32/x64": Object.freeze({
+    target: "x86_64-pc-windows-msvc",
+    assetName: "codex-package-x86_64-pc-windows-msvc.zip"
+  }),
+  "win32/arm64": Object.freeze({
+    target: "aarch64-pc-windows-msvc",
+    assetName: "codex-package-aarch64-pc-windows-msvc.zip"
   })
 });
 
-function expectedTargetForArch(arch = process.arch) {
+function runtimeBinaryNames(platform = process.platform) {
+  const suffix = platform === "win32" ? ".exe" : "";
+  return {
+    codex: `codex${suffix}`,
+    host: `codex-code-mode-host${suffix}`
+  };
+}
+
+function expectedTargetForArch(arch = process.arch, platform = process.platform) {
   const normalized = String(arch || "").trim();
-  const expected = RUNTIME_TARGETS[normalized];
+  const expected = RUNTIME_TARGETS[`${platform}/${normalized}`];
   if (!expected) {
     throw new Error(`domi 不支持当前 Codex Runtime 架构：${normalized || "unknown"}。`);
   }
@@ -47,9 +63,10 @@ function sha256File(filePath) {
 
 function validateManifest(manifest, {
   minimumSize = 50 * 1024 * 1024,
-  arch = process.arch
+  arch = process.arch,
+  platform = process.platform
 } = {}) {
-  const expected = expectedTargetForArch(arch);
+  const expected = expectedTargetForArch(arch, platform);
   if (
     manifest?.schemaVersion !== 1
     || !/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(String(manifest.version || ""))
@@ -94,7 +111,8 @@ function atomicSymlink(target, linkPath) {
   }
   const temporaryLink = `${linkPath}.domi-${process.pid}-${Date.now()}`;
   fs.rmSync(temporaryLink, { force: true });
-  fs.symlinkSync(target, temporaryLink);
+  // Windows 上目录符号链接需要管理员权限；junction 等价且无需特权。
+  fs.symlinkSync(target, temporaryLink, process.platform === "win32" ? "junction" : undefined);
   try {
     fs.renameSync(temporaryLink, linkPath);
   } catch (error) {
@@ -126,7 +144,8 @@ class CodexRuntimeManager {
     manifestPath,
     exec = execFileAsync,
     minimumArchiveSize = 50 * 1024 * 1024,
-    arch = process.arch
+    arch = process.arch,
+    platform = process.platform
   } = {}) {
     this.homeDir = homeDir;
     this.archivePath = archivePath;
@@ -134,7 +153,9 @@ class CodexRuntimeManager {
     this.exec = exec;
     this.minimumArchiveSize = minimumArchiveSize;
     this.arch = arch;
-    this.expectedRuntime = expectedTargetForArch(arch);
+    this.platform = platform;
+    this.binaryNames = runtimeBinaryNames(platform);
+    this.expectedRuntime = expectedTargetForArch(arch, platform);
   }
 
   packageRoot() {
@@ -154,6 +175,10 @@ class CodexRuntimeManager {
   }
 
   bundledManifest() {
+    if (this.platform === "win32") {
+      // Windows 开发/源码运行不使用 macOS 打包清单。
+      throw new Error("Windows 运行时从本地 npm 平台分包安装，无需内置清单。");
+    }
     return readManifest(this.manifestPath, {
       minimumSize: this.minimumArchiveSize,
       arch: this.arch
@@ -200,9 +225,9 @@ class CodexRuntimeManager {
 
   async snapshot() {
     const currentTarget = resolveLink(this.currentLink());
-    const binaryPath = currentTarget ? path.join(currentTarget, "bin", "codex") : "";
+    const binaryPath = currentTarget ? path.join(currentTarget, "bin", this.binaryNames.codex) : "";
     const hostPath = currentTarget
-      ? path.join(currentTarget, "bin", "codex-code-mode-host")
+      ? path.join(currentTarget, "bin", this.binaryNames.host)
       : "";
     const architectureMismatch = Boolean(
       currentTarget && !this.targetMatchesCurrentArch(currentTarget)
@@ -225,8 +250,8 @@ class CodexRuntimeManager {
       rollbackTarget
       && rollbackTarget !== currentTarget
       && this.targetMatchesCurrentArch(rollbackTarget)
-      && fs.existsSync(path.join(rollbackTarget, "bin", "codex"))
-      && fs.existsSync(path.join(rollbackTarget, "bin", "codex-code-mode-host"))
+      && fs.existsSync(path.join(rollbackTarget, "bin", this.binaryNames.codex))
+      && fs.existsSync(path.join(rollbackTarget, "bin", this.binaryNames.host))
     );
     let bundledVersion = "";
     try {
@@ -247,12 +272,15 @@ class CodexRuntimeManager {
       error: ok
         ? ""
         : architectureMismatch
-          ? `已安装的 Codex Runtime 架构与当前 Mac 不匹配，需要安装 ${this.arch} 版本。`
+          ? `已安装的 Codex Runtime 架构与当前设备不匹配，需要安装 ${this.arch} 版本。`
           : "尚未安装 domi 管理的 Codex Runtime。"
     };
   }
 
   async installBundled() {
+    if (this.platform === "win32") {
+      return this.installBundledFromWindowsPackage();
+    }
     const manifest = this.bundledManifest();
     const stat = fs.statSync(this.archivePath);
     if (stat.size !== manifest.size || sha256File(this.archivePath) !== manifest.sha256) {
@@ -353,13 +381,100 @@ class CodexRuntimeManager {
     };
   }
 
+  async installBundledFromWindowsPackage() {
+    // Windows：官方 codex-package 归档仅覆盖 macOS/Linux；开发与源码运行
+    // 直接复用 @openai/codex-sdk 平台分包（npm optionalDependencies）中
+    // 完整的 Codex 运行时。
+    const vendorTriple = this.arch === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc";
+    const vendorRoot = path.join(
+      __dirname, "..", "node_modules", `@openai/codex-win32-${this.arch}`, "vendor", vendorTriple
+    );
+    const sourceBinary = path.join(vendorRoot, "bin", this.binaryNames.codex);
+    if (!fs.existsSync(sourceBinary)) {
+      throw new Error("没有找到本地 @openai/codex 平台分包，请先在项目目录执行 npm install。");
+    }
+    const packageVersion = this.readWindowsVendorVersion(vendorRoot);
+
+    fs.mkdirSync(this.releasesRoot(), { recursive: true });
+    const releaseName = `${packageVersion}-${this.expectedRuntime.target}`;
+    const releasePath = path.join(this.releasesRoot(), releaseName);
+    const releaseBinary = path.join(releasePath, "bin", this.binaryNames.codex);
+    const releaseHost = path.join(releasePath, "bin", this.binaryNames.host);
+    const previousTarget = resolveLink(this.currentLink());
+    let previousVersion = "";
+    if (previousTarget && fs.existsSync(path.join(previousTarget, "bin", this.binaryNames.codex))) {
+      try {
+        previousVersion = await this.binaryVersion(path.join(previousTarget, "bin", this.binaryNames.codex));
+      } catch {
+        // Preserve the target even if the old binary cannot report its version.
+      }
+    }
+
+    let releaseUsable = false;
+    try {
+      fs.accessSync(releaseBinary, fs.constants.X_OK);
+      fs.accessSync(releaseHost, fs.constants.X_OK);
+      const reportedVersion = await this.binaryVersion(releaseBinary);
+      releaseUsable = reportedVersion.includes(packageVersion);
+    } catch {
+      // A partially copied release must be rebuilt from the npm package.
+    }
+    if (!releaseUsable) {
+      const stagingRoot = fs.mkdtempSync(path.join(this.releasesRoot(), ".domi-install-"));
+      try {
+        fs.cpSync(vendorRoot, stagingRoot, { recursive: true });
+        const stagedBinary = path.join(stagingRoot, "bin", this.binaryNames.codex);
+        const stagedHost = path.join(stagingRoot, "bin", this.binaryNames.host);
+        if (!fs.existsSync(stagedHost)) {
+          throw new Error("本地 Codex 平台分包缺少命令宿主，请重新执行 npm install。");
+        }
+        const reportedVersion = await this.binaryVersion(stagedBinary);
+        if (!reportedVersion.includes(packageVersion)) {
+          throw new Error("内置 Codex Runtime 版本校验失败。");
+        }
+        fs.rmSync(releasePath, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+        fs.renameSync(stagingRoot, releasePath);
+      } finally {
+        try {
+          fs.rmSync(stagingRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+        } catch {
+          // Best effort cleanup; the staging root lives inside the releases root.
+        }
+      }
+    }
+
+    const version = await this.binaryVersion(releaseBinary);
+    atomicSymlink(releasePath, this.currentLink());
+    this.writeState({
+      bundledVersion: packageVersion,
+      currentTarget: releasePath,
+      currentVersion: version,
+      previousTarget: previousTarget && previousTarget !== releasePath ? previousTarget : "",
+      previousVersion: previousTarget && previousTarget !== releasePath ? previousVersion : "",
+      installedAt: new Date().toISOString()
+    });
+    return { ok: true, path: releaseBinary, version, installedNow: true };
+  }
+
+  readWindowsVendorVersion(vendorRoot) {
+    try {
+      const manifest = JSON.parse(fs.readFileSync(path.join(vendorRoot, "codex-package.json"), "utf8"));
+      const version = String(manifest?.version || "").trim();
+      if (/^\d+\.\d+\.\d+/.test(version)) return version.split("-")[0];
+    } catch {
+      // Fall through to the surrounding package directory name below.
+    }
+    const match = path.basename(path.dirname(vendorRoot)).match(/(\d+\.\d+\.\d+)/);
+    return match ? match[1] : "0.0.0";
+  }
+
   restoreCaptured(previous) {
     const target = String(previous?.target || "");
     if (
       !target
       || !this.targetMatchesCurrentArch(target)
-      || !fs.existsSync(path.join(target, "bin", "codex"))
-      || !fs.existsSync(path.join(target, "bin", "codex-code-mode-host"))
+      || !fs.existsSync(path.join(target, "bin", this.binaryNames.codex))
+      || !fs.existsSync(path.join(target, "bin", this.binaryNames.host))
     ) return false;
     atomicSymlink(target, this.currentLink());
     return true;
@@ -368,15 +483,15 @@ class CodexRuntimeManager {
   async recordExternalUpdate(previous) {
     const currentTarget = resolveLink(this.currentLink());
     if (!currentTarget) throw new Error("Codex 更新完成，但没有找到新的运行时。");
-    const binaryPath = path.join(currentTarget, "bin", "codex");
-    const hostPath = path.join(currentTarget, "bin", "codex-code-mode-host");
+    const binaryPath = path.join(currentTarget, "bin", this.binaryNames.codex);
+    const hostPath = path.join(currentTarget, "bin", this.binaryNames.host);
     fs.accessSync(hostPath, fs.constants.X_OK);
     const version = await this.binaryVersion(binaryPath);
     const previousTarget = String(previous?.target || "");
     let previousVersion = "";
-    if (previousTarget && fs.existsSync(path.join(previousTarget, "bin", "codex"))) {
+    if (previousTarget && fs.existsSync(path.join(previousTarget, "bin", this.binaryNames.codex))) {
       try {
-        previousVersion = await this.binaryVersion(path.join(previousTarget, "bin", "codex"));
+        previousVersion = await this.binaryVersion(path.join(previousTarget, "bin", this.binaryNames.codex));
       } catch {
         // The path is still retained for manual rollback diagnostics.
       }
@@ -394,8 +509,8 @@ class CodexRuntimeManager {
   async rollback() {
     const state = this.readState();
     const previousTarget = String(state.previousTarget || "");
-    const previousBinary = path.join(previousTarget, "bin", "codex");
-    const previousHost = path.join(previousTarget, "bin", "codex-code-mode-host");
+    const previousBinary = path.join(previousTarget, "bin", this.binaryNames.codex);
+    const previousHost = path.join(previousTarget, "bin", this.binaryNames.host);
     if (
       !previousTarget
       || !this.targetMatchesCurrentArch(previousTarget)
@@ -405,8 +520,8 @@ class CodexRuntimeManager {
       throw new Error("没有可恢复的 Codex Runtime 版本。");
     }
     const currentTarget = resolveLink(this.currentLink());
-    const currentVersion = currentTarget && fs.existsSync(path.join(currentTarget, "bin", "codex"))
-      ? await this.binaryVersion(path.join(currentTarget, "bin", "codex")).catch(() => "")
+    const currentVersion = currentTarget && fs.existsSync(path.join(currentTarget, "bin", this.binaryNames.codex))
+      ? await this.binaryVersion(path.join(currentTarget, "bin", this.binaryNames.codex)).catch(() => "")
       : "";
     const version = await this.binaryVersion(previousBinary);
     atomicSymlink(previousTarget, this.currentLink());
@@ -431,6 +546,7 @@ module.exports = {
   expectedTargetForArch,
   readManifest,
   resolveLink,
+  runtimeBinaryNames,
   sha256File,
   validateManifest
 };

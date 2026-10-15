@@ -46,14 +46,44 @@ function normalizeRelayBaseUrl(value) {
 }
 
 function normalizeRelayModel(value) {
-  const model = String(value || "").trim();
-  if (!model || model.length > 120 || !/^[A-Za-z0-9._:/-]+$/.test(model)) {
-    throw new Error("请输入中转站实际支持的模型名称。");
-  }
-  return model;
+const model = String(value || "").trim();
+if (!model || model.length > 120 || !/^[A-Za-z0-9._:/-]+$/.test(model)) {
+throw new Error("请输入中转站实际支持的模型名称。");
+}
+return model;
 }
 
-function keychainAuthConfig() {
+// Codex speaks two provider wire protocols: the OpenAI Responses API (full
+// capability: reasoning summaries, tool orchestration) and the ubiquitous
+// OpenAI-compatible Chat Completions API (offered by DeepSeek, Kimi, Qwen,
+// GLM, OneAPI-style aggregators and most self-hosted gateways). Which one a
+// relay supports depends on the upstream, so the user picks it explicitly.
+function normalizeRelayWireApi(value) {
+const wireApi = String(value || "").trim().toLowerCase();
+return wireApi === "chat" ? "chat" : "responses";
+}
+
+function relayProviderName(wireApi) {
+return normalizeRelayWireApi(wireApi) === "chat"
+? "domi Chat Completions 中转站"
+: "domi Responses 中转站";
+}
+
+function relayCredentialPath(homeDir = os.homedir()) {
+  return path.join(homeDir, ".codex", "domi-relay-credential");
+}
+
+function keychainAuthConfig(homeDir = os.homedir()) {
+  if (process.platform === "win32") {
+    // Windows 没有 macOS 钥匙串；Codex 通过 auth.command 读取凭据。
+    // 凭据保存在用户目录下的独立文件（受用户级 ACL 保护），
+    // 用 cmd.exe type 读取，避免 PowerShell 的启动开销。
+    return {
+      command: "cmd.exe",
+      args: ["/d", "/c", "type", relayCredentialPath(homeDir)],
+      timeout_ms: 5000
+    };
+  }
   return {
     command: "/usr/bin/security",
     args: [
@@ -180,23 +210,23 @@ function createElectronNetFetcher(netModule, {
   });
 }
 
-function mergeRelayConfig(source, { baseUrl, model }) {
-  const config = source && typeof source === "object" ? structuredClone(source) : {};
-  config.model = normalizeRelayModel(model);
-  config.model_provider = DOMI_PROVIDER_ID;
-  config.model_providers = config.model_providers && typeof config.model_providers === "object"
-    ? config.model_providers
-    : {};
-  config.model_providers[DOMI_PROVIDER_ID] = {
-    name: "domi Responses 中转站",
-    base_url: normalizeRelayBaseUrl(baseUrl),
-    wire_api: "responses",
-    request_max_retries: 4,
-    stream_max_retries: 5,
-    stream_idle_timeout_ms: 300000,
-    auth: keychainAuthConfig()
-  };
-  return config;
+function mergeRelayConfig(source, { baseUrl, model, wireApi, homeDir } = {}) {
+const config = source && typeof source === "object" ? structuredClone(source) : {};
+config.model = normalizeRelayModel(model);
+config.model_provider = DOMI_PROVIDER_ID;
+config.model_providers = config.model_providers && typeof config.model_providers === "object"
+? config.model_providers
+: {};
+config.model_providers[DOMI_PROVIDER_ID] = {
+name: relayProviderName(wireApi),
+base_url: normalizeRelayBaseUrl(baseUrl),
+wire_api: normalizeRelayWireApi(wireApi),
+request_max_retries: 4,
+stream_max_retries: 5,
+stream_idle_timeout_ms: 300000,
+auth: keychainAuthConfig(homeDir)
+};
+return config;
 }
 
 async function fetchOfficialInstaller(fetcher = fetch) {
@@ -247,6 +277,17 @@ async function writeCredentialToKeychain(credential, {
   signal,
   timeoutMs = 15_000
 } = {}) {
+  if (process.platform === "win32") {
+    // Windows：写入用户目录下的凭据文件（原子写入，无尾随换行，
+    // 与 keychainAuthConfig 的 cmd.exe type 读取路径对应）。
+    throwIfBootstrapAborted(signal);
+    const credentialPath = relayCredentialPath();
+    fs.mkdirSync(path.dirname(credentialPath), { recursive: true });
+    const temporaryPath = `${credentialPath}.tmp-${process.pid}`;
+    fs.writeFileSync(temporaryPath, credential, { mode: 0o600 });
+    fs.renameSync(temporaryPath, credentialPath);
+    return;
+  }
   try {
     await runCodexWithPrompt("/usr/bin/security", [
       "add-generic-password",
@@ -403,6 +444,7 @@ class CodexBootstrapService {
     runtimeManager = null,
     installerEnvironment = async () => ({}),
     writeCredential = writeCredentialToKeychain,
+    installLocalWindows = null,
     runCodex = runCodexWithPrompt,
     sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
   } = {}) {
@@ -414,6 +456,7 @@ class CodexBootstrapService {
     this.runtimeManager = runtimeManager;
     this.installerEnvironment = installerEnvironment;
     this.writeCredential = writeCredential;
+    this.installLocalWindows = installLocalWindows || this.installFromLocalWindowsPackage.bind(this);
     this.runCodex = runCodex;
     this.sleep = sleep;
   }
@@ -519,6 +562,40 @@ class CodexBootstrapService {
 
   async installOnline({ update = false } = {}) {
     const previous = update ? this.runtimeManager?.captureCurrent?.() : null;
+    if (process.platform === "win32") {
+      // 官方 install.sh 是 Unix 脚本，无法在 Windows 执行。
+      // 改为从本地 @openai/codex-sdk 平台分包（npm optionalDependencies）
+      // 安装完整的 Codex 运行时。
+      try {
+        const installed = await this.installLocalWindows();
+        await this.sleep(100);
+        const status = await this.status(installed.path);
+        if (!status.ok) {
+          throw new Error(status.error || "Codex 已执行安装，但没有找到可执行文件。");
+        }
+        if (update && this.runtimeManager) {
+          const runtime = await this.runtimeManager.recordExternalUpdate(previous);
+          return {
+            ...status,
+            ...runtime,
+            runtime,
+            installedNow: true,
+            source: "official-update"
+          };
+        }
+        return { ...status, installedNow: true, source: "official" };
+      } catch (error) {
+        return {
+          ok: false,
+          installed: false,
+          installedNow: false,
+          path: "",
+          version: "",
+          credentialStored: false,
+          error: userFacingError(error)
+        };
+      }
+    }
     const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "domi-codex-install-"));
     const installerPath = path.join(temporaryDirectory, "install.sh");
     try {
@@ -572,6 +649,35 @@ class CodexBootstrapService {
     return this.installOnline({ update: true });
   }
 
+  async installFromLocalWindowsPackage() {
+    if (process.platform !== "win32") {
+      throw new Error("installFromLocalWindowsPackage 仅支持 Windows。");
+    }
+    const vendorTriple = process.arch === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc";
+    const vendorRoot = path.join(__dirname, "..", "node_modules", `@openai/codex-win32-${process.arch}`, "vendor", vendorTriple);
+    if (!fs.existsSync(path.join(vendorRoot, "bin", "codex.exe"))) {
+      throw new Error("没有找到本地 @openai/codex 平台分包，请先在项目目录执行 npm install。");
+    }
+    const targetBin = path.join(this.homeDir, ".local", "bin");
+    fs.mkdirSync(targetBin, { recursive: true });
+    const entries = [
+      ["bin", "codex.exe"],
+      ["bin", "codex-code-mode-host.exe"],
+      ["codex-path", "rg.exe"]
+    ];
+    for (const [directory, fileName] of entries) {
+      const sourcePath = path.join(vendorRoot, directory, fileName);
+      if (fs.existsSync(sourcePath)) {
+        fs.copyFileSync(sourcePath, path.join(targetBin, fileName));
+      }
+    }
+    const resourcesRoot = path.join(vendorRoot, "codex-resources");
+    if (fs.existsSync(resourcesRoot)) {
+      fs.cpSync(resourcesRoot, path.join(targetBin, "codex-resources"), { recursive: true });
+    }
+    return { path: path.join(targetBin, "codex.exe") };
+  }
+
   async runtimeStatus() {
     if (!this.runtimeManager) {
       const status = await this.status();
@@ -614,7 +720,7 @@ class CodexBootstrapService {
     return parse(content);
   }
 
-  writeRelayConfig({ baseUrl, model }) {
+  writeRelayConfig({ baseUrl, model, wireApi }) {
     const targetPath = this.configPath();
     const directory = path.dirname(targetPath);
     const existing = this.readConfig();
@@ -628,7 +734,7 @@ class CodexBootstrapService {
         modelProvider: existing.model_provider
       }, null, 2)}\n`, { mode: 0o600 });
     }
-    const merged = mergeRelayConfig(existing, { baseUrl, model });
+    const merged = mergeRelayConfig(existing, { baseUrl, model, wireApi, homeDir: this.homeDir });
     const nextContent = `${stringify(merged).trim()}\n`;
     const temporaryPath = `${targetPath}.domi-tmp`;
 
@@ -645,6 +751,7 @@ class CodexBootstrapService {
       path: targetPath,
       baseUrl: normalizeRelayBaseUrl(baseUrl),
       model: normalizeRelayModel(model),
+      wireApi: normalizeRelayWireApi(wireApi),
       providerId: DOMI_PROVIDER_ID
     };
   }
@@ -706,6 +813,10 @@ class CodexBootstrapService {
     signal,
     timeoutMs = 10_000
   } = {}) {
+    if (process.platform === "win32") {
+      throwIfBootstrapAborted(signal);
+      return fs.existsSync(relayCredentialPath(this.homeDir));
+    }
     try {
       throwIfBootstrapAborted(signal);
       await this.exec("/usr/bin/security", [
@@ -727,7 +838,7 @@ class CodexBootstrapService {
     }
   }
 
-  async configureRelay({ baseUrl, model, apiKey, keepExistingKey = false, codexPath = "" }, {
+  async configureRelay({ baseUrl, model, wireApi, apiKey, keepExistingKey = false, codexPath = "" }, {
     signal,
     timeoutMs = 90_000
   } = {}) {
@@ -743,6 +854,7 @@ class CodexBootstrapService {
       }
       const normalizedBaseUrl = normalizeRelayBaseUrl(baseUrl);
       const normalizedModel = normalizeRelayModel(model);
+      const normalizedWireApi = normalizeRelayWireApi(wireApi);
       const hasExistingKey = Boolean(installed.credentialStored);
       if (!keepExistingKey || !hasExistingKey) {
         await this.saveRelayCredential(apiKey, {
@@ -753,7 +865,8 @@ class CodexBootstrapService {
       throwIfBootstrapAborted(signal);
       const config = this.writeRelayConfig({
         baseUrl: normalizedBaseUrl,
-        model: normalizedModel
+        model: normalizedModel,
+        wireApi: normalizedWireApi
       });
       return {
         ok: true,
@@ -864,6 +977,7 @@ module.exports = {
   mergeRelayConfig,
   normalizeRelayBaseUrl,
   normalizeRelayModel,
+  relayCredentialPath,
   runCodexWithPrompt,
   userFacingError
 };

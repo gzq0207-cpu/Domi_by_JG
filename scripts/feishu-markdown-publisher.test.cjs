@@ -157,8 +157,11 @@ test("single Markdown publishing preserves local assets, writes a manifest, and 
   assert.equal(manifest.source.snapshot, undefined);
   assert.equal(fs.existsSync(path.join(fixture.root, ".domi")), false);
   assert.equal(fs.existsSync(path.join(fixture.root, "renderer-chosen-manifest.json")), false);
-  assert.equal(fs.statSync(fixture.stateRoot).mode & 0o777, 0o700);
-  assert.equal(fs.statSync(manifestPath).mode & 0o777, 0o600);
+  if (process.platform !== "win32") {
+    // Windows/NTFS 不提供 POSIX 权限位（statSync 恒为 0o666）。
+    assert.equal(fs.statSync(fixture.stateRoot).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(manifestPath).mode & 0o777, 0o600);
+  }
   assert.equal(fs.readFileSync(manifestPath, "utf8").includes(fixture.content), false);
 
   const writeCount = lark.calls.filter((args) => ["+create", "+update", "+media-insert"].includes(args[1])).length;
@@ -254,7 +257,7 @@ test("source and image paths cannot escape the library through intermediate syml
   t.after(() => fs.rmSync(external, { recursive: true, force: true }));
   const externalSource = path.join(external, "outside.md");
   fs.writeFileSync(externalSource, "# 外部文档\n");
-  fs.symlinkSync(external, path.join(fixture.root, "linked"));
+  fs.symlinkSync(external, path.join(fixture.root, "linked"), process.platform === "win32" ? "junction" : undefined);
   const lark = mockLark();
   const publisher = new FeishuMarkdownPublisher({ runLark: lark.runLark });
   await assert.rejects(
@@ -268,7 +271,7 @@ test("source and image paths cannot escape the library through intermediate syml
   assert.equal(lark.calls.length, 0);
 
   fs.unlinkSync(path.join(fixture.root, "linked"));
-  fs.symlinkSync(external, path.join(fixture.root, "assets-linked"));
+  fs.symlinkSync(external, path.join(fixture.root, "assets-linked"), process.platform === "win32" ? "junction" : undefined);
   fs.writeFileSync(path.join(external, "external.png"), "external-image");
   fs.writeFileSync(fixture.sourcePath, "# 报告\n\n![外部图片](./assets-linked/external.png)\n");
   const blocked = await publisher.publish({
@@ -286,7 +289,7 @@ test("a symlinked private state root cannot redirect audit files outside Applica
   const fixture = makeFixture(t);
   const external = fs.mkdtempSync(path.join(os.tmpdir(), "domi-feishu-manifest-external-"));
   t.after(() => fs.rmSync(external, { recursive: true, force: true }));
-  fs.symlinkSync(external, fixture.stateRoot);
+  fs.symlinkSync(external, fixture.stateRoot, process.platform === "win32" ? "junction" : undefined);
   const lark = mockLark();
   const publisher = new FeishuMarkdownPublisher({ runLark: lark.runLark });
   await assert.rejects(

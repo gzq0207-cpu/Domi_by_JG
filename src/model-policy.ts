@@ -1,8 +1,14 @@
 export const DOMI_ECONOMY_MODEL_ID = "gpt-5.6-terra";
 export const DOMI_PREMIUM_MODEL_ID = "gpt-5.6-sol";
+export const DOMI_TRANSLATION_MODEL_ID = "gpt-6-luna";
+export const DOMI_DEFAULT_AGENT_PREFERENCES = Object.freeze({
+  model: "gpt-6.1-sol",
+  reasoningEffort: "high",
+  serviceTier: "standard"
+});
 
-export type DomiModelPolicyClass = "economy" | "premium" | "inherit";
-export type DomiModelPolicyRunKind = "podcast-archive";
+export type DomiModelPolicyClass = "economy" | "premium" | "summary" | "translation" | "inherit";
+export type DomiModelPolicyRunKind = "podcast-archive" | "intake" | "summary" | "translation";
 
 export type DomiModelCapability = {
   id: string;
@@ -263,8 +269,19 @@ export function domiModelPolicyClass(
     "useDomiPlugin" | "requestText" | "domiSlidesDeliveryPolicy"
   > = {}
 ): DomiModelPolicyClass {
-  if (runKind === "podcast-archive") return "premium";
+  if (runKind === "translation" || String(workflowId || "").trim() === "translation") return "translation";
+  if (["intake", "podcast-archive", "summary"].includes(runKind || "")) return "summary";
   const normalizedWorkflowId = String(workflowId || "").trim();
+  if (semanticRequest.useDomiPlugin && (!normalizedWorkflowId || normalizedWorkflowId === "domi-router")
+    && isDomiTranslationNaturalLanguageTask(semanticRequest.requestText || "")) return "translation";
+  if (
+    semanticRequest.useDomiPlugin
+    && (!normalizedWorkflowId || normalizedWorkflowId === "domi-router")
+    && isDomiSummaryNaturalLanguageTask(
+      semanticRequest.requestText || "",
+      semanticRequest.domiSlidesDeliveryPolicy || ""
+    )
+  ) return "summary";
   if (ECONOMY_WORKFLOW_IDS.has(normalizedWorkflowId)) return "economy";
   if (PREMIUM_WORKFLOW_IDS.has(normalizedWorkflowId)) return "premium";
   if (normalizedWorkflowId) return "inherit";
@@ -280,6 +297,32 @@ export function domiModelPolicyClass(
   return "inherit";
 }
 
+export function isDomiTranslationNaturalLanguageTask(requestText: string) {
+  const request = String(requestText || "").trim();
+  if (!/(?:翻译|译成|译为|中文译文|英译中|\btranslate\b|\btranslation\b)/i.test(request)) return false;
+  if (/(?:不要|不用|无需|不需要|别).{0,5}(?:翻译|译成|译为)/.test(request)) return false;
+  if (TECHNICAL_DIAGNOSTIC_FAILURE_PATTERN.test(request)) return false;
+  // Translating a research report is mechanical work; conducting research or
+  // producing a new summary as well still uses that deliverable's policy.
+  return !/(?:摘要|总结|概括|提炼|评分|评级|估值|盈利预测|投资建议|(?:进行|开展|重新|深入|深度|系统性)(?:研究|分析|调研)|(?:并|再|然后).{0,8}(?:分析|研究|评估))/i.test(request);
+}
+
+export function isDomiSummaryNaturalLanguageTask(requestText: string, domiSlidesDeliveryPolicy = "") {
+  const request = String(requestText || "").trim();
+  if (!/(?:摘要|总结|概括|梗概|提炼.{0,12}(?:观点|要点|重点|内容)|(?:整理|生成|撰写|写).{0,12}(?:日报|简报)|\bsummar(?:y|ies|ize|ise)\b)/i.test(request)) {
+    return false;
+  }
+  // Detailed research, investment decisions and meeting records retain their
+  // own delivery policy even when the request also asks for an abstract.
+  if (isDomiPremiumNaturalLanguageTask(request, domiSlidesDeliveryPolicy)) return false;
+  if (
+    TECHNICAL_DIAGNOSTIC_FAILURE_PATTERN.test(request)
+    || ORDINARY_FILE_EDIT_PATTERN.test(request)
+    || MECHANICAL_DELIVERABLE_EDIT_PATTERN.test(request)
+  ) return false;
+  return true;
+}
+
 function requiredModel(
   models: readonly DomiModelCapability[] | undefined,
   modelId: string,
@@ -287,7 +330,7 @@ function requiredModel(
 ) {
   if (!Array.isArray(models) || models.length === 0) {
     throw new Error(
-      `无法启动 ${policyClass === "economy" ? "高性价比" : "高质量交付"}工作流：Codex model/list 未返回可用模型，domi 不会静默改用其他模型。请检查 Codex 连接后重试。`
+      `无法启动 ${policyClass === "translation" ? "中文翻译" : policyClass === "economy" ? "高性价比" : "高质量交付"}工作流：Codex model/list 未返回可用模型，domi 不会静默改用其他模型。请检查 Codex 连接后重试。`
     );
   }
   const model = models.find((item) => item.id === modelId);
@@ -319,8 +362,10 @@ function assertUserServiceTier(model: DomiModelCapability, serviceTier: string) 
 /**
  * Resolve the one authoritative model policy for every renderer submission.
  *
+ * Translation uses Luna/medium/standard, independently of summary generation.
  * Cost-sensitive background maintenance stays on Terra/medium/standard.
- * Externally deliverable work stays on Sol/max while preserving the user's
+ * Summaries and content intake use GPT-6.1 Sol/high/standard. Research and detailed
+ * externally deliverable work stays on Sol/max while preserving the user's
  * speed tier. With no explicit workflow, enabled domi requests use the same
  * premium policy when their natural-language task semantics require it.
  * Unclassified work keeps all user selections unchanged.
@@ -338,14 +383,15 @@ export function resolveDomiModelPolicy(
     return { policyClass, ...userSelection };
   }
 
-  const modelId = policyClass === "economy"
+  const modelId = policyClass === "translation" ? DOMI_TRANSLATION_MODEL_ID : policyClass === "economy"
     ? DOMI_ECONOMY_MODEL_ID
-    : DOMI_PREMIUM_MODEL_ID;
-  const requiredEffort = policyClass === "economy" ? "medium" : "max";
+    : policyClass === "summary" ? DOMI_DEFAULT_AGENT_PREFERENCES.model : DOMI_PREMIUM_MODEL_ID;
+  const requiredEffort = ["economy", "translation"].includes(policyClass) ? "medium"
+    : policyClass === "summary" ? DOMI_DEFAULT_AGENT_PREFERENCES.reasoningEffort : "max";
   const model = requiredModel(request.models, modelId, policyClass);
   assertReasoningEffort(model, requiredEffort);
 
-  const resolvedServiceTier = policyClass === "economy"
+  const resolvedServiceTier = policyClass !== "premium"
     ? "standard"
     : userSelection.serviceTier;
   if (policyClass === "premium") {

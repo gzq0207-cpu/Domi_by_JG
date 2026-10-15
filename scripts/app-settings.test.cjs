@@ -11,10 +11,10 @@ const {
 } = require("../electron/app-settings.cjs");
 
 test("radar followed domains are ordered, deduplicated and may pause all collection", () => {
-  assert.deepEqual(normalizeRadarFollowedDomains(["生物医药", "AI", "AI", "未知"]), ["AI", "生物医药"]);
+  assert.deepEqual(normalizeRadarFollowedDomains(["生物医药", "AI", "AI", "未知"]), ["模型层"]);
   assert.deepEqual(normalizeRadarFollowedDomains([]), []);
   assert.deepEqual(normalizeRadarFollowedDomains(undefined), [
-    "AI", "半导体", "智能出行", "前沿科技", "具身智能&机器人"
+    "算力芯片", "数据中心基础设施", "模型层", "Agent与平台", "应用"
   ]);
 });
 
@@ -205,7 +205,10 @@ test("domi connection settings persist outside the app bundle and survive app up
     assert.equal(diskConfig.localLibraryDir, localConfig.localLibraryDir);
     assert.equal(diskConfig.oneDriveProjectDir, localConfig.localLibraryDir);
     assert.equal(diskConfig.plaudBrowser, "tabbit");
-    assert.equal(fs.statSync(configPath).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      // Windows/NTFS 不提供 POSIX 权限位（statSync 恒为 0o666）。
+      assert.equal(fs.statSync(configPath).mode & 0o777, 0o600);
+    }
 
     const migrated = createService(root).load();
     assert.equal(migrated.settings.peopleTableId, localConfig.peopleTableId);
@@ -232,7 +235,7 @@ test("legacy OneDrive settings migrate to the generic local library directory", 
     }).load();
     assert.equal(migrated.settings.version, 9);
     assert.deepEqual(migrated.settings.radarFollowedDomains, [
-      "AI", "半导体", "智能出行", "前沿科技", "具身智能&机器人"
+      "数据中心基础设施", "算力芯片", "模型层", "Agent与平台", "应用"
     ]);
     assert.equal(migrated.settings.localLibraryDir, "~/Library/CloudStorage/Legacy/Projects");
   } finally {
@@ -264,6 +267,75 @@ test("legacy API provider settings migrate to ChatGPT and never affect the Codex
   }
 });
 
+test("agent-cli mode runs claude/workbuddy local clients with subscription quota", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-settings-cli-"));
+  try {
+    const service = createService(root);
+    const saved = service.save({
+      agentProvider: "claude",
+      authMode: "agent-cli",
+      claudeCliPath: "C:/Tools/claude.exe",
+      claudeModel: "claude-sonnet-4-5",
+      apiBaseUrl: "https://ignored.example.com/v1"
+    });
+    assert.equal(saved.settings.agentProvider, "claude");
+    assert.equal(saved.settings.authMode, "agent-cli");
+    assert.equal(saved.settings.claudeCliPath, "C:/Tools/claude.exe");
+    assert.equal(saved.settings.claudeModel, "claude-sonnet-4-5");
+    assert.equal(saved.settings.apiBaseUrl, "");
+    const runtime = service.runtime();
+    assert.equal(runtime.providerLabel, "Claude 本地客户端");
+    assert.equal(runtime.defaultModel, "claude-sonnet-4-5");
+
+    // codex 引擎不允许挂 agent-cli；归一化回 chatgpt。
+    const codex = service.save({ agentProvider: "codex", authMode: "agent-cli" });
+    assert.equal(codex.settings.authMode, "chatgpt");
+    // workbuddy 挂 agent-cli 合法。
+    const workbuddy = service.save({ agentProvider: "workbuddy", authMode: "agent-cli" });
+    assert.equal(workbuddy.settings.authMode, "agent-cli");
+    assert.equal(service.runtime().providerLabel, "WorkBuddy 本地客户端");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("agent provider selection persists with relay auth and labels the runtime", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-settings-agent-"));
+  try {
+    const service = createService(root);
+    const claude = service.save({
+      authMode: "relay",
+      agentProvider: "claude",
+      apiBaseUrl: "https://api.anthropic.com/v1/",
+      apiModel: "claude-sonnet-4-5",
+      apiWireApi: "chat",
+      relayCredentialConfigured: true
+    });
+    assert.equal(claude.settings.agentProvider, "claude");
+    assert.equal(claude.settings.authMode, "relay");
+    assert.equal(service.runtime().providerLabel, "Claude API（OpenAI 兼容）");
+
+    const workbuddy = service.save({
+      authMode: "relay",
+      agentProvider: "workbuddy",
+      apiBaseUrl: "https://workbuddy.example.com/v1",
+      apiModel: "workbuddy-model",
+      apiWireApi: "chat"
+    });
+    assert.equal(workbuddy.settings.agentProvider, "workbuddy");
+    assert.equal(service.runtime().providerLabel, "WorkBuddy API（OpenAI 兼容）");
+
+    // ChatGPT 登录与未知引擎都归一化回 Codex。
+    const chatgpt = service.save({ authMode: "chatgpt", agentProvider: "claude" });
+    assert.equal(chatgpt.settings.agentProvider, "codex");
+    assert.equal(service.runtime().providerLabel, "个人 ChatGPT");
+    const unknown = service.save({ authMode: "relay", agentProvider: "someone-else" });
+    assert.equal(unknown.settings.agentProvider, "codex");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Responses relay settings persist without placing a credential in app settings", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-settings-"));
   try {
@@ -272,11 +344,13 @@ test("Responses relay settings persist without placing a credential in app setti
       authMode: "relay",
       apiBaseUrl: "https://relay.example.com/v1",
       apiModel: "relay-model",
+      apiWireApi: "responses",
       relayCredentialConfigured: true
     });
     assert.equal(saved.settings.authMode, "relay");
     assert.equal(saved.settings.apiBaseUrl, "https://relay.example.com/v1");
     assert.equal(saved.settings.apiModel, "relay-model");
+    assert.equal(saved.settings.apiWireApi, "responses");
     assert.equal(saved.settings.relayCredentialConfigured, true);
     assert.equal(saved.hasApiKey, true);
 
@@ -284,8 +358,37 @@ test("Responses relay settings persist without placing a credential in app setti
     assert.equal(runtime.authMode, "relay");
     assert.equal(runtime.defaultModel, "relay-model");
     assert.equal(runtime.providerLabel, "Responses 中转站");
+    assert.equal(runtime.apiWireApi, "responses");
     assert.equal(runtime.hasApiKey, true);
     assert.deepEqual(runtime.env.DOMI_PROVIDER_API_KEY, undefined);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("chat completions relay settings persist and invalid values fall back to responses", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-settings-"));
+  try {
+    const service = createService(root);
+    const saved = service.save({
+      authMode: "relay",
+      apiBaseUrl: "https://api.deepseek.com/v1",
+      apiModel: "deepseek-chat",
+      apiWireApi: "chat",
+      relayCredentialConfigured: true
+    });
+    assert.equal(saved.settings.apiWireApi, "chat");
+
+    const runtime = service.runtime();
+    assert.equal(runtime.providerLabel, "Chat Completions 中转站");
+    assert.equal(runtime.apiWireApi, "chat");
+
+    const invalid = service.save({ apiWireApi: "grpc" });
+    assert.equal(invalid.settings.apiWireApi, "responses");
+
+    const chatgpt = service.save({ authMode: "chatgpt" });
+    assert.equal(chatgpt.settings.apiWireApi, "responses");
+    assert.equal(service.runtime().providerLabel, "个人 ChatGPT");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -377,7 +480,10 @@ test("task document and Outlook account hints stay in the private local config",
       diskConfig.outlookCalendarRecipients,
       "张三 <zhangsan@example.com>, lisi@example.com"
     );
-    assert.equal(fs.statSync(configPath).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      // Windows/NTFS 不提供 POSIX 权限位（statSync 恒为 0o666）。
+      assert.equal(fs.statSync(configPath).mode & 0o777, 0o600);
+    }
 
     assert.throws(
       () => service.save({ outlookCalendarEmail: "not-an-email" }),
@@ -436,10 +542,12 @@ test("local repository mode completes onboarding without any Feishu identifiers"
     assert.equal(saved.settings.projectBaseToken, "");
     assert.equal(saved.settings.localRepositoryDir, workspaceRoot);
     assert.equal(fs.existsSync(path.join(workspaceRoot, "0.待办事项.md")), true);
-    assert.equal(fs.existsSync(path.join(workspaceRoot, "1.行业研究")), true);
-    assert.equal(fs.existsSync(path.join(workspaceRoot, "2.行业动态")), true);
-    assert.equal(fs.existsSync(path.join(workspaceRoot, "3.项目库")), true);
-    assert.equal(fs.existsSync(path.join(workspaceRoot, "4.人脉库")), true);
+    assert.equal(fs.existsSync(path.join(workspaceRoot, "01.能源与电力")), true);
+    assert.equal(fs.existsSync(path.join(workspaceRoot, "05.互联与网络")), true);
+    assert.equal(fs.existsSync(path.join(workspaceRoot, "07.模型层")), true);
+    assert.equal(fs.existsSync(path.join(workspaceRoot, "_其他行业")), true);
+    assert.equal(fs.existsSync(path.join(workspaceRoot, "12.人脉")), true);
+    assert.equal(fs.existsSync(path.join(workspaceRoot, "13.认知库")), true);
     assert.equal(
       saved.settings.localDatabasePath,
       path.join(root, "domi-repository.sqlite3")

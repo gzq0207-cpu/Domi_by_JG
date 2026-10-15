@@ -19,9 +19,75 @@ function writeFakeCodex(binaryPath, source) {
   );
 }
 
+test("dynamic library tool requests return source data and errors via the native protocol", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "domi-dynamic-tools-"));
+  const fakeCodexPath = path.join(directory, "fake-codex");
+  writeFakeCodex(fakeCodexPath, `#!/usr/bin/env node
+const readline = require("node:readline");
+let pending;
+const input = readline.createInterface({ input: process.stdin });
+input.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + "\\n");
+  if (message.method === "invoke") {
+    pending = message.id;
+    process.stdout.write(JSON.stringify({ id: "tool-1", method: "item/tool/call", params: { threadId: "t", turnId: "v", callId: "c", tool: "domi_library_read", arguments: message.params } }) + "\\n");
+  }
+  if (message.id === "tool-1" && message.result) process.stdout.write(JSON.stringify({ id: pending, result: message.result }) + "\\n");
+});
+`);
+  const server = new CodexAppServer({ cwd: directory, version: "test", runtimeProvider: () => ({ codexPath: fakeCodexPath }),
+    onDynamicToolCall: async (params) => {
+      if (params.arguments.fail) throw new Error("正文读取失败");
+      return { ok: true, content: "关键原文", path: "a.md" };
+    } });
+  try {
+    const success = await server.request("invoke", {});
+    assert.equal(success.success, true);
+    assert.equal(success.contentItems[0].type, "inputText");
+    assert.equal(JSON.parse(success.contentItems[0].text).content, "关键原文");
+    const failed = await server.request("invoke", { fail: true });
+    assert.equal(failed.success, false);
+    assert.match(failed.contentItems[0].text, /正文读取失败/);
+  } finally { await closeServerAndRemove(server, directory); }
+});
+
+async function closeServerAndRemove(server, directory) {
+  server.close();
+  if (process.platform === "win32") {
+    // Windows：子进程异步退出会短暂锁定以其为工作目录的临时目录。
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  fs.rmSync(directory, {
+    recursive: true,
+    force: true,
+    maxRetries: 10,
+    retryDelay: 100
+  });
+}
+
 test("Codex symlinks resolve to the real runtime directory containing the command host", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-codex-symlink-test-"));
   try {
+    if (process.platform === "win32") {
+      // Windows 无特权时无法创建符号链接；包管理器在 Windows 上通过
+      // 目录 junction 安装运行时，realpath 解析语义与符号链接一致。
+      const runtimeDirectory = path.join(root, "runtime");
+      const binDirectory = path.join(runtimeDirectory, "bin");
+      fs.mkdirSync(binDirectory, { recursive: true });
+      writeFakeCodex(path.join(binDirectory, "codex.exe"), "@echo off\r\n");
+      const shimDirectory = path.join(root, "shims");
+      fs.symlinkSync(runtimeDirectory, shimDirectory, "junction");
+      const shim = path.join(shimDirectory, "bin", "codex.exe");
+
+      const canonicalBinary = fs.realpathSync.native(path.join(binDirectory, "codex.exe"));
+      assert.equal(resolveCodexBinary(shim), canonicalBinary);
+      assert.equal(
+        canonicalCodexRuntime(shim)?.hostPath,
+        path.join(path.dirname(canonicalBinary), "codex-code-mode-host")
+      );
+      return;
+    }
     const runtimeDirectory = path.join(root, "runtime");
     const shimDirectory = path.join(root, "shims");
     fs.mkdirSync(runtimeDirectory, { recursive: true });
@@ -136,8 +202,7 @@ input.on("line", (line) => {
     assert.deepEqual(await server.request("capabilities"), { experimentalApi: true });
     assert.deepEqual(server.capabilities(), { experimentalApi: true });
   } finally {
-    server.close();
-    fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+    await closeServerAndRemove(server, temporaryDirectory);
   }
 });
 
@@ -186,8 +251,7 @@ input.on("line", (line) => {
     assert.deepEqual(await server.request("attempts"), { initializeAttempts: 2 });
     assert.match(logs.join(""), /稳定兼容模式/);
   } finally {
-    server.close();
-    fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+    await closeServerAndRemove(server, temporaryDirectory);
   }
 });
 
@@ -221,8 +285,48 @@ input.on("line", (line) => {
     );
     assert.deepEqual(await server.request("ping"), { ok: true });
   } finally {
-    server.close();
-    fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+    await closeServerAndRemove(server, temporaryDirectory);
+  }
+});
+
+test("stderr log callback failures never crash the app server", async () => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "domi-codex-epipe-test-"));
+  const fakeCodexPath = path.join(temporaryDirectory, "fake-codex");
+  writeFakeCodex(fakeCodexPath, `#!/usr/bin/env node
+const readline = require("node:readline");
+const input = readline.createInterface({ input: process.stdin });
+input.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize" || message.method === "noisy") {
+    if (message.method === "noisy") {
+      process.stderr.write("codex stderr noise during run\\n");
+    }
+    process.stdout.write(JSON.stringify({ id: message.id, result: { ok: true } }) + "\\n");
+  }
+});
+`);
+
+  const server = new CodexAppServer({
+    cwd: temporaryDirectory,
+    version: "test",
+    requestTimeoutMs: 3_000,
+    // 模拟宿主（main.cjs）stderr 管道已断开：日志回调同步抛出 EPIPE。
+    // 回归验证：该异常不能从 stderr data 监听器冒泡成未捕获异常。
+    onLog: () => {
+      const error = new Error("write EPIPE");
+      error.code = "EPIPE";
+      throw error;
+    },
+    runtimeProvider: () => ({ codexPath: fakeCodexPath })
+  });
+
+  try {
+    await server.start();
+    assert.deepEqual(await server.request("noisy"), { ok: true });
+    assert.deepEqual(await server.request("noisy"), { ok: true });
+    assert.deepEqual(await server.request("noisy"), { ok: true });
+  } finally {
+    await closeServerAndRemove(server, temporaryDirectory);
   }
 });
 
@@ -316,8 +420,7 @@ input.on("line", (line) => {
     assert.equal(closed.length, 1);
     assert.equal(closed[0].reason, "answered");
   } finally {
-    server.close();
-    fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+    await closeServerAndRemove(server, temporaryDirectory);
   }
 });
 
@@ -362,7 +465,6 @@ input.on("line", (line) => {
     assert.equal(userInputCount, 0);
     assert.equal(server.pendingUserInputRequests().length, 0);
   } finally {
-    server.close();
-    fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+    await closeServerAndRemove(server, temporaryDirectory);
   }
 });

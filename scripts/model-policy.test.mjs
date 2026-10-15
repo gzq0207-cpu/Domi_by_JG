@@ -3,10 +3,13 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import {
+  DOMI_DEFAULT_AGENT_PREFERENCES,
   DOMI_ECONOMY_MODEL_ID,
   DOMI_PREMIUM_MODEL_ID,
+  DOMI_TRANSLATION_MODEL_ID,
   domiModelPolicyClass,
   isDomiPremiumNaturalLanguageTask,
+  isDomiSummaryNaturalLanguageTask,
   resolveDomiModelPolicy
 } from "../src/model-policy.ts";
 import {
@@ -16,6 +19,7 @@ import {
 } from "../src/workflows.ts";
 
 const models = [
+  { id: DOMI_TRANSLATION_MODEL_ID, supportedReasoningEfforts: [{ id: "medium" }], serviceTiers: [{ id: "priority" }] },
   {
     id: DOMI_ECONOMY_MODEL_ID,
     supportedReasoningEfforts: [{ id: "low" }, { id: "medium" }],
@@ -25,6 +29,11 @@ const models = [
     id: DOMI_PREMIUM_MODEL_ID,
     supportedReasoningEfforts: [{ id: "medium" }, { id: "high" }, { id: "max" }],
     serviceTiers: [{ id: "priority" }, { id: "flex" }]
+  },
+  {
+    id: "gpt-6.1-sol",
+    supportedReasoningEfforts: [{ id: "medium" }, { id: "high" }, { id: "max" }],
+    serviceTiers: [{ id: "priority" }]
   }
 ];
 
@@ -47,6 +56,16 @@ function resolveNaturalLanguage(requestText, overrides = {}) {
     ...overrides
   });
 }
+
+test("translation uses Luna medium standard without lowering intake or summary policy", () => {
+  const expected = { policyClass: "translation", model: "gpt-6-luna", reasoningEffort: "medium", serviceTier: "standard" };
+  assert.deepEqual(resolve(undefined, { runKind: "translation" }), expected);
+  for (const text of ["把这篇英文文章全文翻译成中文", "翻译这份公司研究报告", "将所有英文转录稿译为中文"]) assert.deepEqual(resolveNaturalLanguage(text), expected);
+  assert.equal(resolve(undefined, { runKind: "intake" }).model, "gpt-6.1-sol");
+  assert.equal(resolveNaturalLanguage("翻译并总结这篇文章").policyClass, "summary");
+  assert.equal(resolveNaturalLanguage("不要翻译，分析这家公司的财报").policyClass, "premium");
+  assert.throws(() => resolve(undefined, { runKind: "translation", models: models.filter(m => m.id !== DOMI_TRANSLATION_MODEL_ID) }), /不支持/);
+});
 
 test("radar and Todo use Terra medium at standard speed", () => {
   for (const workflowId of ["investment-radar", "task"]) {
@@ -81,8 +100,8 @@ test("externally deliverable workflows use Sol max and preserve the user speed t
   }
 });
 
-test("podcast archive is explicitly pinned to the premium policy", () => {
-  assert.equal(domiModelPolicyClass(undefined, "podcast-archive"), "premium");
+test("podcast archive uses the summary defaults", () => {
+  assert.equal(domiModelPolicyClass(undefined, "podcast-archive"), "summary");
   assert.deepEqual(resolveDomiModelPolicy({
     runKind: "podcast-archive",
     models,
@@ -90,11 +109,78 @@ test("podcast archive is explicitly pinned to the premium policy", () => {
     userReasoningEffort: "default",
     userServiceTier: "default"
   }), {
-    policyClass: "premium",
-    model: DOMI_PREMIUM_MODEL_ID,
-    reasoningEffort: "max",
-    serviceTier: "default"
+    policyClass: "summary",
+    model: "gpt-6.1-sol",
+    reasoningEffort: "high",
+    serviceTier: "standard"
   });
+});
+
+test("forwarded-content intake uses GPT-6.1 Sol high at standard speed", () => {
+  assert.equal(domiModelPolicyClass(undefined, "intake"), "summary");
+  assert.deepEqual(resolveDomiModelPolicy({
+    runKind: "intake",
+    models,
+    userModel: "default",
+    userReasoningEffort: "max",
+    userServiceTier: "priority"
+  }), {
+    policyClass: "summary",
+    model: "gpt-6.1-sol",
+    reasoningEffort: "high",
+    serviceTier: "standard"
+  });
+});
+
+test("new tasks and explicit summary runs share GPT-6.1 Sol high standard defaults", () => {
+  assert.deepEqual(DOMI_DEFAULT_AGENT_PREFERENCES, {
+    model: "gpt-6.1-sol", reasoningEffort: "high", serviceTier: "standard"
+  });
+  assert.deepEqual(resolve("domi-router", { runKind: "summary" }), {
+    policyClass: "summary", ...DOMI_DEFAULT_AGENT_PREFERENCES
+  });
+});
+
+test("article, video, audio and digest summaries override previous Fast or Max selections", () => {
+  for (const requestText of [
+    "请给这篇文章撰写摘要",
+    "总结这个 B 站视频的内容",
+    "概括这期播客的核心观点",
+    "帮我总结这份音频",
+    "提炼这份财报的要点",
+    "生成今天的订阅日报",
+    "Please summarize this article"
+  ]) {
+    assert.equal(isDomiSummaryNaturalLanguageTask(requestText), true, requestText);
+    for (const workflowId of [undefined, "domi-router"]) {
+      assert.deepEqual(resolveNaturalLanguage(requestText, {
+        workflowId, userReasoningEffort: "max", userServiceTier: "priority"
+      }), { policyClass: "summary", ...DOMI_DEFAULT_AGENT_PREFERENCES }, requestText);
+    }
+  }
+});
+
+test("summary wording does not lower research or detailed delivery policies", () => {
+  for (const requestText of [
+    "深度研究这家公司，给出摘要和投资评分",
+    "撰写 IC memo 并附上执行摘要",
+    "把管理层访谈整理成完整纪要，并附摘要",
+    "把总结做成一份投研 slides"
+  ]) {
+    assert.equal(resolveNaturalLanguage(requestText).policyClass, "premium", requestText);
+  }
+  for (const requestText of ["摘要功能报错，请排查", "修改摘要文档里的错别字"]) {
+    assert.equal(resolveNaturalLanguage(requestText).policyClass, "inherit", requestText);
+  }
+  assert.equal(resolveNaturalLanguage("总结这个视频", { useDomiPlugin: false }).policyClass, "inherit");
+  assert.equal(resolve("ic-memo", { useDomiPlugin: true, requestText: "撰写摘要" }).policyClass, "premium");
+});
+
+test("summaries reject unavailable models or unsupported high effort", () => {
+  assert.throws(() => resolve(undefined, { runKind: "summary", models: [] }), /model\/list/);
+  assert.throws(() => resolve(undefined, {
+    runKind: "summary", models: [{ id: "gpt-6.1-sol", supportedReasoningEfforts: [{ id: "max" }] }]
+  }), /不支持策略要求的 high/);
 });
 
 test("ordinary and unclassified workflows inherit every user selection", () => {
@@ -269,7 +355,7 @@ test("a missing model/list fails closed instead of silently falling back", () =>
 
 test("missing models and reasoning capabilities fail closed", () => {
   assert.throws(
-    () => resolve("investment-radar", { models: models.slice(1) }),
+    () => resolve("investment-radar", { models: models.filter((m) => m.id !== DOMI_ECONOMY_MODEL_ID) }),
     new RegExp(`${DOMI_ECONOMY_MODEL_ID}.*不会静默降级`)
   );
   assert.throws(
@@ -303,21 +389,19 @@ test("every renderer entry point uses the centralized policy before starting or 
     return appSource.slice(start, end);
   };
 
-  const radar = segment("async function scanWeeklyNews", "async function archivePodcastTranscript");
-  assert.match(radar, /resolveRunModelPolicy\(radarWorkflow\.id\)/);
+  const radar = segment("async function scanWeeklyNews", "async function notifyImportantWeeklyNews");
+  assert.match(radar, /await resolveReadyRunModelPolicy\(radarWorkflow\.id\)/);
   assert.match(radar, /model: runModelPolicy\.model/);
   assert.doesNotMatch(radar, /model,\s*\n\s*reasoningEffort,\s*\n\s*serviceTier/);
 
-  const podcast = segment("async function archivePodcastTranscript", "async function notifyImportantWeeklyNews");
-  assert.match(podcast, /runKind: "podcast-archive"/);
-  assert.match(podcast, /model: runModelPolicy\.model/);
 
   const todo = segment("async function syncManagedTasks", "async function resolveDomiEntityWorkspacePath");
-  assert.match(todo, /resolveRunModelPolicy\(todoWorkflow\.id\)/);
+  assert.match(todo, /await resolveReadyRunModelPolicy\(todoWorkflow\.id\)/);
   assert.match(todo, /serviceTier: runModelPolicy\.serviceTier/);
 
   const submit = segment("async function submitToCodexInternal", "function handleSubmit");
-  assert.match(submit, /resolveRunModelPolicy\(workflow\?\.id/);
+  assert.match(submit, /await resolveReadyRunModelPolicy\(workflow\?\.id/);
+  assert.match(submit, /runKind: options\.runKind \?\? \(bareIntake \? "intake" : undefined\)/);
   assert.match(submit, /useDomiPlugin,\s*\n\s*requestText: messageText/);
   assert.match(submit, /model: runModelPolicy\.model/);
 
@@ -325,11 +409,21 @@ test("every renderer entry point uses the centralized policy before starting or 
   assert.match(queue, /resolveRunModelPolicy\(workflow\?\.id\s*,/);
   assert.match(queue, /useDomiPlugin: domiPluginEnabled,\s*\n\s*requestText: messageText/);
   assert.match(queue, /model: runModelPolicy\.model/);
+  assert.match(queue, /bareIntakeInput\(rawInput, queuedAttachments\)/);
+
+  const digest = segment("async function generateSubscriptionDigest", "function ");
+  assert.match(digest, /await resolveReadyRunModelPolicy\(routerWorkflow\.id, \{ runKind: "summary" \}\)/);
+  for (const marker of ["function handleIntakeItem", "function handleIntakeFileItem"]) {
+    const intake = segment(marker, "function ");
+    assert.match(intake, /runKind: "intake"/);
+  }
 
   const resolver = segment("function resolveRunModelPolicy", "const deferredThreadQuery");
   assert.match(resolver, /domiSlidesDeliveryPolicyForText\(semanticRequestText\)/);
   assert.match(resolver, /useDomiPlugin: options\.useDomiPlugin/);
   assert.match(resolver, /requestText: semanticRequestText/);
+  assert.match(resolver, /models: codexModelReadinessRef\.current\?\.current\(\)\?\.models/);
+  assert.match(resolver, /await codexModelReadinessRef\.current!\.ready\(\)/);
 });
 
 test("programmatic Radar and Todo prompts request only their compact execution contracts", () => {

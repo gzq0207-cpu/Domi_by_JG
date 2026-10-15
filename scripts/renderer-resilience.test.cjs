@@ -99,7 +99,7 @@ assert.match(
 
 assert.equal(
   (setupCenter.match(/requestOrigin: "programmatic"/g) || []).length,
-  3,
+  2,
   "Connection and account diagnostics must be explicitly marked as programmatic Codex requests."
 );
 
@@ -221,13 +221,8 @@ assert.match(
 );
 assert.match(
   radarSourceManager,
-  /processPodcastEpisode[\s\S]*?公开 RSS、小宇宙公开节目页或单集页/,
-  "Podcast source management must discover public episodes and hand audio to the PLAUD processor."
-);
-assert.match(
-  app,
-  /async function archivePodcastTranscript[\s\S]*?ephemeral: true[\s\S]*?background: true/,
-  "Podcast notes must archive in the background instead of creating another task workspace."
+  /公开 RSS、小宇宙公开节目页或单集页[\s\S]*?podcast-episode-link/,
+  "Podcast source management must discover public episodes and link straight to the episode."
 );
 assert.match(
   app,
@@ -438,7 +433,7 @@ assert.match(
 );
 assert.match(
   app,
-  /searchDocumentLibrary\(\{ query, limit: 8 \}\)[\s\S]*?result\.indexing[\s\S]*?setTimeout/,
+  /searchDocumentLibrary\(\{[\s\S]*?query,[\s\S]*?limit: 8,[\s\S]*?excludeTranscripts: domiSearchExcludeTranscripts[\s\S]*?\}\)[\s\S]*?result\.indexing[\s\S]*?setTimeout/,
   "Document mention search must debounce and refresh partial background-index results."
 );
 assert.match(
@@ -464,7 +459,7 @@ assert.match(
 assert.match(
   documentSearchIndex,
   /tokenize='trigram'[\s\S]*?is_transcript[\s\S]*?MAX_MARKDOWN_BYTES/,
-  "The search cache must use trigram FTS, suppress raw transcripts by default, and bound Markdown reads."
+  "The search cache must use trigram FTS, index transcripts with demotion, and bound Markdown reads."
 );
 assert.match(
   documentSearchWorker,
@@ -505,8 +500,8 @@ const recordingExchangePanelIndex = app.indexOf('<section className={`panel-sect
 const recordingExchangePanel = app.slice(recordingExchangePanelIndex, recordingExchangePanelIndex + 500);
 assert.match(
   recordingExchangePanel,
-  /<Mic size=\{17\} \/>录音交流/,
-  "The recordings and PLAUD panel must use the user-facing Recording Exchange label."
+  /<Gauge size=\{17\} \/>domi 状态/,
+  "The domi status panel must use the user-facing domi status label."
 );
 assert.doesNotMatch(
   recordingExchangePanel,
@@ -834,28 +829,8 @@ assert.match(
 );
 assert.match(
   app,
-  /function renderNewTaskHome\(\)[\s\S]*?NEW_TASK_QUOTE[\s\S]*?visibleQuickStartWorkflows/,
+  /function renderNewTaskHome\(\)[\s\S]*?NEW_TASK_QUOTE[\s\S]*?quickStartWorkflows/,
   "The empty task view must retain the quote and workflow suggestion cards."
-);
-assert.match(
-  app,
-  /const plaudEnabled = appSettings\?\.plaudConnectionMode === "enabled"[\s\S]*?workflow\.requiresPlaud \|\| plaudEnabled/,
-  "PLAUD-dependent quick starts must remain hidden until the user enables PLAUD."
-);
-assert.doesNotMatch(
-  app,
-  /window\.setTimeout\(\(\) => \{[\s\S]{0,200}?refreshPlaudQueue\(\)[\s\S]{0,100}?1_200/,
-  "PLAUD startup must not open a remote browser session before the user asks to read recordings."
-);
-assert.match(
-  app,
-  /function toggleSection[\s\S]*?section === "domi"[\s\S]*?opening[\s\S]*?void refreshPlaudQueue\(\)/,
-  "Opening a previously collapsed PLAUD area may lazily refresh its recordings."
-);
-assert.match(
-  app,
-  /aria-label="刷新 PLAUD 最近录音"[\s\S]*?refreshPlaudQueue\(\{ fresh: true \}\)/,
-  "The recording panel must expose an explicit read-only refresh action."
 );
 assert.doesNotMatch(
   app,
@@ -864,8 +839,8 @@ assert.doesNotMatch(
 );
 assert.match(
   app,
-  /const NEW_THREAD_MODEL = "default";[\s\S]*?const NEW_THREAD_REASONING_EFFORT = "max";[\s\S]*?const NEW_THREAD_SERVICE_TIER = "priority";/,
-  "New tasks must keep Max reasoning on the Fast service tier by default."
+  /const NEW_THREAD_MODEL = DOMI_DEFAULT_AGENT_PREFERENCES\.model;[\s\S]*?const NEW_THREAD_REASONING_EFFORT = DOMI_DEFAULT_AGENT_PREFERENCES\.reasoningEffort;[\s\S]*?const NEW_THREAD_SERVICE_TIER = DOMI_DEFAULT_AGENT_PREFERENCES\.serviceTier;/,
+  "New tasks must use the centralized GPT-6.1 Sol/high/standard defaults."
 );
 assert.match(
   setupCenter,
@@ -884,7 +859,7 @@ assert.match(
 );
 assert.match(
   setupCenter,
-  /disabled=\{saving \|\| installBusy \|\| \(!codexInstalled && !codexPathRequiresApply\)\}/,
+  /disabled=\{saving \|\| installBusy[\s\S]*?\|\| \(!codexInstalled && !codexPathRequiresApply && draft\.authMode !== \"agent-cli\"\)\}/,
   "Onboarding must not advance while Codex installation is incomplete, while keeping its primary control available to cancel a running test."
 );
 assert.match(
@@ -929,7 +904,7 @@ assert.match(
 );
 assert.match(
   setupCenter,
-  /codexConnectionDraftBlockReason\(\{[\s\S]*?savedCodexPath: settings\.codexPath[\s\S]*?relayApiKey[\s\S]*?disabled=\{Boolean\(connectionTestBlockReason\)/,
+  /codexConnectionDraftBlockReason\(\{[\s\S]*?savedCodexPath: settings\.codexPath[\s\S]*?relayApiKey[\s\S]*?disabled=\{draft\.authMode === \"agent-cli\"[\s\S]*?Boolean\(connectionTestBlockReason\)/,
   "A generic test must be unavailable for an unsaved Codex path or replacement relay key."
 );
 assert.match(
@@ -944,7 +919,7 @@ assert.match(
 );
 assert.match(
   `${setupCenter}\n${app}`,
-  /onRefresh\(result\.codex\)[\s\S]*?refreshCodex\(verifiedStatus\?: CodexCheckResult\)[\s\S]*?verifiedStatus \|\| await workbench\.checkCodex\(\)/,
+  /onRefresh\(result\.codex\)[\s\S]*?refreshCodex\(\s*verifiedStatus\?: CodexCheckResult,\s*options: \{ refreshModels\?: boolean \} = \{\}\s*\)[\s\S]*?if \(verifiedStatus\) \{[\s\S]*?codexModelReadinessRef\.current!\.update\(verifiedStatus\);[\s\S]*?\} else \{[\s\S]*?await codexModelReadinessRef\.current!\.refresh\(/,
   "A successful full connection test must publish its verified status without running the same health check twice."
 );
 assert.match(
@@ -1186,8 +1161,65 @@ assert.match(
 );
 assert.match(
   main,
-  /CODEX_VERSION_CHECK_TIMEOUT_MS[\s\S]*?CODEX_HEALTH_REQUEST_TIMEOUT_MS[\s\S]*?execFileAsync\(binary, \["--version"\][\s\S]*?timeout: codexCheckTimeout\(deadlineAt, CODEX_VERSION_CHECK_TIMEOUT_MS\)[\s\S]*?healthTimeoutMs = codexCheckTimeout\(deadlineAt, CODEX_HEALTH_REQUEST_TIMEOUT_MS\)[\s\S]*?client\.request\("model\/list"[\s\S]*?timeoutMs: healthTimeoutMs[\s\S]*?codex-check-performance/,
+  /CODEX_VERSION_CHECK_TIMEOUT_MS[\s\S]*?CODEX_HEALTH_REQUEST_TIMEOUT_MS[\s\S]*?client\.request\("model\/list"[\s\S]*?timeoutMs: codexCheckTimeout\(modelDeadlineAt, CODEX_HEALTH_REQUEST_TIMEOUT_MS\)[\s\S]*?execFileAsync\(binary, \["--version"\][\s\S]*?timeout: codexCheckTimeout\(deadlineAt, CODEX_VERSION_CHECK_TIMEOUT_MS\)[\s\S]*?listAvailableCodexModels\(client, \{ signal, deadlineAt \}\)[\s\S]*?codex-check-performance/,
   "Codex version and App Server readiness probes must stay bounded and emit stage timings."
+);
+assert.match(
+  main,
+  /async function listAvailableCodexModels\([\s\S]*?cursor = page\?\.nextCursor \|\| null;[\s\S]*?while \(cursor\);[\s\S]*?models: modelResult\.map/,
+  "The model picker must receive every visible page from Codex model/list."
+);
+assert.match(
+  app,
+  /selectedModel\?\.name \|\| "推荐模型"[\s\S]*?codexStatus\.models\.map\(\(item\) =>/,
+  "The model picker must show Codex-provided names rather than hard-coded version aliases."
+);
+assert.match(
+  app,
+  /selectedModel\?\.supportedReasoningEfforts\.some\([\s\S]*?selectedModel\?\.serviceTiers\.some\(/,
+  "The selected model's available reasoning and service tiers must drive the picker display."
+);
+assert.match(
+  main,
+  /force: request\?\.refreshModels === true[\s\S]*?ipcMain\.handle\("codex:check", runCodexCheckCached\)/,
+  "The model picker must be able to bypass the cached Codex status and re-read live models."
+);
+assert.match(
+  app,
+  /function openModelMenu\(\) \{[\s\S]*?refreshCodex\(undefined, \{ refreshModels: true \}\)[\s\S]*?async function refreshModelMenu\(\)/,
+  "Opening or refreshing the model picker must re-query Codex's current model list."
+);
+assert.match(
+  app,
+  /列表来自 Codex App Server，与 ChatGPT 网页端可用模型可能不同/,
+  "The picker must disclose that Codex and ChatGPT web model lists can differ."
+);
+assert.doesNotMatch(
+  app,
+  /\bastra\b/i,
+  "The picker must never hard-code models that Codex has not reported as runnable."
+);
+const codexHealthCheck = main.split("async function runCodexCheck(")[1]?.split("function runCodexCheckCached(")[0];
+assert.ok(codexHealthCheck, "The Codex health check must be present.");
+assert.doesNotMatch(
+  codexHealthCheck,
+  /\b(useAgentCli|runAgentCli|sender|payload|runId)\b/,
+  "Codex health checks must not reference task-run arguments or a CLI dispatch branch."
+);
+assert.match(
+  main,
+  /async function startChatGptLogin\(\) \{\s*try \{\s*await ensureCodexRuntimeReady\(\)/,
+  "ChatGPT login must prepare Codex without accessing an undefined settings variable."
+);
+assert.match(
+  main,
+  /"secure-storage",\s*process\.platform === "darwin" \? "macOS Keychain" : "系统加密存储"/,
+  "Diagnostics must identify the actual platform's secure storage."
+);
+assert.match(
+  main,
+  /codex\.pluginSetup\?\.skipped && codex\.pluginSetup\.ok[\s\S]*?开发模式未启用内置插件安装（已跳过）/,
+  "Diagnostics must distinguish development-mode plugin skips from installation failures."
 );
 assert.match(
   main,
@@ -1210,13 +1242,13 @@ assert.match(
   "Weekly news must retain separate lightweight and radar refresh schedules."
 );
 assert.ok(
-  canonicalTaxonomy["智能出行"].includes("汽车芯片"),
-  "Automotive chips must follow the project library taxonomy under smart mobility."
+  canonicalTaxonomy["终端与具身"].includes("自动驾驶"),
+  "Autonomous driving must follow the project library taxonomy under terminals and embodied AI."
 );
 assert.equal(
-  canonicalTaxonomy.AI.includes("汽车芯片"),
+  canonicalTaxonomy["算力芯片"].includes("自动驾驶"),
   false,
-  "Automotive chips must not appear under AI."
+  "Autonomous driving must not appear under compute chips."
 );
 assert.match(
   taxonomy,
@@ -1230,8 +1262,8 @@ assert.match(
 );
 assert.match(
   app,
-  /radarWorkflow\.defaultPrompt,[\s\S]*?followed_domains=[\s\S]*?radarTaxonomyPrompt\(radarDomainsSnapshot\)/,
-  "Future radar scans must validate classifications against the same project taxonomy."
+  /radarWorkflow\.defaultPrompt,[\s\S]*?followed_domains=[\s\S]*?radarTaxonomyPrompt\(radarDomainsSnapshot, databaseSnapshot\?\.taxonomy\?\.customSubdomains \|\| \[\]\)/,
+  "Future radar scans must validate classifications against the same project taxonomy (canonical plus user custom subdomains)."
 );
 assert.match(
   app,
@@ -1305,7 +1337,7 @@ assert.match(
 );
 assert.match(
   app,
-  /const statusPromise = workbench\.checkCodex\(\)\.then[\s\S]*?const dataRefreshPromise = Promise\.allSettled\(\[[\s\S]*?refreshDomi\(\)[\s\S]*?refreshDomiTaskBoard[\s\S]*?refreshWeeklyNews[\s\S]*?Promise\.all\(\[statusPromise, dataRefreshPromise\]\)[\s\S]*?if \(!status\.pluginSetup\?\.ok\)/,
+  /const statusPromise = codexModelReadinessRef\.current!\.refresh\(\);[\s\S]*?const dataRefreshPromise = Promise\.allSettled\(\[[\s\S]*?refreshDomi\(\)[\s\S]*?refreshDomiTaskBoard[\s\S]*?refreshWeeklyNews[\s\S]*?Promise\.all\(\[statusPromise, dataRefreshPromise\]\)[\s\S]*?if \(!status\.pluginSetup\?\.ok\)/,
   "Initial integration sync must refresh independent data, todo and news sources alongside Codex readiness."
 );
 assert.match(
@@ -1563,59 +1595,19 @@ assert.match(
   "Important weekly news must be able to reach the native notification bridge."
 );
 assert.match(
-  app,
-  /item\.queueStage === "managed"\) return "已生成并入库"/,
-  "Completed PLAUD project recordings must display their archived state."
-);
-assert.match(
-  app,
-  /refreshPlaudQueue\(\{ fresh: true \}\)/,
-  "PLAUD workflow completion must bypass stale queue snapshots."
-);
-assert.match(
   main,
   /const fresh = request\?\.fresh === true[\s\S]*?plaudQueue\(\{ offset, limit, fresh \}\)[\s\S]*?retries: 0[\s\S]*?force: fresh[\s\S]*?allowStale: false/,
   "PLAUD reads must have one retry owner and fresh reads must bypass every service-level stale fallback."
-);
-assert.match(
-  setupCenter,
-  /plaudBrowser === "chrome"[\s\S]*?Google Chrome[\s\S]*?plaudBrowser === "tabbit"[\s\S]*?Tabbit/,
-  "PLAUD onboarding must let each user choose Chrome or Tabbit."
-);
-assert.match(
-  setupCenter,
-  /loginPlaud\(\)[\s\S]*?workbench\.loginPlaud\(\{ browser \}\)[\s\S]*?只读验证/,
-  "PLAUD login must use the dedicated browser flow and verify the remote account."
-);
-assert.match(
-  setupCenter,
-  /本连接助手禁止运行 login \$\{browser\}[\s\S]*?只报告“请用户主动点击登录并验证”/,
-  "The diagnostic assistant must never open the visible PLAUD login window on its own."
 );
 assert.match(
   main,
   /shutdownAllPlaudOperations\("app-quit"\)/,
   "App quit must gracefully stop both the persistent reader and direct PLAUD CLI children."
 );
-assert.doesNotMatch(
-  setupCenter,
-  /openResource\("\/Applications\/Tabbit\.app"\)/,
-  "PLAUD onboarding must not hard-code or reuse the user's everyday Tabbit profile."
-);
 assert.match(
   preload,
   /loginPlaud:[\s\S]*?domi:plaud-login[\s\S]*?checkPlaudConnection:[\s\S]*?domi:plaud-connection[\s\S]*?disconnectPlaud:[\s\S]*?domi:plaud-disconnect/,
   "The renderer bridge must expose login, verification, and local-profile removal."
-);
-assert.match(
-  setupCenter,
-  /rate_limited:\s*"PLAUD 暂时限流"[\s\S]*?service_unavailable:\s*"PLAUD 服务暂时不可用"/,
-  "PLAUD settings must explain vendor throttling and outages without asking for a new login."
-);
-assert.match(
-  app,
-  /loadMorePlaudQueue[\s\S]*?setPlaudSnapshot[\s\S]*?remoteStatus:\s*result\.remoteStatus[\s\S]*?retryable:\s*result\.retryable/,
-  "A later-page failure must propagate its remote status so the recovery action stays accurate."
 );
 assert.match(
   app,
@@ -1748,7 +1740,7 @@ assert.match(
 );
 assert.match(
   app,
-  /async function openDocumentLibrary\(\)[\s\S]*?if \(!await navigateWorkspace\("documents"\)\) return;[\s\S]*?async function openPrimaryWorkspace\(view: "tasks" \| "news" \| "data"\)[\s\S]*?if \(!await navigateWorkspace\(view\)\) return;/,
+  /async function openDocumentLibrary\(\)[\s\S]*?if \(!await navigateWorkspace\("documents"\)\) return;[\s\S]*?async function openPrimaryWorkspace\(view: "tasks" \| "news" \| "subscriptions" \| "data"\)[\s\S]*?if \(!await navigateWorkspace\(view\)\) return;/,
   "Sidebar UI state must change only after the current page has safely completed navigation."
 );
 assert.match(
@@ -1758,7 +1750,7 @@ assert.match(
 );
 assert.match(
   app,
-  /async function openPrimaryWorkspace\(view: "tasks" \| "news" \| "data"\)[\s\S]*?if \(view !== "data"\) return;[\s\S]*?refreshDatabase\(\{ preserveSelection: true \}\)/,
+  /async function openPrimaryWorkspace\(view: "tasks" \| "news" \| "subscriptions" \| "data"\)[\s\S]*?if \(view !== "data"\) return;[\s\S]*?refreshDatabase\(\{ preserveSelection: true \}\)/,
   "Every database workspace open must refresh while preserving the current selection."
 );
 assert.match(
@@ -1904,28 +1896,18 @@ assert.equal(
 );
 assert.match(
   app,
-  /threadsRef\.current = \[[\s\S]*?targetThread as Thread[\s\S]*?submitToCodex\(workflow, plaudNotesWorkflowRequest/,
-  "A newly created PLAUD task must be synchronously registered before same-tick submission."
-);
-assert.match(
-  app,
   /threadsRef\.current = \[[\s\S]*?nextThread[\s\S]*?const result = await submitToCodex\(workflow, suggestion\.prompt/,
   "A newly created suggested task must be synchronously registered before same-tick submission."
 );
 assert.match(
   app,
-  /submitToCodex\(workflow, plaudNotesWorkflowRequest[\s\S]*?activeDocumentPath: undefined[\s\S]*?submitToCodex\(workflow, suggestion\.prompt[\s\S]*?activeDocumentPath: undefined/,
+  /submitToCodex\(workflow, suggestion\.prompt[\s\S]*?activeDocumentPath: undefined/,
   "Programmatic tasks must not inherit a document currently open in another task."
 );
 assert.match(
   app,
-  /function plaudNotesWorkflowRequest[\s\S]*?默认本地主库使用 Markdown 文档和本地项目库[\s\S]*?legacy_feishu_primary[\s\S]*?只读检索飞书 Wiki、云文档或 Base[\s\S]*?飞书只读检索失败不得阻塞[\s\S]*?程序化工作流，不是用户对飞书写入的原始指令[\s\S]*?禁止创建、编辑、更新、覆盖或发布任何飞书外部内容/,
-  "PLAUD processing must archive locally, treat Feishu as an optional read-only reference and forbid implicit remote writes."
-);
-assert.match(
-  app,
-  /submitToCodex\(workflow, plaudNotesWorkflowRequest[\s\S]*?requestOrigin: "programmatic"[\s\S]*?userInstructionText: ""[\s\S]*?submitToCodex\(workflow, suggestion\.prompt[\s\S]*?requestOrigin: "programmatic"[\s\S]*?userInstructionText: ""/,
-  "Generated PLAUD and execution-suggestion requests must never masquerade as original user instructions."
+  /submitToCodex\(workflow, suggestion\.prompt[\s\S]*?requestOrigin: "programmatic"[\s\S]*?userInstructionText: ""/,
+  "Generated execution-suggestion requests must never masquerade as original user instructions."
 );
 assert.match(
   workflows,

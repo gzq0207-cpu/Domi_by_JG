@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 contextBridge.exposeInMainWorld("workbench", {
   checkCodex: () => ipcRenderer.invoke("codex:check"),
+    checkAgentCli: (engineId) => ipcRenderer.invoke("agent:cli-status", engineId),
   loadSettings: () => ipcRenderer.invoke("settings:load"),
   saveSettings: (request) => ipcRenderer.invoke("settings:save", request),
   selectDirectory: (currentPath) => ipcRenderer.invoke("settings:select-directory", currentPath),
@@ -21,6 +22,7 @@ contextBridge.exposeInMainWorld("workbench", {
   downloadUpdate: () => ipcRenderer.invoke("update:download"),
   installUpdate: () => ipcRenderer.invoke("update:install"),
   runCodex: (payload) => ipcRenderer.invoke("codex:run", payload),
+  verifyLibraryCitation: (request) => ipcRenderer.invoke("library:citation-verify", request),
   stopCodex: (runId) => ipcRenderer.invoke("codex:stop", runId),
   recoverCodexThread: (threadId) => ipcRenderer.invoke("codex:recover-thread", threadId),
   bindCodexRun: (runId) => ipcRenderer.invoke("codex:bind-run", runId),
@@ -52,6 +54,7 @@ contextBridge.exposeInMainWorld("workbench", {
   listDocumentLibrary: (request) => ipcRenderer.invoke("document-library:list", request),
   searchDocumentLibrary: (request) => ipcRenderer.invoke("document-library:search", request),
   createDocumentLibraryEntry: (request) => ipcRenderer.invoke("document-library:create", request),
+  finalizeSubscriptionDigest: (request) => ipcRenderer.invoke("domi:subscription-digest-finalize", request),
   readMarkdown: (request) => ipcRenderer.invoke("markdown:read", request),
   saveMarkdown: (request) => ipcRenderer.invoke("markdown:save", request),
   renameMarkdown: (request) => ipcRenderer.invoke("markdown:rename", request),
@@ -65,6 +68,7 @@ contextBridge.exposeInMainWorld("workbench", {
   createProjectWorkspace: (request) => ipcRenderer.invoke("workspace:create", request),
   openWorkspace: (workspacePath) => ipcRenderer.invoke("workspace:open", workspacePath),
   loadDomiCache: () => ipcRenderer.invoke("domi:cache"),
+  syncFeishuWikiMirror: (request) => ipcRenderer.invoke("feishu:wiki-mirror-sync", request),
   checkDomi: () => ipcRenderer.invoke("domi:status"),
   getFeishuSetupStatus: (request) => ipcRenderer.invoke("domi:feishu-setup-status", request),
   startFeishuSetupAuth: () => ipcRenderer.invoke("domi:feishu-setup-start-auth"),
@@ -85,6 +89,7 @@ contextBridge.exposeInMainWorld("workbench", {
   bulkImportRadarSources: (request) => ipcRenderer.invoke("domi:radar-source-bulk-import", request),
   deleteRadarSource: (request) => ipcRenderer.invoke("domi:radar-source-delete", request),
   syncRadarSources: (request) => ipcRenderer.invoke("domi:radar-source-sync", request),
+  saveRadarTwitterToken: (request) => ipcRenderer.invoke("domi:radar-source-twitter-token", request),
   processPodcastEpisode: (request) => ipcRenderer.invoke("domi:podcast-process", request),
   listDomiTasks: (request) => ipcRenderer.invoke("domi:task-list", request),
   updateDomiTask: (request) => ipcRenderer.invoke("domi:task-update", request),
@@ -101,6 +106,11 @@ contextBridge.exposeInMainWorld("workbench", {
     const handler = (_event, payload) => callback(payload);
     ipcRenderer.on("codex:event", handler);
     return () => ipcRenderer.removeListener("codex:event", handler);
+  },
+  onIntakeItem: (callback) => {
+    const handler = (_event, payload) => callback(payload);
+    ipcRenderer.on("app:intake-item", handler);
+    return () => ipcRenderer.removeListener("app:intake-item", handler);
   },
   onUpdateStatus: (callback) => {
     const handler = (_event, payload) => callback(payload);

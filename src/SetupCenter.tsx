@@ -1,4 +1,5 @@
 import {
+  Brain,
   BadgeCheck,
   CalendarDays,
   CheckCircle2,
@@ -12,11 +13,11 @@ import {
   KeyRound,
   LoaderCircle,
   LogIn,
-  Mic,
   RefreshCw,
   Settings2,
   ShieldCheck,
   Sparkles,
+  UsersRound,
   Terminal,
   X
 } from "lucide-react";
@@ -31,6 +32,11 @@ import {
   codexConnectionRuntimeSnapshot,
   runBoundedCodexConnectionTest
 } from "./codex-connection-test";
+import {
+  AGENT_PROVIDERS,
+  agentProviderById,
+  agentProviderDraftPatch
+} from "./agent-providers";
 import type { CodexConnectionRuntimeSnapshot } from "./codex-connection-test";
 import {
   AppSettings,
@@ -38,6 +44,7 @@ import {
   AppSettingsSaveResult,
   ChatGPTLoginResult,
   CodexCheckResult,
+  AgentCliStatus,
   CodexRuntimeStatus,
   DiagnosticCheck,
   DiagnosticReport,
@@ -47,7 +54,7 @@ import {
 } from "./env";
 
 type SetupCenterProps = {
-  initialTab?: "connection" | "data" | "plaud" | "updates" | "diagnostics";
+  initialTab?: "connection" | "data" | "updates" | "diagnostics";
   settings: AppSettings;
   codexStatus: CodexCheckResult | null;
   required: boolean;
@@ -91,23 +98,6 @@ function outlookVerificationTime(timestamp: number) {
   } catch {
     return "";
   }
-}
-
-function plaudStatusLabel(status: string) {
-  return {
-    auth_required: "需要重新登录",
-    authorization_pending: "正在自动续期",
-    access_denied: "PLAUD 暂时拒绝访问",
-    verification_pending: "正在自动恢复登录",
-    profile_locked: "专用浏览器被占用",
-    browser_unavailable: "浏览器连接不可用",
-    runtime_unavailable: "内置音频组件不完整",
-    network_error: "网络不可用",
-    rate_limited: "PLAUD 暂时限流",
-    service_unavailable: "PLAUD 服务暂时不可用",
-    service_changed: "PLAUD 服务可能已更新",
-    unknown: "需要继续诊断"
-  }[status] || "";
 }
 
 type FeishuAssistPhase = "connection" | "configuration" | "authorization";
@@ -169,9 +159,11 @@ export default function SetupCenter({
   onRefresh
 }: SetupCenterProps) {
   const { confirm, confirmDialog } = useAppConfirm();
-  const [tab, setTab] = useState<"connection" | "data" | "plaud" | "updates" | "diagnostics">(initialTab);
-  const [draft, setDraft] = useState(settings);
+  const [tab, setTab] = useState<"connection" | "data" | "updates" | "diagnostics">(initialTab);
   const [saving, setSaving] = useState(false);
+  const [draft, setDraft] = useState(settings);
+  // 当前选中引擎（含 API-only 标记与接入默认值）。
+  const activeProvider = agentProviderById(draft.agentProvider);
   const [loginBusy, setLoginBusy] = useState(false);
   const [installBusy, setInstallBusy] = useState(false);
   const [installError, setInstallError] = useState("");
@@ -190,16 +182,12 @@ export default function SetupCenter({
   const [relayApiKey, setRelayApiKey] = useState("");
   const [diagnosing, setDiagnosing] = useState(false);
   const [report, setReport] = useState<DiagnosticReport | null>(null);
-  const [plaudCheck, setPlaudCheck] = useState<DiagnosticCheck | null>(null);
-  const [plaudChecking, setPlaudChecking] = useState(false);
-  const [plaudCheckedAt, setPlaudCheckedAt] = useState(0);
-  const [plaudStatus, setPlaudStatus] = useState("");
-  const [plaudAssistBusy, setPlaudAssistBusy] = useState(false);
-  const [plaudAssistMessage, setPlaudAssistMessage] = useState("");
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
   const [codexRuntime, setCodexRuntime] = useState<CodexRuntimeStatus | null>(null);
   const [codexRuntimeBusy, setCodexRuntimeBusy] = useState(false);
+  const [agentCliStatus, setAgentCliStatus] = useState<AgentCliStatus | null>(null);
+  const [agentCliChecking, setAgentCliChecking] = useState(false);
   const [outlookProfileBusy, setOutlookProfileBusy] = useState(false);
   const [feishuStatus, setFeishuStatus] = useState<FeishuSetupStatus | null>(null);
   const [feishuStatusBusy, setFeishuStatusBusy] = useState(false);
@@ -217,19 +205,22 @@ export default function SetupCenter({
   onDirtyChangeRef.current = onDirtyChange;
   const hasUnsavedChanges = JSON.stringify(draft) !== JSON.stringify(settings)
     || Boolean(relayApiKey.trim());
-  const connectionConfigFingerprint = codexConnectionConfigFingerprint({
-    authMode: draft.authMode,
-    apiBaseUrl: draft.apiBaseUrl,
-    apiModel: draft.apiModel,
-    relayCredentialConfigured: draft.relayCredentialConfigured,
-    codexPath: draft.codexPath,
-    relayApiKey,
-    runtimeAuthMode: codexStatus?.authMode,
-    runtimeApiBaseUrl: codexStatus?.apiBaseUrl,
-    runtimeModel: codexStatus?.configuredModel,
-    runtimePath: codexStatus?.path,
-    runtimeAccount: codexStatus?.account?.email
-  });
+const connectionConfigFingerprint = codexConnectionConfigFingerprint({
+authMode: draft.authMode,
+apiBaseUrl: draft.apiBaseUrl,
+apiModel: draft.apiModel,
+apiWireApi: draft.apiWireApi,
+relayCredentialConfigured: draft.relayCredentialConfigured,
+          codexPath: draft.codexPath,
+          agentProvider: draft.agentProvider,
+relayApiKey,
+runtimeAuthMode: codexStatus?.authMode,
+runtimeApiBaseUrl: codexStatus?.apiBaseUrl,
+runtimeApiWireApi: codexStatus?.apiWireApi,
+runtimeModel: codexStatus?.configuredModel,
+runtimePath: codexStatus?.path,
+runtimeAccount: codexStatus?.account?.email
+});
   const connectionConfigFingerprintRef = useRef(connectionConfigFingerprint);
   connectionConfigFingerprintRef.current = connectionConfigFingerprint;
 
@@ -522,274 +513,41 @@ export default function SetupCenter({
     return true;
   }
 
-  function selectTab(nextTab: "connection" | "data" | "plaud" | "updates" | "diagnostics") {
-    if (nextTab !== "connection") cancelConnectionTest({ silent: true });
-    setTab(nextTab);
-  }
-
-  async function saveConnection(continueToData: boolean) {
-    if (codexPathRequiresApply) {
-      const applied = await save(false);
-      if (applied) {
-        setConnectionVerified(false);
-        setError("");
-        setNotice("Codex 路径已应用并刷新运行状态。现在请测试完整连接；测试通过后即可继续。");
-      }
-      return;
-    }
-    if (!codexStatus?.path) {
-      setError("请先安装 Codex CLI。");
-      return;
-    }
-    if (!selectedConnectionReady) {
-      setError(draft.authMode === "relay"
-        ? "请先安全保存中转站配置并完成测试；无需登录 ChatGPT。"
-        : "请先完成 ChatGPT 登录并测试连接。");
-      return;
-    }
-    if (required && !connectionVerified) {
-      const verified = await testConnection();
-      if (!verified) return;
-    }
-    if (await save(false) && continueToData) setTab("data");
-  }
-
-  async function saveDataAndContinue() {
-    if (await save(false)) setTab("plaud");
-  }
-
-  async function checkOutlookProfile() {
-    if (!codexStatus?.ok) {
-      setError("Codex 尚未就绪，无法读取 Outlook 当前登录账号。");
-      return;
-    }
-    setOutlookProfileBusy(true);
-    setError("");
-    setNotice("正在通过 Outlook Calendar 只读检测当前发送账号…");
+  // 本地客户端状态卡：检测可执行文件、版本与登录态。
+  async function refreshAgentCliStatus(engineId?: "claude" | "workbuddy") {
+    const target = engineId || (activeProvider.id === "workbuddy" ? "workbuddy" : "claude");
+    if (!agentCliChecking) setAgentCliChecking(true);
     try {
-      const result = await workbench.runCodex({
-        runId: `outlook-profile-${Date.now()}`,
-        prompt: [
-          "DOMI_OUTLOOK_PROFILE_CHECK_V1",
-          "使用已安装 domi 插件中的 $schedule，只执行 Outlook 发送账号检测。",
-          "必须调用 Outlook Calendar 连接器的 get_profile；不得读取日程、不得创建或修改任何事件。",
-          "最终只输出单行 JSON，不要 Markdown、解释或脱敏：{\"email\":\"当前登录账号的完整邮箱\"}。",
-          "该结果由 domi 作为私密输出接收，只保存到本机 Application Support，不写入任务产物或日志。"
-        ].join("\n"),
-        requestText: "检测 Outlook 发送账号",
-        requestOrigin: "programmatic",
-        userInstructionText: "",
-        ephemeral: true,
-        background: true,
-        privateOutput: true,
-        workflowId: "schedule",
-        workspacePath: codexStatus.workspacePath
+      // 状态卡需要读取用户刚填的 CLI 路径：先落一次草稿再检测。
+      if (draft.claudeCliPath !== settings.claudeCliPath
+        || draft.workbuddyCliPath !== settings.workbuddyCliPath
+        || draft.workbuddyArgs !== settings.workbuddyArgs
+        || draft.claudeModel !== settings.claudeModel) {
+        await onSave({
+          claudeCliPath: draft.claudeCliPath,
+          workbuddyCliPath: draft.workbuddyCliPath,
+          workbuddyArgs: draft.workbuddyArgs,
+          claudeModel: draft.claudeModel
+        });
+      }
+      const status = await workbench.checkAgentCli(target);
+      setAgentCliStatus(status);
+    } catch (statusError) {
+      setAgentCliStatus({
+        ok: false,
+        engine: target,
+        detected: false,
+        path: "",
+        via: "",
+        version: "",
+        login: { loggedIn: null, detail: "" },
+        error: statusError instanceof Error ? statusError.message : String(statusError)
       });
-      if (!result.ok) {
-        setNotice("");
-        setError(result.error || "Outlook 当前登录账号检测失败。");
-        return;
-      }
-      const email = outlookProfileEmail(result.output || "");
-      if (!email) {
-        setNotice("");
-        setError("Outlook 未返回可识别的登录邮箱，请确认已连接自己的 Outlook Calendar 账号后重试。");
-        return;
-      }
-      const verifiedAt = Date.now();
-      const saved = await onSave({
-        outlookCalendarEmail: email,
-        outlookCalendarEmailVerifiedAt: verifiedAt
-      });
-      if (!saved.ok) {
-        setNotice("");
-        setError(saved.error || "已读取 Outlook 账号，但无法保存本机显示状态。");
-        return;
-      }
-      setDraft((current) => ({
-        ...current,
-        outlookCalendarEmail: email,
-        outlookCalendarEmailVerifiedAt: verifiedAt
-      }));
-      setNotice("已验证 Outlook 当前发送账号；实际发送前还会再次核对当前登录身份。");
-    } catch (profileError) {
-      setNotice("");
-      setError(profileError instanceof Error ? profileError.message : String(profileError));
     } finally {
-      setOutlookProfileBusy(false);
+      setAgentCliChecking(false);
     }
   }
 
-  async function checkPlaudConnection() {
-    setPlaudChecking(true);
-    setError("");
-    setNotice("");
-    try {
-      const browser = draft.plaudBrowser === "tabbit" ? "tabbit" : "chrome";
-      const saved = await onSave({ plaudConnectionMode: "enabled", plaudBrowser: browser });
-      if (!saved.ok) {
-        setError(saved.error || "无法保存 PLAUD 设置。");
-        return;
-      }
-      const result = await workbench.checkPlaudConnection({ browser });
-      setPlaudCheckedAt(result.checkedAt || Date.now());
-      setPlaudStatus(result.status || (result.connected ? "connected" : "unknown"));
-      const browserLabel = result.browserLabel || (browser === "tabbit" ? "Tabbit" : "Google Chrome");
-      const check = {
-        id: "plaud",
-        label: "PLAUD 录音转写",
-        ok: Boolean(result.ok && result.connected),
-        detail: result.ok && result.connected
-          ? `已通过 ${browserLabel} 只读验证当前 PLAUD 账号`
-          : result.error || `未检测到 ${browserLabel} 中的 PLAUD 登录`
-      };
-      setPlaudCheck(check);
-      if (!check?.ok) {
-        setError(check.detail);
-      } else {
-        setNotice(`${check.detail}，domi 可以读取该账号的录音队列。`);
-      }
-    } catch (diagnosticError) {
-      setError(diagnosticError instanceof Error ? diagnosticError.message : String(diagnosticError));
-    } finally {
-      setPlaudChecking(false);
-    }
-  }
-
-  async function loginPlaud() {
-    setPlaudChecking(true);
-    setError("");
-    setNotice("");
-    try {
-      const browser = draft.plaudBrowser === "tabbit" ? "tabbit" : "chrome";
-      const saved = await onSave({ plaudConnectionMode: "enabled", plaudBrowser: browser });
-      if (!saved.ok) {
-        setError(saved.error || "无法保存 PLAUD 设置。");
-        return;
-      }
-      const result = await workbench.loginPlaud({ browser });
-      setPlaudCheckedAt(result.checkedAt || Date.now());
-      setPlaudStatus(result.status || (result.connected ? "connected" : "unknown"));
-      const browserLabel = result.browserLabel || (browser === "tabbit" ? "Tabbit" : "Google Chrome");
-      const check = {
-        id: "plaud",
-        label: "PLAUD 录音转写",
-        ok: Boolean(result.ok && result.connected),
-        detail: result.ok && result.connected
-          ? `已通过 ${browserLabel} 登录并只读验证当前 PLAUD 账号`
-          : result.error || `${browserLabel} 中的 PLAUD 登录未完成`
-      };
-      setPlaudCheck(check);
-      if (check.ok) {
-        setPlaudAssistMessage("");
-        setNotice(`${check.detail}。`);
-      }
-      else setError(check.detail);
-    } catch (loginError) {
-      setError(loginError instanceof Error ? loginError.message : String(loginError));
-    } finally {
-      setPlaudChecking(false);
-    }
-  }
-
-  async function disconnectPlaud() {
-    setPlaudChecking(true);
-    setError("");
-    setNotice("");
-    try {
-      const browser = draft.plaudBrowser === "tabbit" ? "tabbit" : "chrome";
-      const result = await workbench.disconnectPlaud({ browser });
-      if (!result.ok) {
-        setError(result.error || "PLAUD 本地登录清理失败。");
-        return;
-      }
-      const saved = await onSave({ plaudConnectionMode: "disabled", plaudBrowser: browser });
-      if (!saved.ok) {
-        setError(saved.error || "PLAUD 已断开，但无法保存关闭状态。");
-        return;
-      }
-      setDraft((current) => ({ ...current, plaudConnectionMode: "disabled" }));
-      setPlaudCheck(null);
-      setPlaudCheckedAt(0);
-      setPlaudStatus("");
-      setPlaudAssistMessage("");
-      setNotice("已断开 PLAUD，并删除 domi 专用浏览器登录数据。");
-    } catch (disconnectError) {
-      setError(disconnectError instanceof Error ? disconnectError.message : String(disconnectError));
-    } finally {
-      setPlaudChecking(false);
-    }
-  }
-
-  async function assistPlaudConnection() {
-    if (!codexStatus?.ok) {
-      setError("Codex 尚未就绪，请先完成 Codex 连接。");
-      return;
-    }
-    const browser = draft.plaudBrowser === "tabbit" ? "tabbit" : "chrome";
-    const browserLabel = browser === "tabbit" ? "Tabbit" : "Google Chrome";
-    const currentError = error || plaudCheck?.detail || "PLAUD 连接未完成";
-    setPlaudAssistBusy(true);
-    setPlaudAssistMessage("");
-    setError("");
-    setNotice(`Codex 正在检查 ${browserLabel}、PLAUD 专用 Profile 和内置音频运行时…`);
-    try {
-      const result = await workbench.runCodex({
-        runId: `plaud-assist-${Date.now()}`,
-        prompt: [
-          "请协助当前用户完成 domi 的 PLAUD 连接。",
-          `用户选择的浏览器：${browser}（${browserLabel}）。`,
-          `当前脱敏错误：${currentError}`,
-          "",
-          "必须采用已安装 domi 插件中的 $plaud skill，并遵守其隐私与授权规则：",
-          `1. 先运行 doctor ${browser}，检查 domi 内置 ffmpeg/ffprobe、Playwright 和所选浏览器。`,
-          "2. 可以执行安全、可逆且仅作用于 domi 本地配置或 domi 专用 PLAUD Profile 的修复。",
-          `3. 运行 connection ${browser} 自动恢复并复检；本连接助手禁止运行 login ${browser}，也不得打开任何可见浏览器窗口。即使明确返回 PLAUD_AUTH_REQUIRED，也只报告“请用户主动点击登录并验证”。HTTP 401/403、页面加载、网络超时或未及时捕获授权请求不得自行触发登录。`,
-          `4. 完成后运行 connection ${browser} 做只读验证。`,
-          "5. 不得读取、复制或改动用户日常 Chrome/Tabbit Profile；不得输出 Cookie、鉴权头、账号标识或预签名 URL。",
-          "6. 不得提交或推送 Git，不得把本地配置写入仓库；安装第三方浏览器等系统级操作必须先让用户明确确认。",
-          "7. 如果仍需用户处理验证码、账号登录、网络代理或浏览器安装，请用简短步骤说明。",
-          "",
-          "最终只报告：已完成的检查/修复、当前连接状态、仍需用户做的动作。"
-        ].join("\n"),
-        requestText: "诊断并协助完成 PLAUD 连接",
-        requestOrigin: "programmatic",
-        userInstructionText: "",
-        ephemeral: true,
-        background: false,
-        workflowId: "plaud-connection-assist",
-        workspacePath: codexStatus.workspacePath
-      });
-      if (!result.ok) {
-        setError(result.error || "Codex 未能完成 PLAUD 连接诊断。");
-        return;
-      }
-      const message = String(result.output || "Codex 已完成检查。").trim().slice(0, 4000);
-      setPlaudAssistMessage(message);
-      const checked = await workbench.checkPlaudConnection({ browser });
-      const connected = Boolean(checked.ok && checked.connected);
-      const detail = connected
-        ? `已通过 ${checked.browserLabel || browserLabel} 只读验证当前 PLAUD 账号`
-        : checked.error || `${browserLabel} 中的 PLAUD 登录仍未完成`;
-      setPlaudCheck({
-        id: "plaud",
-        label: "PLAUD 录音转写",
-        ok: connected,
-        detail
-      });
-      if (connected) {
-        setNotice(`${detail}。`);
-        setError("");
-      } else {
-        setNotice("");
-        setError(detail);
-      }
-    } catch (assistError) {
-      setError(assistError instanceof Error ? assistError.message : String(assistError));
-    } finally {
-      setPlaudAssistBusy(false);
-    }
-  }
 
   async function startLogin() {
     if (connectionTestAttemptRef.current) return;
@@ -802,9 +560,11 @@ export default function SetupCenter({
       authMode: "chatgpt",
       apiBaseUrl: "",
       apiModel: "",
-      relayCredentialConfigured: false
+      apiWireApi: "responses",
+      relayCredentialConfigured: false,
+      agentProvider: "codex"
     }));
-    const saved = await onSave({ ...draft, authMode: "chatgpt" });
+    const saved = await onSave({ ...draft, authMode: "chatgpt", agentProvider: "codex" });
     if (!saved.ok) {
       setError(saved.error || "无法切换到 ChatGPT 登录模式。");
       setLoginBusy(false);
@@ -866,12 +626,13 @@ export default function SetupCenter({
       controller: new AbortController(),
       configFingerprint: connectionConfigFingerprintRef.current,
       kind: "relay-configure" as const,
-      expectedRuntime: codexConnectionRuntimeSnapshot({
-        authMode: "relay",
-        path: codexStatus?.path,
-        apiBaseUrl: draft.apiBaseUrl,
-        configuredModel: draft.apiModel
-      })
+    expectedRuntime: codexConnectionRuntimeSnapshot({
+      authMode: "relay",
+      path: codexStatus?.path,
+      apiBaseUrl: draft.apiBaseUrl,
+      apiWireApi: draft.apiWireApi,
+      configuredModel: draft.apiModel
+    })
     };
     connectionTestAttemptRef.current = attempt;
     setRelayBusy(true);
@@ -886,9 +647,11 @@ export default function SetupCenter({
           requestId: currentRequestId,
           baseUrl: draft.apiBaseUrl,
           model: draft.apiModel,
+          wireApi: draft.apiWireApi,
           apiKey: relayApiKey || undefined,
           keepExistingKey: !relayApiKey && draft.relayCredentialConfigured,
-          codexPath: draft.codexPath
+          codexPath: draft.codexPath,
+          agentProvider: draft.agentProvider
         }),
         cancel: (request) => workbench.cancelCodexConnectionTest(request),
         timeoutMs: CODEX_CONNECTION_TEST_UI_TIMEOUT_MS
@@ -927,6 +690,7 @@ export default function SetupCenter({
       const nextDraft = {
         ...draft,
         authMode: "relay" as const,
+        agentProvider: draft.agentProvider,
         apiBaseUrl: result.codex?.apiBaseUrl || draft.apiBaseUrl,
         apiModel: result.codex?.configuredModel || draft.apiModel,
         relayCredentialConfigured: true
@@ -956,6 +720,121 @@ export default function SetupCenter({
         connectionTestAttemptRef.current = null;
         setRelayBusy(false);
       }
+    }
+  }
+
+  // 引擎或模式变化时自动检测本地客户端（状态卡）。
+  useEffect(() => {
+    if (tab !== "connection" || !activeProvider.apiOnly || draft.authMode !== "agent-cli") return;
+    void refreshAgentCliStatus();
+  }, [tab, draft.agentProvider, draft.authMode]);
+
+
+  function selectTab(nextTab: "connection" | "data" | "updates" | "diagnostics") {
+    if (nextTab !== "connection") cancelConnectionTest({ silent: true });
+    setTab(nextTab);
+  }
+
+  async function saveConnection(continueToData: boolean) {
+    if (draft.authMode === "agent-cli") {
+      if (!activeProvider.apiOnly) {
+        setError("Codex 引擎不支持本地客户端模式，请选择 ChatGPT 或 API 接入。");
+        return;
+      }
+      const detected = agentCliStatus?.detected
+        && agentCliStatus.engine === activeProvider.id;
+      if (!detected) {
+        setError(`未检测到 ${activeProvider.label} 本地客户端。请先安装并登录其官方客户端，填写可执行文件路径后重新检测；或改用 API 接入。`);
+        return;
+      }
+      if (await save(continueToData)) return;
+      return;
+    }
+    if (codexPathRequiresApply) {
+      const applied = await save(false);
+      if (applied) {
+        setConnectionVerified(false);
+        setError("");
+        setNotice("Codex 路径已应用并刷新运行状态。现在请测试完整连接；测试通过后即可继续。");
+      }
+      return;
+    }
+    if (!codexStatus?.path) {
+      setError("请先安装 Codex CLI。");
+      return;
+    }
+    if (!selectedConnectionReady) {
+      setError(draft.authMode === "relay"
+        ? "请先安全保存 API 配置并完成测试；无需登录 ChatGPT。"
+        : "请先完成 ChatGPT 登录并测试连接。");
+      return;
+    }
+    if (required && !connectionVerified) {
+      const verified = await testConnection();
+      if (!verified) return;
+    }
+    if (await save(false) && continueToData) setTab("data");
+  }
+
+  async function checkOutlookProfile() {
+    if (!codexStatus?.ok) {
+      setError("Codex 尚未就绪，无法读取 Outlook 当前登录账号。");
+      return;
+    }
+    setOutlookProfileBusy(true);
+    setError("");
+    setNotice("正在通过 Outlook Calendar 只读检测当前发送账号…");
+    try {
+      const result = await workbench.runCodex({
+        runId: `outlook-profile-${Date.now()}`,
+        prompt: [
+          "DOMI_OUTLOOK_PROFILE_CHECK_V1",
+          "使用已安装 domi 插件中的 $schedule，只执行 Outlook 发送账号检测。",
+          "必须调用 Outlook Calendar 连接器的 get_profile；不得读取日程、不得创建或修改任何事件。",
+          "最终只输出单行 JSON，不要 Markdown、解释或脱敏：{\"email\":\"当前登录账号的完整邮箱\"}。",
+          "该结果由 domi 作为私密输出接收，只保存到本机 Application Support，不写入任务产物或日志。"
+        ].join("\n"),
+        requestText: "检测 Outlook 发送账号",
+        requestOrigin: "programmatic",
+        userInstructionText: "",
+        ephemeral: true,
+        background: true,
+        privateOutput: true,
+        workflowId: "schedule",
+        workspacePath: codexStatus.workspacePath
+      });
+      if (!result.ok) {
+        setNotice("");
+        setError(result.error || "Outlook 当前登录账号检测失败。");
+        return;
+      }
+      const email = outlookProfileEmail(result.output || "");
+      if (!email) {
+        setNotice("");
+        setError("Outlook 未返回可识别的登录邮箱，请确认已连接自己的 Outlook Calendar 账号后重试。");
+        return;
+      }
+      const verifiedAt = Date.now();
+      const saved = await onSave({
+        outlookCalendarEmail: email,
+        outlookCalendarEmailVerifiedAt: verifiedAt
+      });
+      if (!saved.ok) {
+        setNotice("");
+        setError(saved.error || "已读取 Outlook 账号，但无法保存本机显示状态。");
+        return;
+      }
+      setDraft((current) => ({
+        ...current,
+        outlookCalendarEmail: email,
+        outlookCalendarEmailVerifiedAt: verifiedAt
+      }));
+      setNotice("已验证 Outlook 当前发送账号；实际发送前还会再次核对当前登录身份。");
+    } catch (profileError) {
+      setNotice("");
+      setError(profileError instanceof Error ? profileError.message : String(profileError));
+    } finally {
+      setOutlookProfileBusy(false);
     }
   }
 
@@ -1216,17 +1095,31 @@ export default function SetupCenter({
     runtimePath: codexStatus?.path,
     relayApiKey
   });
+  const agentCliDraftReady = draft.authMode !== "agent-cli" || Boolean(
+    activeProvider.apiOnly
+    && agentCliStatus?.detected
+    && agentCliStatus.engine === activeProvider.id
+  );
   const relayDraftMatchesRuntime = draft.authMode !== "relay" || Boolean(
     draft.relayCredentialConfigured
     && draft.apiBaseUrl.trim() === codexStatus?.apiBaseUrl
     && draft.apiModel.trim() === codexStatus?.configuredModel
   );
   const selectedConnectionReady = Boolean(
-    codexStatus?.ok
+    draft.authMode === "agent-cli"
+      ? agentCliDraftReady
+      : codexStatus?.ok
     && codexStatus.authMode === draft.authMode
     && relayDraftMatchesRuntime
   );
-  const connectionDetail = selectedConnectionReady
+  const connectionDetail = draft.authMode === "agent-cli"
+    ? [agentCliStatus?.version, agentCliStatus?.path, agentCliStatus?.login?.detail]
+      .filter(Boolean)
+      .join(" · ")
+      || (agentCliStatus?.error
+        ? agentCliStatus.error
+        : "正在检测本地客户端…")
+    : selectedConnectionReady
     ? draft.authMode === "relay"
       ? [codexStatus?.configuredModel, codexStatus?.apiBaseUrl, codexStatus?.version].filter(Boolean).join(" · ")
       : [codexStatus?.account?.email, codexStatus?.account?.planType, codexStatus?.version].filter(Boolean).join(" · ")
@@ -1265,13 +1158,10 @@ export default function SetupCenter({
           </div>
           <nav>
             <button className={tab === "connection" ? "active" : ""} onClick={() => selectTab("connection")}>
-              <Settings2 size={16} />Codex 连接
+              <Settings2 size={16} />AI 引擎
             </button>
             <button className={tab === "data" ? "active" : ""} onClick={() => selectTab("data")}>
               <Database size={16} />资料连接
-            </button>
-            <button className={tab === "plaud" ? "active" : ""} onClick={() => selectTab("plaud")}>
-              <Mic size={16} />录音转写
             </button>
             <button className={tab === "updates" ? "active" : ""} onClick={() => selectTab("updates")}>
               <Download size={16} />软件更新
@@ -1282,7 +1172,7 @@ export default function SetupCenter({
           </nav>
           <div className="setup-security-note">
             <ShieldCheck size={15} />
-            <span>ChatGPT 登录由 Codex 管理；中转站密钥只保存在 macOS 钥匙串。</span>
+            <span>ChatGPT 登录由 Codex 管理；API 密钥只保存在本机系统安全存储。</span>
           </div>
         </aside>
 
@@ -1291,20 +1181,16 @@ export default function SetupCenter({
             <div>
               <span>{required ? "开始使用 domi" : "偏好设置"}</span>
               <h2>{tab === "connection"
-                ? "选择 Codex 连接方式"
+                ? "选择 AI 引擎与接入方式"
                 : tab === "data"
                   ? "配置 domi 资料库"
-                  : tab === "plaud"
-                    ? "连接 PLAUD"
                   : tab === "updates"
                     ? "软件更新"
                     : "系统诊断"}</h2>
               <p>{tab === "connection"
-                ? "domi 会自动准备 Codex CLI；你只需选择 ChatGPT 账号或 Responses 中转站。"
+              ? "domi 会自动准备本地运行时；选择 Codex、Claude 或 WorkBuddy 引擎，再选择各自的接入方式。"
                 : tab === "data"
                   ? "domi 默认使用本地 SQLite + Markdown；飞书可选连接，作为外部参考资料库和发布平台。配置仅保存在这台 Mac。"
-                : tab === "plaud"
-                  ? "PLAUD 仅用于把录音转成文字稿。现在不用可以直接跳过，domi 不会连接或读取录音。"
                 : tab === "updates"
                   ? "检查签名版本并更新程序本体；历史、工作区和本机配置会继续保留。"
                   : "检查 Codex、Keychain、本地数据库、工作区和 domi 插件。"}</p>
@@ -1348,6 +1234,46 @@ export default function SetupCenter({
                 )}
               </div>
 
+              <div className="agent-engine-options" role="radiogroup" aria-label="AI 引擎">
+                {AGENT_PROVIDERS.map((provider) => {
+                  const ProviderIcon = provider.id === "claude"
+                    ? Brain
+                    : provider.id === "workbuddy"
+                      ? UsersRound
+                      : Terminal;
+                  const providerSelected = draft.agentProvider === provider.id
+                    || (!draft.agentProvider && provider.id === "codex");
+                  return (
+                    <button
+                      key={provider.id}
+                      type="button"
+                      role="radio"
+                      aria-checked={providerSelected}
+                      className={providerSelected ? "selected" : ""}
+                      disabled={connectionOperationBusy}
+                      onClick={() => {
+                        setDraft((current) => ({
+                          ...current,
+                          ...agentProviderDraftPatch(provider.id, current),
+                          authMode: provider.apiOnly ? "agent-cli" : current.authMode
+                        }));
+                        setConnectionVerified(false);
+                        setError("");
+                        setNotice("");
+                      }}
+                    >
+                      <ProviderIcon size={17} />
+                      <span>
+                        <strong>{provider.label}</strong>
+                        <small>{provider.tagline}</small>
+                      </span>
+                      <i>{providerSelected ? <CheckCircle2 size={16} /> : null}</i>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {activeProvider.id === "codex" && (
               <div className="codex-mode-options" role="radiogroup" aria-label="Codex 连接方式（二选一）">
                 <button
                   type="button"
@@ -1390,39 +1316,205 @@ export default function SetupCenter({
                 >
                   <KeyRound size={18} />
                   <span>
-                    <strong>Responses 中转站</strong>
-                    <small>选择后只需保存中转站并通过测试，不要求登录 ChatGPT。</small>
+                    <strong>API 中转站</strong>
+                    <small>接入任何 OpenAI 兼容大模型 API（DeepSeek、Kimi、通义、GLM、聚合网关等），不要求登录 ChatGPT。</small>
                   </span>
                   <i>{draft.authMode === "relay" ? <CheckCircle2 size={17} /> : null}</i>
                 </button>
               </div>
+              )}
+
+              {activeProvider.apiOnly && (
+                <div className="agent-cli-mode-options" role="radiogroup" aria-label={`${activeProvider.label} 接入方式`}>
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={draft.authMode === "agent-cli"}
+                    className={draft.authMode === "agent-cli" ? "selected" : ""}
+                    disabled={connectionOperationBusy}
+                    onClick={() => {
+                      setDraft((current) => ({ ...current, authMode: "agent-cli" }));
+                      setConnectionVerified(false);
+                      setError("");
+                      setNotice("");
+                    }}
+                  >
+                    <Terminal size={17} />
+                    <span>
+                      <strong>本地客户端</strong>
+                      <small>复用你已登录的 {activeProvider.label} 桌面客户端，用订阅额度执行任务（推荐）。</small>
+                    </span>
+                    <i>{draft.authMode === "agent-cli" ? <CheckCircle2 size={16} /> : null}</i>
+                  </button>
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={draft.authMode === "relay"}
+                    className={draft.authMode === "relay" ? "selected" : ""}
+                    disabled={connectionOperationBusy}
+                    onClick={() => {
+                      setDraft((current) => ({ ...current, authMode: "relay" }));
+                      setConnectionVerified(false);
+                      setError("");
+                      setNotice("");
+                    }}
+                  >
+                    <KeyRound size={17} />
+                    <span>
+                      <strong>API 接入</strong>
+                      <small>用 {activeProvider.label} 的 OpenAI 兼容 API + 密钥，按 API 额度计费。</small>
+                    </span>
+                    <i>{draft.authMode === "relay" ? <CheckCircle2 size={16} /> : null}</i>
+                  </button>
+                </div>
+              )}
+
+              {draft.authMode === "agent-cli" && activeProvider.apiOnly && (
+                <div className="agent-cli-settings">
+                  <label>
+                    <span>{activeProvider.label} 可执行文件路径（可选）</span>
+                    <input
+                      value={activeProvider.id === "claude" ? draft.claudeCliPath : draft.workbuddyCliPath}
+                      onChange={(event) => {
+                        const value = event.target.value;
+                        setDraft((current) => activeProvider.id === "claude"
+                          ? { ...current, claudeCliPath: value }
+                          : { ...current, workbuddyCliPath: value });
+                        setConnectionVerified(false);
+                      }}
+                      placeholder="留空自动从 PATH 和常见安装位置检测"
+                      spellCheck={false}
+                      disabled={connectionOperationBusy}
+                    />
+                    <small>安装并登录 {activeProvider.label} 桌面客户端后保持默认即可；只有自动检测失败时才需要填写。</small>
+                  </label>
+                  {activeProvider.id === "claude" && (
+                    <label>
+                      <span>模型（可选）</span>
+                      <input
+                        value={draft.claudeModel}
+                        onChange={(event) => {
+                          setDraft((current) => ({ ...current, claudeModel: event.target.value }));
+                          setConnectionVerified(false);
+                        }}
+                        placeholder="留空使用账号默认模型，如 claude-sonnet-4-5"
+                        spellCheck={false}
+                        disabled={connectionOperationBusy}
+                      />
+                    </label>
+                  )}
+                  {activeProvider.id === "workbuddy" && (
+                    <label>
+                      <span>启动参数模板（可选）</span>
+                      <input
+                        value={draft.workbuddyArgs}
+                        onChange={(event) => {
+                          setDraft((current) => ({ ...current, workbuddyArgs: event.target.value }));
+                          setConnectionVerified(false);
+                        }}
+                        placeholder="如 run --model {model} --session {sessionId}"
+                        spellCheck={false}
+                        disabled={connectionOperationBusy}
+                      />
+                      <small>仅当 WorkBuddy 不是 Claude 兼容 CLI 时填写；{"{model}"} 与 {"{sessionId}"} 会被替换。</small>
+                    </label>
+                  )}
+                  <div className={`agent-cli-status-card ${agentCliStatus?.detected ? "ok" : agentCliStatus?.error ? "error" : ""}`}>
+                    <i>
+                      {agentCliChecking
+                        ? <LoaderCircle className="spinning" size={18} />
+                        : agentCliStatus?.detected
+                          ? <CheckCircle2 size={18} />
+                          : <CircleAlert size={18} />}
+                    </i>
+                    <div>
+                      <strong>{agentCliStatus?.detected
+                        ? `${activeProvider.label} 本地客户端已就绪`
+                        : agentCliStatus?.error || "尚未检测本地客户端"}</strong>
+                      <small>{[
+                        agentCliStatus?.version,
+                        agentCliStatus?.path,
+                        agentCliStatus?.login?.loggedIn === true
+                          ? agentCliStatus.login.detail
+                          : agentCliStatus?.login?.loggedIn === false
+                            ? agentCliStatus.login.detail
+                            : ""
+                      ].filter(Boolean).join(" · ")}</small>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (draft.authMode === "agent-cli") void refreshAgentCliStatus();
+                        else testConnection();
+                      }}
+                      disabled={draft.authMode === "agent-cli"
+                        ? agentCliChecking
+                        : Boolean(connectionTestBlockReason) || !codexInstalled || (draft.authMode === "relay" && !draft.relayCredentialConfigured)}
+                    >
+                      {agentCliChecking ? "检测中" : "重新检测"}
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {draft.authMode === "relay" && (
                 <div className="relay-settings">
                   <label>
-                    <span>中转站地址</span>
+                    <span>{activeProvider.apiOnly ? `${activeProvider.label} API 地址` : "中转站地址"}</span>
                     <input
                       value={draft.apiBaseUrl}
                       onChange={(event) => {
                         setDraft((current) => ({ ...current, apiBaseUrl: event.target.value }));
                         setConnectionVerified(false);
                       }}
-                      placeholder="https://relay.example.com/v1"
+                      placeholder={activeProvider.baseUrlPlaceholder}
                       spellCheck={false}
                       disabled={connectionOperationBusy}
                     />
-                    <small>必须支持 OpenAI Responses API；普通 Chat Completions 接口不能提供完整 Codex 能力。</small>
+                    <small>{activeProvider.baseUrlHint}</small>
                   </label>
+                  {activeProvider.id === "codex" && (
+                  <div className="relay-wire-api" role="radiogroup" aria-label="接口协议">
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-checked={draft.apiWireApi !== "chat"}
+                      className={draft.apiWireApi !== "chat" ? "selected" : ""}
+                      disabled={connectionOperationBusy}
+                      onClick={() => {
+                        setDraft((current) => ({ ...current, apiWireApi: "responses" }));
+                        setConnectionVerified(false);
+                      }}
+                    >
+                      <strong>Responses API</strong>
+                      <small>OpenAI 新协议，完整 Codex 能力（推理摘要、工具编排）；适用于官方或高兼容中转</small>
+                    </button>
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-checked={draft.apiWireApi === "chat"}
+                      className={draft.apiWireApi === "chat" ? "selected" : ""}
+                      disabled={connectionOperationBusy}
+                      onClick={() => {
+                        setDraft((current) => ({ ...current, apiWireApi: "chat" }));
+                        setConnectionVerified(false);
+                      }}
+                    >
+                      <strong>Chat Completions</strong>
+                      <small>通用 OpenAI 兼容协议，DeepSeek、Kimi、通义、GLM 及多数聚合网关都支持</small>
+                    </button>
+                  </div>
+                  )}
                   <div>
                     <label>
-                      <span>模型名称</span>
+                      <span>{activeProvider.apiOnly ? "模型 ID" : "模型名称"}</span>
                       <input
                         value={draft.apiModel}
                         onChange={(event) => {
                           setDraft((current) => ({ ...current, apiModel: event.target.value }));
                           setConnectionVerified(false);
                         }}
-                        placeholder="中转站支持的模型 ID"
+                        placeholder={activeProvider.modelPlaceholder}
                         spellCheck={false}
                         disabled={connectionOperationBusy}
                       />
@@ -1436,7 +1528,7 @@ export default function SetupCenter({
                           setRelayApiKey(event.target.value);
                           setConnectionVerified(false);
                         }}
-                        placeholder={draft.relayCredentialConfigured ? "已保存在 macOS 钥匙串，留空则沿用" : "仅保存到 macOS 钥匙串"}
+                        placeholder={draft.relayCredentialConfigured ? "已保存到系统安全存储，留空则沿用" : "仅保存到系统安全存储"}
                         autoComplete="new-password"
                         spellCheck={false}
                         disabled={connectionOperationBusy}
@@ -1464,9 +1556,19 @@ export default function SetupCenter({
                     {selectedConnectionReady ? <BadgeCheck size={20} /> : <CircleAlert size={20} />}
                   </i>
                   <div>
-                    <small>{draft.authMode === "relay" ? "Responses 中转站" : "ChatGPT / Codex"}</small>
+                    <small>{draft.authMode === "agent-cli"
+                      ? `${activeProvider.label} 本地客户端`
+                      : activeProvider.apiOnly
+                        ? `${activeProvider.label} API`
+                        : draft.authMode === "relay"
+                          ? (draft.apiWireApi === "chat" ? "Chat Completions 中转站" : "Responses 中转站")
+                          : "ChatGPT / Codex"}</small>
                     <strong>{selectedConnectionReady
-                      ? draft.authMode === "relay" ? "中转站配置已就绪" : "ChatGPT 身份已就绪"
+                      ? draft.authMode === "agent-cli"
+                        ? `${activeProvider.label} 客户端已就绪`
+                        : activeProvider.apiOnly
+                        ? `${activeProvider.label} 接入已就绪`
+                        : draft.authMode === "relay" ? "中转站配置已就绪" : "ChatGPT 身份已就绪"
                       : "尚未检测到可用连接"}</strong>
                     <span>{connectionDetail}</span>
                   </div>
@@ -1493,10 +1595,10 @@ export default function SetupCenter({
                   ) : (
                     <button
                       type="button"
-                      onClick={testConnection}
-                      disabled={Boolean(connectionTestBlockReason) || !codexInstalled || (draft.authMode === "relay" && !draft.relayCredentialConfigured)}
+                      onClick={() => void refreshAgentCliStatus()}
+                      disabled={agentCliChecking}
                     >
-                      <RefreshCw size={15} />测试完整连接
+                      <RefreshCw size={15} className={agentCliChecking ? "spinning" : ""} />{draft.authMode === "agent-cli" ? "检测本地客户端" : "测试完整连接"}
                     </button>
                   )}
                 </div>
@@ -1532,6 +1634,40 @@ export default function SetupCenter({
                   <span>
                     <strong>始终允许外部数据访问</strong>
                     <small>允许 Codex 直接读取飞书、Wiki 和所选本地资料库，不再逐次询问。</small>
+                  </span>
+                  <i aria-hidden="true"><b /></i>
+                </button>
+                <button
+                  className={`permission-setting ${draft.documentSearchCloudContent ? "enabled" : ""}`}
+                  type="button"
+                  role="switch"
+                  aria-checked={draft.documentSearchCloudContent === true}
+                  onClick={() => setDraft((current) => ({
+                    ...current,
+                    documentSearchCloudContent: current.documentSearchCloudContent !== true
+                  }))}
+                >
+                  <ShieldCheck size={17} />
+                  <span>
+                    <strong>索引云盘资料库正文</strong>
+                    <small>默认跳过 OneDrive/Dropbox 等云盘目录的正文索引，避免触发整库按需下载；开启后会读取并下载云盘文件。</small>
+                  </span>
+                  <i aria-hidden="true"><b /></i>
+                </button>
+                <button
+                  className={`permission-setting ${draft.semanticSearchEnabled !== false ? "enabled" : ""}`}
+                  type="button"
+                  role="switch"
+                  aria-checked={draft.semanticSearchEnabled !== false}
+                  onClick={() => setDraft((current) => ({
+                    ...current,
+                    semanticSearchEnabled: current.semanticSearchEnabled === false
+                  }))}
+                >
+                  <ShieldCheck size={17} />
+                  <span>
+                    <strong>语义检索（本地向量模型）</strong>
+                    <small>在关键词检索之外启用本地向量化语义召回，提升大资料库下的命中质量。首次使用会在后台下载约 120MB 的本地模型，全部在本机运行，不上传任何文档内容。</small>
                   </span>
                   <i aria-hidden="true"><b /></i>
                 </button>
@@ -1765,160 +1901,6 @@ export default function SetupCenter({
               </section>
               {(error || notice) && <div className={`setup-feedback ${error ? "error" : "success"}`}>{error || notice}</div>}
             </div>
-          ) : tab === "plaud" ? (
-            <div className="setup-form plaud-connection-form">
-              <div className="plaud-mode-options" role="radiogroup" aria-label="PLAUD 使用方式">
-                <button
-                  type="button"
-                  role="radio"
-                  aria-checked={draft.plaudConnectionMode === "enabled"}
-                  className={draft.plaudConnectionMode === "enabled" ? "selected" : ""}
-                  onClick={() => {
-                    setDraft((current) => ({ ...current, plaudConnectionMode: "enabled" }));
-                    setPlaudCheck(null);
-                    setPlaudAssistMessage("");
-                    setError("");
-                    setNotice("");
-                  }}
-                >
-                  <Mic size={20} />
-                  <span>
-                    <strong>连接 PLAUD</strong>
-                    <small>读取 PLAUD 最近录音，并可生成文字稿、纪要和入库结果。</small>
-                  </span>
-                  <i>{draft.plaudConnectionMode === "enabled" ? <CheckCircle2 size={17} /> : null}</i>
-                </button>
-                <button
-                  type="button"
-                  role="radio"
-                  aria-checked={draft.plaudConnectionMode === "disabled"}
-                  className={draft.plaudConnectionMode === "disabled" ? "selected" : ""}
-                  onClick={() => {
-                    setDraft((current) => ({ ...current, plaudConnectionMode: "disabled" }));
-                    setPlaudCheck(null);
-                    setPlaudAssistMessage("");
-                    setError("");
-                    setNotice("已选择暂时不用；之后可在设置的“录音转写”中重新开启。");
-                  }}
-                >
-                  <ShieldCheck size={20} />
-                  <span>
-                    <strong>暂时不用</strong>
-                    <small>不检测 PLAUD、不读取录音队列，也不会显示授权或连接错误。</small>
-                  </span>
-                  <i>{draft.plaudConnectionMode === "disabled" ? <CheckCircle2 size={17} /> : null}</i>
-                </button>
-              </div>
-
-              {draft.plaudConnectionMode === "enabled" ? (
-                <div className={`plaud-setup-panel ${plaudCheck?.ok ? "ok" : ""}`}>
-                  <div className="plaud-browser-options" role="radiogroup" aria-label="PLAUD 登录浏览器">
-                    <button
-                      type="button"
-                      role="radio"
-                      aria-checked={draft.plaudBrowser === "chrome"}
-                      className={draft.plaudBrowser === "chrome" ? "selected" : ""}
-                      onClick={() => {
-                        setDraft((current) => ({ ...current, plaudBrowser: "chrome" }));
-                        setPlaudCheck(null);
-                        setPlaudAssistMessage("");
-                        setError("");
-                        setNotice("");
-                      }}
-                    >
-                      <strong>Google Chrome</strong>
-                      <small>使用 domi 专用 Chrome Profile</small>
-                    </button>
-                    <button
-                      type="button"
-                      role="radio"
-                      aria-checked={draft.plaudBrowser === "tabbit"}
-                      className={draft.plaudBrowser === "tabbit" ? "selected" : ""}
-                      onClick={() => {
-                        setDraft((current) => ({ ...current, plaudBrowser: "tabbit" }));
-                        setPlaudCheck(null);
-                        setPlaudAssistMessage("");
-                        setError("");
-                        setNotice("");
-                      }}
-                    >
-                      <strong>Tabbit</strong>
-                      <small>使用 domi 专用 Tabbit Profile</small>
-                    </button>
-                  </div>
-                  <div className="plaud-setup-copy">
-                    <span className="plaud-setup-icon">
-                      {plaudCheck?.ok ? <BadgeCheck size={21} /> : <Mic size={21} />}
-                    </span>
-                    <div>
-                      <strong>{plaudCheck?.ok
-                        ? "PLAUD 已连接"
-                        : `使用 ${draft.plaudBrowser === "tabbit" ? "Tabbit" : "Chrome"} 登录 PLAUD`}</strong>
-                      <small>{plaudCheck?.detail
-                        || "domi 会打开独立的本地浏览器 Profile；请登录你自己的 PLAUD 账号，不读取日常浏览器 Profile。"}</small>
-                      {plaudCheckedAt ? (
-                        <small>
-                          最近检测：{outlookVerificationTime(plaudCheckedAt)}
-                          {plaudStatus && plaudStatus !== "connected"
-                            ? ` · ${plaudStatusLabel(plaudStatus)}`
-                            : ""}
-                        </small>
-                      ) : null}
-                    </div>
-                  </div>
-                  <ol>
-                    <li>domi 已内置离线音频转换组件，新用户不需要安装 Homebrew 或 ffmpeg。</li>
-                    <li>点击“登录并验证”，在打开的专用窗口中登录自己的 PLAUD 账号。</li>
-                    <li>domi 会发起一次只读远端请求，确认该账号确实可以读取录音。</li>
-                    <li>登录数据只保存在本机 domi Application Support；不会读取或复制 Chrome/Tabbit 的日常 Profile。</li>
-                  </ol>
-                  <div className="setup-inline-actions">
-                    <button type="button" onClick={loginPlaud} disabled={plaudChecking}>
-                      {plaudChecking ? <LoaderCircle className="spinning" size={15} /> : <ExternalLink size={15} />}
-                      登录并验证
-                    </button>
-                    <button type="button" onClick={checkPlaudConnection} disabled={plaudChecking}>
-                      {plaudChecking ? <LoaderCircle className="spinning" size={15} /> : <RefreshCw size={15} />}
-                      重新检测
-                    </button>
-                    <button type="button" onClick={disconnectPlaud} disabled={plaudChecking}>
-                      <ShieldCheck size={15} />断开并清除登录
-                    </button>
-                    {(error || (plaudCheck && !plaudCheck.ok)) && codexStatus?.ok ? (
-                      <button
-                        type="button"
-                        onClick={assistPlaudConnection}
-                        disabled={plaudChecking || plaudAssistBusy}
-                      >
-                        {plaudAssistBusy
-                          ? <LoaderCircle className="spinning" size={15} />
-                          : <Sparkles size={15} />}
-                        {plaudAssistBusy ? "Codex 正在处理" : "让 Codex 帮我解决"}
-                      </button>
-                    ) : null}
-                  </div>
-                  {plaudAssistMessage ? (
-                    <div className="plaud-assist-result">
-                      <strong>Codex 连接助手</strong>
-                      <p>{plaudAssistMessage}</p>
-                    </div>
-                  ) : null}
-                </div>
-              ) : draft.plaudConnectionMode === "disabled" ? (
-                <div className="plaud-skip-note">
-                  <ShieldCheck size={19} />
-                  <span>
-                    <strong>PLAUD 保持关闭</strong>
-                    <small>本地资料库、飞书资料库、行业动态和其他 domi 能力仍可正常使用。</small>
-                  </span>
-                </div>
-              ) : (
-                <div className="plaud-choice-note">
-                  请选择“连接 PLAUD”或“暂时不用”后继续。
-                </div>
-              )}
-              {(error || notice) && <div className={`setup-feedback ${error ? "error" : "success"}`}>{error || notice}</div>}
-            </div>
           ) : tab === "updates" ? (
             <div className="update-view">
               <div className={`update-summary ${updateStatus?.state === "error" ? "error" : ""}`}>
@@ -2054,8 +2036,6 @@ export default function SetupCenter({
               ? "更改连接会重启本地 Codex 服务，不影响 domi 中的对话记录。"
               : tab === "data"
                 ? "配置保存在 Application Support；覆盖安装和自动更新会继续沿用，无需重复配置。"
-              : tab === "plaud"
-                ? "PLAUD 登录只保存在本机 domi 专用浏览器 Profile；不会进入插件、Git 或诊断报告。"
               : tab === "updates"
                 ? "更新包必须通过 Developer ID 签名与 Apple 公证。"
                 : "诊断报告不包含登录令牌或 Base 标识。"}</span>
@@ -2066,7 +2046,8 @@ export default function SetupCenter({
                 onClick={() => connectionOperationBusy
                   ? cancelConnectionTest()
                   : saveConnection(required)}
-                disabled={saving || installBusy || (!codexInstalled && !codexPathRequiresApply)}
+                disabled={saving || installBusy
+                  || (!codexInstalled && !codexPathRequiresApply && draft.authMode !== "agent-cli")}
               >
                 {saving && <LoaderCircle className="spinning" size={16} />}
                 {connectionOperationBusy
@@ -2082,28 +2063,15 @@ export default function SetupCenter({
               <button
                 className="setup-primary"
                 type="button"
-                onClick={required ? saveDataAndContinue : () => save(false)}
+                onClick={() => save(required)}
                 disabled={saving || feishuAuthBusy}
               >
                 {(saving || feishuAuthBusy) && <LoaderCircle className="spinning" size={16} />}
                 {feishuAuthBusy
                   ? "正在连接飞书…"
                   : required
-                    ? "下一步：录音转写"
+                    ? "保存并进入 domi"
                     : "保存资料连接"}
-              </button>
-            )}
-            {tab === "plaud" && (
-              <button
-                className="setup-primary"
-                type="button"
-                onClick={() => save(required)}
-                disabled={saving
-                  || draft.plaudConnectionMode === "unconfigured"
-                  || (draft.plaudConnectionMode === "enabled" && !plaudCheck?.ok)}
-              >
-                {saving && <LoaderCircle className="spinning" size={16} />}
-                {required ? "保存并进入 domi" : "保存 PLAUD 设置"}
               </button>
             )}
             {tab === "updates" && (

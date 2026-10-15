@@ -92,7 +92,7 @@ test("state store migrates legacy snapshots and writes only changed threads", as
     assert.ok(fs.readdirSync(path.join(root, "backups")).some((name) => name.endsWith(".sqlite3")));
   } finally {
     store.close();
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
   }
 });
 
@@ -142,7 +142,7 @@ test("generic tasks use isolated hidden runtimes while entity tasks keep their c
     assert.equal(fs.existsSync(path.join(normalized.threads[0].workspacePath, "outputs")), true);
   } finally {
     store.close();
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
   }
 });
 
@@ -180,7 +180,7 @@ test("reopening an untouched new-task draft does not create a task workspace", (
     assert.deepEqual(fs.readdirSync(projectsDir), []);
   } finally {
     store.close();
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
   }
 });
 
@@ -202,7 +202,7 @@ test("cache pruning is scoped by prefix and retains only the newest entries", as
     assert.deepEqual(store.loadCache("other-cache")?.value, { value: "keep" });
   } finally {
     store.close();
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
   }
 });
 
@@ -232,6 +232,6 @@ test("cache compare-and-swap rejects a stale concurrent writer", () => {
     );
   } finally {
     store.close();
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
   }
 });

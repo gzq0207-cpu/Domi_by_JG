@@ -21,14 +21,17 @@ type BoundedCodexConnectionTestOptions = {
 };
 
 type CodexConnectionFingerprintInput = {
+  agentProvider?: string;
   authMode?: string;
   apiBaseUrl?: string;
   apiModel?: string;
+  apiWireApi?: string;
   relayCredentialConfigured?: boolean;
   codexPath?: string;
   relayApiKey?: string;
   runtimeAuthMode?: string;
   runtimeApiBaseUrl?: string;
+  runtimeApiWireApi?: string;
   runtimeModel?: string;
   runtimePath?: string;
   runtimeAccount?: string;
@@ -38,6 +41,7 @@ export type CodexConnectionRuntimeSnapshot = {
   authMode: string;
   path: string;
   apiBaseUrl: string;
+  apiWireApi: string;
   configuredModel: string;
 };
 
@@ -84,12 +88,14 @@ export function codexConnectionRuntimeSnapshot(input: {
   authMode?: string;
   path?: string;
   apiBaseUrl?: string;
+  apiWireApi?: string;
   configuredModel?: string;
 }): CodexConnectionRuntimeSnapshot {
   return {
     authMode: String(input.authMode || "").trim(),
     path: String(input.path || "").trim(),
     apiBaseUrl: normalizedRelayUrl(input.apiBaseUrl),
+    apiWireApi: String(input.apiWireApi || "").trim(),
     configuredModel: String(input.configuredModel || "").trim()
   };
 }
@@ -100,6 +106,7 @@ export function codexConnectionRuntimeMatchesSnapshot(
     authMode?: string;
     path?: string;
     apiBaseUrl?: string;
+    apiWireApi?: string;
     configuredModel?: string;
   } | null | undefined
 ): boolean {
@@ -108,6 +115,7 @@ export function codexConnectionRuntimeMatchesSnapshot(
   return expected.authMode === normalizedActual.authMode
     && expected.path === normalizedActual.path
     && expected.apiBaseUrl === normalizedActual.apiBaseUrl
+    && expected.apiWireApi === normalizedActual.apiWireApi
     && expected.configuredModel === normalizedActual.configuredModel;
 }
 
@@ -118,11 +126,14 @@ export function codexConnectionConfigFingerprint(
     String(input.authMode || ""),
     String(input.apiBaseUrl || "").trim(),
     String(input.apiModel || "").trim(),
+    String(input.apiWireApi || ""),
     Boolean(input.relayCredentialConfigured),
     String(input.codexPath || "").trim(),
+    String(input.agentProvider || ""),
     String(input.relayApiKey || ""),
     String(input.runtimeAuthMode || ""),
     String(input.runtimeApiBaseUrl || "").trim(),
+    String(input.runtimeApiWireApi || ""),
     String(input.runtimeModel || "").trim(),
     String(input.runtimePath || "").trim(),
     String(input.runtimeAccount || "").trim()

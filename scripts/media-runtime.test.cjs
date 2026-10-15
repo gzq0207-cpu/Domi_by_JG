@@ -53,8 +53,9 @@ test("media runtime target architecture and output directories are explicit", ()
   assert.equal(resolveTargetArchitecture("arm64"), "arm64");
   assert.equal(resolveTargetArchitecture("x64"), "x64");
   assert.throws(() => resolveTargetArchitecture("universal"), /Unsupported media runtime architecture/);
-  assert.match(outputRootForArchitecture("arm64"), /build\/media-runtime-arm64$/);
-  assert.match(outputRootForArchitecture("x64"), /build\/media-runtime-x64$/);
+  const separatorPattern = path.sep === "\\" ? "\\\\" : "/";
+  assert.match(outputRootForArchitecture("arm64"), new RegExp(`build${separatorPattern}media-runtime-arm64$`));
+  assert.match(outputRootForArchitecture("x64"), new RegExp(`build${separatorPattern}media-runtime-x64$`));
 });
 
 test("media runtime cache identity includes the deployment target", () => {
@@ -121,6 +122,12 @@ test("media runtime resolver prefers the packaged resource binaries", (t) => {
 });
 
 test("media runtime resolver rejects symlinked executables", (t) => {
+  if (process.platform === "win32") {
+    // 创建文件符号链接在 Windows 需要管理员权限或开发者模式，
+    // 该场景仅对 POSIX 运行时有意义。
+    t.skip("symlink-based media runtime layout requires POSIX privileges");
+    return;
+  }
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "domi-media-runtime-link-test-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const binDirectory = path.join(root, "build", "media-runtime", "bin");

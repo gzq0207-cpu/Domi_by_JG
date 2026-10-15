@@ -5,7 +5,17 @@ const {
 } = require("./codex-protocol.cjs");
 
 function threadPersistenceOptions(payload = {}) {
-  return payload.ephemeral === true ? { ephemeral: true } : {};
+  return payload.ephemeral === true || payload.sourceScope === "selected" || payload.sourceScope === "library" ? { ephemeral: true } : {};
+}
+
+function sourceScopedThreadKey(workspacePath, sandbox, payload = {}) {
+  // Restricted turns never resume history. Ordinary turns still keep a
+  // separate runtime key for web-disabled and web-enabled configurations.
+  return `${workspacePath}\u0000${sandbox}\u0000${payload.webSearch === false ? "offline" : "web"}\u0000${payload.sourceScope || "legacy"}`;
+}
+
+function sourceScopeAllowsResume(payload = {}) {
+  return payload.ephemeral !== true && payload.sourceScope !== "selected" && payload.sourceScope !== "library";
 }
 
 function codexRunExecutionMode(payload = {}) {
@@ -222,5 +232,7 @@ module.exports = {
   requestCodexTurn,
   resolveCodexActiveRun,
   runtimeAdditionalContext,
-  threadPersistenceOptions
+  threadPersistenceOptions,
+  sourceScopedThreadKey,
+  sourceScopeAllowsResume
 };
