@@ -1,6 +1,6 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertCircle, FileText, X } from "lucide-react";
-import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform, type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { workbench } from "./bridge";
 import type { LibraryCitation, LibraryUsage } from "./env";
@@ -35,7 +35,10 @@ const MessageContent = memo(function MessageContent({ message, onOpenDocument }:
   const requestSequence = useRef(0);
   const panelRef = useRef<HTMLElement>(null);
   const openerRef = useRef<HTMLButtonElement | null>(null);
-  const citations = message.libraryUsage?.citations || [];
+  const messageRef = useRef(message);
+  const openDocumentRef = useRef(onOpenDocument);
+  messageRef.current = message;
+  openDocumentRef.current = onOpenDocument;
   useEffect(() => () => { requestSequence.current += 1; }, [message.runId]);
 
   function closeInspector() {
@@ -46,7 +49,7 @@ const MessageContent = memo(function MessageContent({ message, onOpenDocument }:
     openerRef.current?.focus();
   }
 
-  async function inspectCitation(citation: LibraryCitation, opener: HTMLButtonElement) {
+  const inspectCitation = useCallback(async (citation: LibraryCitation, opener: HTMLButtonElement) => {
     const sequence = ++requestSequence.current;
     openerRef.current = opener;
     setInspected(citation);
@@ -55,8 +58,9 @@ const MessageContent = memo(function MessageContent({ message, onOpenDocument }:
     setChecking(true);
     window.setTimeout(() => panelRef.current?.focus(), 0);
     try {
-      if (!message.runId) throw new Error("这条历史回答没有运行标识，只能查看已保存的引文，不能核验当前版本。");
-      const result = await workbench.verifyLibraryCitation({ runId: message.runId, citationId: citation.id });
+      const runId = messageRef.current.runId;
+      if (!runId) throw new Error("这条历史回答没有运行标识，只能查看已保存的引文，不能核验当前版本。");
+      const result = await workbench.verifyLibraryCitation({ runId, citationId: citation.id });
       if (sequence !== requestSequence.current) return;
       if (!result.ok || !result.citation || result.citation.id !== citation.id) throw new Error(result.error || "无法核验当前来源版本。");
       setInspected(result.citation);
@@ -64,7 +68,7 @@ const MessageContent = memo(function MessageContent({ message, onOpenDocument }:
     } catch (error) {
       if (sequence === requestSequence.current) setCheckError(error instanceof Error ? error.message : String(error));
     } finally { if (sequence === requestSequence.current) setChecking(false); }
-  }
+  }, []);
 
   async function openInspectedSource() {
     if (!inspected || !message.runId || !currentChecked || checking) return;
@@ -86,6 +90,42 @@ const MessageContent = memo(function MessageContent({ message, onOpenDocument }:
     } finally { if (sequence === requestSequence.current) setChecking(false); }
   }
 
+  // Keep Markdown element component identities stable. Focusing a citation
+  // updates the parent's focus state before mouseup; replacing the button at
+  // that point loses its click and makes the evidence inspector unreachable.
+  const markdownComponents = useMemo<Components>(() => ({
+    table: ({ children, node: _node, ...props }) => (
+      <div className="markdown-table-scroll" role="region" aria-label="表格，可左右滚动" tabIndex={0}>
+        <table {...props}>{children}</table>
+      </div>
+    ),
+    a: ({ href, children, title }) => {
+      const evidenceId = domiEvidenceId(href);
+      if (evidenceId) {
+        const citations = messageRef.current.libraryUsage?.citations || [];
+        const index = citations.findIndex((citation) => citation.id === evidenceId);
+        const citation = citations[index];
+        return <button type="button" className={`message-evidence-citation ${citation?.status === "verified" ? "" : "unverified"}`}
+          disabled={!citation} aria-label={citation ? `查看引用 ${index + 1}：${citation.title}` : "引用未核验"}
+          title={citation ? `${citation.title} · ${citation.kind === "inference" ? "分析推断" : "事实转述"} · 点击查看原文与核验结果` : "引用没有对应的宿主证据记录"}
+          onClick={(event) => { if (citation) void inspectCitation(citation, event.currentTarget); }}>
+          {citation ? `[${index + 1}]` : "[引用未核验]"}
+        </button>;
+      }
+      const citationPath = codexFileCitationPath(href);
+      const target = citationPath || href || "";
+      return <a href={href} title={citationPath || title || href} className={citationPath ? "message-file-citation" : undefined}
+        onClick={(event) => {
+          event.preventDefault();
+          if (!target) return;
+          if (isLocalMarkdownResource(target) || isLocalPdfResource(target)) openDocumentRef.current(target);
+          else void workbench.openResource(target);
+        }}>
+        {citationPath && <FileText size={14} aria-hidden="true" />}<span>{children}</span>
+      </a>;
+    }
+  }), [inspectCitation]);
+
   if (message.role !== "assistant") return <div className="message-text">{message.content}</div>;
   const displayContent = humanizeMessageStates(stripDomiEntityResultMarker(message.content));
   const audit = message.libraryUsage?.citationCheck;
@@ -104,37 +144,7 @@ const MessageContent = memo(function MessageContent({ message, onOpenDocument }:
           if (key === "href" && (isLocalMarkdownResource(url) || isLocalPdfResource(url))) return url;
           return defaultUrlTransform(url);
         }}
-        components={{
-          table: ({ children, node: _node, ...props }) => (
-            <div className="markdown-table-scroll" role="region" aria-label="表格，可左右滚动" tabIndex={0}>
-              <table {...props}>{children}</table>
-            </div>
-          ),
-          a: ({ href, children, title }) => {
-            const evidenceId = domiEvidenceId(href);
-            if (evidenceId) {
-              const index = citations.findIndex((citation) => citation.id === evidenceId);
-              const citation = citations[index];
-              return <button type="button" className={`message-evidence-citation ${citation?.status === "verified" ? "" : "unverified"}`}
-                disabled={!citation} aria-label={citation ? `查看引用 ${index + 1}：${citation.title}` : "引用未核验"}
-                title={citation ? `${citation.title} · ${citation.kind === "inference" ? "分析推断" : "事实转述"} · 点击查看原文与核验结果` : "引用没有对应的宿主证据记录"}
-                onClick={(event) => { if (citation) void inspectCitation(citation, event.currentTarget); }}>
-                {citation ? `[${index + 1}]` : "[引用未核验]"}
-              </button>;
-            }
-            const citationPath = codexFileCitationPath(href);
-            const target = citationPath || href || "";
-            return <a href={href} title={citationPath || title || href} className={citationPath ? "message-file-citation" : undefined}
-              onClick={(event) => {
-                event.preventDefault();
-                if (!target) return;
-                if (isLocalMarkdownResource(target) || isLocalPdfResource(target)) onOpenDocument(target);
-                else void workbench.openResource(target);
-              }}>
-              {citationPath && <FileText size={14} aria-hidden="true" />}<span>{children}</span>
-            </a>;
-          }
-        }}
+        components={markdownComponents}
       >{displayContent}</ReactMarkdown>
       {inspected && <section className="message-evidence-inspector" aria-label="引用原文回查" tabIndex={-1} ref={panelRef}
         onKeyDown={(event) => { if (event.key === "Escape") closeInspector(); }}>

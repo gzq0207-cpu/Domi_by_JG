@@ -28,6 +28,8 @@ export function isLocalPdfResource(resource?: string) {
   );
 }
 
+export function isLocalWordResource(resource?:string) {return /\.(?:docx|doc)(?:(?::\d+(?::\d+)?)|[?#].*)?$/i.test(localDocumentCandidate(resource));}
+
 // Keep local links as file URLs until the host converts them with fileURLToPath.
 // URL.pathname contains /C:/ on Windows and is not a native filesystem path.
 export function resolveLocalDocumentLink(resource: string, documentPath: string) {

@@ -10,6 +10,7 @@ const {
   shouldIndexFile,
   upsertIndexedDocument
 } = require("./document-search-index.cjs");
+const { createOcrPageExecutor } = require("./document-reader.cjs");
 const {
   countPendingEmbeddings,
   fetchChunkTexts,
@@ -42,6 +43,9 @@ let lastError = "";
 let lastScanComplete = false;
 let cloudContentAllowed = false;
 let semanticEnabled = false;
+// OCR 命令由宿主随消息下发：未配置时保持原索引行为，空页 PDF 仍只按文件名匹配。
+let ocrCommandValue = "";
+let ocrPageExecutor = null;
 let embeddingPumpActive = false;
 let rerunRequested = false;
 let activeGeneration = "";
@@ -218,7 +222,7 @@ async function indexRoot(rootPath) {
       }
       if (!stat.isFile()) continue;
       try {
-        if (await upsertIndexedDocument(database, scanRoot, filePath, stat, generation, { skipContent })) {
+        if (await upsertIndexedDocument(database, scanRoot, filePath, stat, generation, { skipContent, ocrPage: ocrPageExecutor || null })) {
           changed += 1;
         }
       } catch (error) {
@@ -274,9 +278,17 @@ function adoptRoot(rootPath) {
   return activeRoot;
 }
 
+function adoptOcrCommand(message) {
+  const command = typeof message?.ocrCommand === "string" ? message.ocrCommand.trim() : "";
+  if (command === ocrCommandValue) return;
+  ocrCommandValue = command;
+  ocrPageExecutor = command ? createOcrPageExecutor(command) : null;
+}
+
 parentPort.on("message", (message) => {
   if (!message || typeof message !== "object") return;
   adoptSemanticSettings(message);
+  adoptOcrCommand(message);
   if (message.type === "index-file") {
     cloudContentAllowed = message.cloudContentAllowed === true;
     const rootPath = path.resolve(message.rootPath);
@@ -294,7 +306,7 @@ parentPort.on("message", (message) => {
             filePath,
             stat,
             activeGeneration || `direct-${Date.now()}`,
-            { skipContent: skipContentFor(rootPath) }
+            { skipContent: skipContentFor(rootPath), ocrPage: ocrPageExecutor || null }
           );
         } catch {
           // Transient races (file removed between messages) are fine.

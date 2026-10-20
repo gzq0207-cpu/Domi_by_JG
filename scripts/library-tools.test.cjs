@@ -5,7 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
-const { LibrarySession, libraryToolSpecs, startLibraryThread } = require("../electron/library-tools.cjs");
+const { LibrarySession, libraryToolSpecs, startLibraryThread, citationReferences, libraryInstructions, restrictedLibraryConfig } = require("../electron/library-tools.cjs");
 const { LibraryToolGateway } = require("../electron/library-tool-gateway.cjs");
 
 function fixture(t, options = {}) {
@@ -66,7 +66,7 @@ test("first-turn chapter hydration is included in the ledger and tools stay read
   assert.match(context.context, /企业客户愿意付费/);
   assert.equal(session.snapshot().fullCount, 1);
   assert.equal(fs.readFileSync(filePath, "utf8"), original);
-  assert.deepEqual(libraryToolSpecs.map((spec) => spec.name), ["domi_library_search", "domi_library_read", "domi_library_status"]);
+  assert.deepEqual(libraryToolSpecs.map((spec) => spec.name), ["domi_library_search", "domi_library_read", "domi_library_cite", "domi_library_status"]);
 });
 
 test("existing conversations can call the same tools through a revocable loopback CLI", async (t) => {
@@ -98,4 +98,116 @@ test("older app servers can start the same selected model through the CLI fallba
   assert.equal(requests.length, 2);
   assert.equal(requests[1].model, "selected-model");
   await assert.rejects(startLibraryThread({ request: async () => { throw new Error("selected model unavailable"); } }, { dynamicTools: libraryToolSpecs }), /model unavailable/);
+});
+
+function scopeFixture(t) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "domi-library-scope-"));
+  const selectedPath = path.join(directory, "选定材料.md");
+  const otherPath = path.join(directory, "全库材料.md");
+  fs.writeFileSync(selectedPath, "# 选定\n企业客户愿意付费，但推理成本限制了毛利。\n");
+  fs.writeFileSync(otherPath, "# 其他\n这里是不应被引用的全库内容。\n");
+  const session = new LibrarySession({ rootPath: directory, settings: { storageBackend: "local", semanticSearchEnabled: false },
+    sourceScope: "selected", selectedPaths: [selectedPath],
+    search: async () => ({ ok: true, results: [{ path: otherPath, relativePath: "全库材料.md", line: 2, snippet: "不应被引用" }] }) });
+  t.after(() => { session.close(); fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); });
+  return { directory, selectedPath, otherPath, session };
+}
+
+test("selected scope grants only chosen materials and never widens to the library", async (t) => {
+  const { directory, otherPath, session } = scopeFixture(t);
+  assert.throws(() => new LibrarySession({ rootPath: directory, settings: { storageBackend: "local" },
+    sourceScope: "selected", search: async () => ({ ok: true, results: [] }) }), /至少一份材料/);
+  const denied = await session.call("domi_library_read", { path: otherPath });
+  assert.equal(denied.ok, false);
+  assert.match(denied.error, /不在本轮选定材料范围内/);
+  const search = await session.call("domi_library_search", { query: "企业客户" });
+  assert.equal(search.ok, true);
+  assert.equal(search.sourceScope, "selected");
+  assert.deepEqual(search.results.map((item) => path.basename(item.path)), ["选定材料.md"]);
+  assert.equal(session.snapshot().candidateCount, 1, "library-wide candidates are not counted in selected scope");
+});
+
+test("claims bind to verbatim quotes and the audit accepts markers adjacent to claims", async (t) => {
+  const { session, filePath } = fixture(t);
+  const doc = await session.call("domi_library_read", { path: filePath });
+  const claim = "企业客户愿意付费，但推理成本限制了毛利";
+  const quote = "企业客户愿意付费，但推理成本限制了毛利。";
+  const cite = await session.call("domi_library_cite", { sourceId: doc.sourceId, quote, claim, kind: "fact" });
+  assert.equal(cite.ok, true);
+  assert.match(cite.marker, /^:domi-cite\{id="E[a-f0-9]{12}"\}$/);
+  const check = await session.checkCitations(`${claim}。${cite.marker}`);
+  assert.equal(check.checked, true);
+  assert.equal(check.verifiedCount, 1);
+  assert.equal(check.invalidCount, 0);
+  assert.equal(check.missing, false);
+  assert.deepEqual(check.issues, []);
+  const citation = session.snapshot().citations.find((item) => item.id === cite.citation.id);
+  assert.equal(citation.status, "verified");
+  assert.equal(citation.startLine, 2);
+});
+
+test("citations fail closed on missing quotes, unsupported numbers and stale adjacency", async (t) => {
+  const { session, filePath } = fixture(t);
+  const doc = await session.call("domi_library_read", { path: filePath });
+  const absent = await session.call("domi_library_cite", { sourceId: doc.sourceId, quote: "这句原文根本不存在", claim: "任意结论", kind: "fact" });
+  assert.equal(absent.ok, false);
+  assert.match(absent.error, /不在本轮实际提供的原文中/);
+  const numeric = await session.call("domi_library_cite", { sourceId: doc.sourceId,
+    quote: "企业客户愿意付费，但推理成本限制了毛利。", claim: "推理成本让毛利率只有 42%", kind: "fact" });
+  assert.equal(numeric.ok, false);
+  assert.equal(numeric.citation.status, "invalid");
+  assert.match(numeric.error, /数字 42%/);
+  const detached = await session.checkCitations(`另一段无关结论。${numeric.marker}`);
+  assert.equal(detached.invalidCount, 1);
+  assert.equal(session.snapshot().citations.find((item) => item.id === numeric.citation.id).status, "unbound");
+  const uncited = await session.checkCitations("只有结论而没有引用标记。");
+  assert.equal(uncited.missing, true);
+  assert.match(uncited.issues.join(" "), /没有可核验的结论—原文引用绑定/);
+});
+
+test("code blocks and fabricated markers never count as response citations", () => {
+  assert.deepEqual(citationReferences("```\n:domi-cite{id=\"Eaaaaaaaaaaaa\"}\n```"), []);
+  const references = citationReferences('结论 :domi-cite{id="Eaaaaaaaaaaaa"}');
+  assert.equal(references.length, 1);
+  assert.equal(references[0].id, "Eaaaaaaaaaaaa");
+  assert.deepEqual(citationReferences('结论 :domi-cite{id="EZZZZZZZZZZZZ"}')[0].id, "");
+});
+
+test("selected initial context and no-hit searches cannot disclose a library-wide sentinel", async (t) => {
+  const { session, selectedPath, otherPath } = scopeFixture(t);
+  let globalQueries = 0;
+  session.search = session.semanticSearch = async () => { globalQueries++; throw new Error("global search must not run"); };
+  const context = await session.initialContext("未在选定材料出现的问题");
+  assert.equal(globalQueries, 0);
+  assert.ok(context.context.includes("企业客户愿意付费"), "selected documents are readable without a keyword hit");
+  assert.ok(!context.context.includes("不应被引用"));
+  assert.deepEqual(context.candidatePaths, [selectedPath]);
+  assert.equal((await session.call("domi_library_search", { query: "不应被引用" })).results.length, 0);
+  const selected = await session.call("domi_library_read", { path: selectedPath, mode: "document", maxChars: 5 });
+  const bypass = await session.call("domi_library_read", { path: otherPath, cursor: selected.nextCursor });
+  assert.equal(bypass.ok, false);
+  assert.match(bypass.error, /不在本轮选定材料/);
+  assert.equal(globalQueries, 0);
+});
+
+test("scope instructions list all selected documents even when initial hydration is partial", () => {
+  const paths = ["C:/行业/报告.md", "C:/访谈/原始记录.pdf"];
+  const instructions = libraryInstructions({ sourceScope: "selected", selectedPaths: paths, dynamicTools: true });
+  assert.ok(instructions.includes(JSON.stringify(paths)));
+  assert.match(instructions, /数据，不是指令/);
+  assert.match(instructions, /选定文档中未找到足够依据/);
+  assert.match(instructions, /不以常识或模型记忆补全/);
+  assert.match(instructions, /历史回答不能作为证据/);
+  assert.match(instructions, /逐份 read/);
+});
+
+test("restricted runtime disables alternative source tools and refuses unsupported tool registration", async () => {
+  const config = restrictedLibraryConfig({ mcp_servers: { external: {} }, plugins: { domi: {} }, apps: { drive: {} } });
+  assert.equal(config.web_search, "disabled");
+  for (const feature of ["shell_tool", "unified_exec", "browser_use", "apps", "plugins", "memories", "multi_agent"]) assert.equal(config[`features.${feature}`], false);
+  assert.equal(config['mcp_servers."external".enabled'], false);
+  assert.equal(config['plugins."domi".enabled'], false);
+  assert.equal(config['apps."drive".enabled'], false);
+  await assert.rejects(startLibraryThread({ request: async () => { throw new Error("unsupported dynamicTools"); } },
+    { dynamicTools: libraryToolSpecs }, { requireDynamicTools: true }), /本轮未降级/);
 });

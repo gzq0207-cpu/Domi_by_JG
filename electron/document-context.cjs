@@ -109,18 +109,22 @@ function clipSnippet(snippet) {
 
 // Merges multi-keyword result sets: earlier (more prominent) keywords keep
 // priority, ties break toward documents that matched multiple keywords.
-function mergeSearchResults(resultSets) {
+// Each set corresponds to keywords[index]; the per-document matched-keyword set
+// feeds sub-question coverage reranking downstream.
+function mergeSearchResults(resultSets, keywords = []) {
   const byPath = new Map();
-  for (const results of resultSets) {
+  for (const [index, results] of (resultSets || []).entries()) {
+    const keyword = keywords[index];
     for (const result of results || []) {
       const existing = byPath.get(result.path);
       if (existing) {
         existing.keywordHits += 1;
+        if (keyword) existing.matchedKeywords.add(keyword);
         const locations = existing.locations || (existing.locations = []);
         if (locations.length < 3 && !locations.some((item) => item.line === result.line && item.offset === result.offset)) locations.push(result);
         continue;
       }
-      byPath.set(result.path, { ...result, keywordHits: 1, locations: [result] });
+      byPath.set(result.path, { ...result, keywordHits: 1, matchedKeywords: new Set(keyword ? [keyword] : []), locations: [result] });
     }
   }
   return [...byPath.values()];
@@ -179,6 +183,65 @@ function reciprocalRankFusion(keywordResults, semanticResults, k = RRF_K) {
   (semanticResults || []).forEach((result, index) => add(result, index, "semantic"));
   return [...byPath.values()].sort((left, right) =>
     (right.fusedScore - left.fusedScore)
+      || (right.keywordHits - left.keywordHits)
+      || (right.mtimeMs || 0) - (left.mtimeMs || 0));
+}
+
+// 问题里明确点名的对象：引号/书名号内的词，以及连续大写开头的英文专名。
+// 实体命中是重排的信号，不是穷尽判定；未点名不惩罚。
+function questionEntities(requestText) {
+  const entities = new Set();
+  const text = String(requestText || "");
+  for (const match of text.matchAll(/[「『“]([^「」『』“”]{2,40})[」』”]|《([^《》]{2,40})》/g)) {
+    const value = String(match[1] || match[2] || "").trim().toLowerCase();
+    if (value && !isStopword(value)) entities.add(value);
+  }
+  for (const match of text.matchAll(/\b[A-Z][A-Za-z0-9]+(?:\s+[A-Z][A-Za-z0-9]+)*\b/g)) {
+    const value = match[0].toLowerCase();
+    if (!LATIN_STOPWORDS.has(value)) entities.add(value);
+  }
+  return [...entities];
+}
+
+// 问题里点名的年份（2020–2100）：用于日期邻近重排。
+function questionYears(requestText) {
+  const years = new Set();
+  for (const match of String(requestText || "").matchAll(/\b(20[2-9]\d)\s*(?:年|年度|\.|-|–|—)?/g)) {
+    years.add(Number(match[1]));
+  }
+  return [...years];
+}
+
+function documentYearOf(result) {
+  const fromText = String(result?.date || "").match(/(20\d{2})/);
+  if (fromText) return Number(fromText[1]);
+  if (Number.isFinite(result?.mtimeMs) && result.mtimeMs > 0) {
+    return new Date(result.mtimeMs).getFullYear();
+  }
+  return 0;
+}
+
+// 重排：在 RRF 融合分之上叠加保守的确定性加分——子问题（关键词）覆盖、
+// 命名实体命中、日期邻近。加分总和小于一个 RRF 名次步长，只能提升同名次
+// 附近的排序，不会压过双通道共同命中的文档；不宣称排序即质量优势。
+function rerankFusedResults(results, { keywords = [], requestText = "" } = {}) {
+  const entities = questionEntities(requestText);
+  const years = questionYears(requestText);
+  return results.map((result) => {
+    const matchedKeywords = result.matchedKeywords instanceof Set ? [...result.matchedKeywords] : [];
+    const coverage = keywords.length ? matchedKeywords.length / keywords.length : 0;
+    const haystack = `${result.title || ""}\n${result.snippet || ""}\n${result.relativePath || ""}`.toLowerCase();
+    const entityHits = entities.filter((entity) => haystack.includes(entity)).length;
+    const documentYear = documentYearOf(result);
+    const dateBoost = years.length && documentYear
+      ? (years.includes(documentYear) ? 1 : 1 / (1 + Math.min(5, Math.abs(years[0] - documentYear))))
+      : 0;
+    const bonus = 0.004 * coverage
+      + 0.003 * Math.min(entityHits, 2)
+      + 0.003 * dateBoost;
+    return { ...result, rerankScore: (result.fusedScore || 0) + bonus, coverage, entityHits, dateBoost };
+  }).sort((left, right) =>
+    (right.rerankScore - left.rerankScore)
       || (right.keywordHits - left.keywordHits)
       || (right.mtimeMs || 0) - (left.mtimeMs || 0));
 }
@@ -245,12 +308,12 @@ async function retrieveDocuments({ search, semanticSearch, requestText, settings
           .catch(() => { warnings.add("语义检索失败，本轮使用关键词检索。"); return []; })
       : Promise.resolve([])
   ]);
-  const merged = mergeSearchResults(resultSets)
+  const merged = mergeSearchResults(resultSets, keywords)
     .sort((left, right) =>
       (right.keywordHits - left.keywordHits)
       || (right.mtimeMs || 0) - (left.mtimeMs || 0));
   const semantic = dedupeSemanticResults(semanticResponse);
-  const fused = reciprocalRankFusion(merged, semantic);
+  const fused = rerankFusedResults(reciprocalRankFusion(merged, semantic), { keywords, requestText });
   return { results: fused, keywords, warnings: [...warnings] };
 }
 
@@ -302,6 +365,9 @@ module.exports = {
   dedupeSemanticResults,
   formatDocumentContext,
   mergeSearchResults,
+  questionEntities,
+  questionYears,
   reciprocalRankFusion,
+  rerankFusedResults,
   retrieveDocuments
 };

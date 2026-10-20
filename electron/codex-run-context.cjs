@@ -3,9 +3,10 @@ const {
   isAdditionalContextCompatibilityError,
   usesExperimentalApi
 } = require("./codex-protocol.cjs");
+const { isRestrictedSourceScope } = require('./question-modes.cjs');
 
 function threadPersistenceOptions(payload = {}) {
-  return payload.ephemeral === true || payload.sourceScope === "selected" || payload.sourceScope === "library" ? { ephemeral: true } : {};
+  return payload.ephemeral === true || isRestrictedSourceScope(payload) ? { ephemeral: true } : {};
 }
 
 function sourceScopedThreadKey(workspacePath, sandbox, payload = {}) {
@@ -15,7 +16,7 @@ function sourceScopedThreadKey(workspacePath, sandbox, payload = {}) {
 }
 
 function sourceScopeAllowsResume(payload = {}) {
-  return payload.ephemeral !== true && payload.sourceScope !== "selected" && payload.sourceScope !== "library";
+  return payload.ephemeral !== true && !isRestrictedSourceScope(payload);
 }
 
 function codexRunExecutionMode(payload = {}) {

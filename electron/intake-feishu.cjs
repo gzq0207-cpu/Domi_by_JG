@@ -29,7 +29,7 @@ const URL_PATTERN = /https?:\/\/[^\s"'<>【】《》〈〉（）()「」『』�
 const INTAKE_FILE_EXTENSIONS = new Set([
   ".pdf",
   ".doc", ".docx", ".xls", ".xlsx", ".csv", ".ppt", ".pptx",
-  ".md", ".txt", ".json",
+  ".md", ".txt", ".json", ".srt", ".vtt",
   ".png", ".jpg", ".jpeg", ".webp", ".heic", ".gif", ".bmp",
   ".mp3", ".m4a", ".wav", ".mp4", ".mov"
 ]);
@@ -153,6 +153,12 @@ function parseFeishuTime(value) {
 // 或用「日报」「动态」直接拉取最近内容。命中后不走转发链路，由 onQuery
 // 回调查本地库并把摘要回复到群里（纯 SQL，零 AI 消耗）；电脑关机时消息
 // 照常存在飞书，开机后轮询补答。含链接的消息不识别为指令，避免与转发冲突。
+//
+// 方案 C：深度问答与续读。「问 …」或以？结尾的自然语言问题触发本地库
+// 原文检索（与桌面 Codex/CLI 共用同一套 LibrarySession 检索、章节展开与
+// 覆盖记录）；「续读 n」在同一会话内继续读上一轮第 n 个来源。与「查 关
+// 键词」的快速 SQL 检索明确区分：question 返回的是原文摘录与覆盖说明，
+// 不做模型生成，不宣称结论成立。
 function parseInboxQuery(text) {
   const trimmed = String(text || "").trim();
   if (!trimmed) return null;
@@ -164,7 +170,69 @@ function parseInboxQuery(text) {
     const keyword = searchMatch[1].trim();
     if (keyword) return { kind: "search", keyword };
   }
+  const continueMatch = trimmed.match(/^(?:续读|继续读)\s*([1-9]\d?)$/);
+  if (continueMatch) return { kind: "continue", keyword: continueMatch[1] };
+  // 「问」前缀必须带分隔符（空格/冒号/逗号），避免「问题反馈…」等普通消息误触发。
+  const explicitQuestion = trimmed.match(/^(?:问问?|deep)\s*(?:[:：,，]\s*|\s+)(.{2,500})$/i);
+  const questionText = explicitQuestion
+    ? explicitQuestion[1].trim()
+    : (trimmed.length >= 6 && trimmed.length <= 500 && /[?？]$/.test(trimmed) ? trimmed : "");
+  if (questionText) return { kind: "question", keyword: questionText.slice(0, 200) };
   return null;
+}
+
+function inboxExcerpt(value, maxLength) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  const limit = Number(maxLength) || 200;
+  return text.length > limit ? `${text.slice(0, limit)}…` : text;
+}
+
+// 深度问答回复：只呈现检索命中的原文片段、读取范围与覆盖缺口，不生成结论。
+// mirrorLink 由调用方（主进程）解析本地路径到飞书镜像链接。
+function buildInboxQuestionReply(question, sources, warnings = [], options = {}) {
+  const mirrorLink = options.mirrorLink || (() => "");
+  const title = inboxExcerpt(question, 40);
+  if (!sources.length) {
+    return [
+      `「${title}」本地库检索没有命中原文。`,
+      "这不代表资料库一定没有相关内容：索引可能未建全，或问题只匹配摘要字段。",
+      "可换关键词发「查 关键词」，或在电脑端打开 domi 继续深问。"
+    ].join("\n");
+  }
+  const blocks = [`「${title}」本地库原文检索（${sources.length} 个来源，已展开相关章节）：`];
+  for (const [index, source] of sources.slice(0, 4).entries()) {
+    const date = source.date ? ` · ${source.date}` : "";
+    const coverage = source.totalChars
+      ? `已读 ${source.coveredChars || source.content?.length || 0}/${source.totalChars} 字`
+      : "";
+    const link = mirrorLink(source.path || "");
+    blocks.push([
+      `【${index + 1}】${source.title || source.relativePath || "资料"}${date}`,
+      source.content ? inboxExcerpt(source.content, 200) : "（命中但未展开正文，可续读）",
+      [coverage, link ? `阅读：${link}` : ""].filter(Boolean).join("；")
+    ].filter(Boolean).join("\n"));
+  }
+  const coverageNotes = [...new Set(warnings)].slice(0, 2);
+  if (coverageNotes.length) blocks.push(`覆盖说明：${coverageNotes.join(" ")}`);
+  if (sources.length > 4) blocks.push(`其余 ${sources.length - 4} 个命中来源未展示，可发送「续读 序号」逐个查看。`);
+  blocks.push("发送「续读 序号」继续读对应来源；「查 关键词」仍是快速检索。");
+  return blocks.join("\n\n");
+}
+
+// 续读回复：同一 LibrarySession 会话内继续读原文，版本变化会被拒绝。
+function buildInboxContinueReply(index, source, document, options = {}) {
+  const mirrorLink = options.mirrorLink || (() => "");
+  if (!document || !document.ok) {
+    return `续读失败：${document?.error || "本地资料会话已过期（约 2 小时），请重新发一次问题。"}`;
+  }
+  const title = source?.title || source?.relativePath || "资料";
+  const link = mirrorLink(source?.path || "");
+  const more = document.nextCursor ? "仍有未读内容，可再发「续读 序号」继续。" : "这份资料本轮已读完。";
+  return [
+    `【${index}】${title} 续读（第 ${document.startLine}-${document.endLine} 行${document.pages?.length ? `，第 ${document.pages.join("、")} 页` : ""}）：`,
+    inboxExcerpt(document.content, 600),
+    [link ? `阅读：${link}` : "", more].filter(Boolean).join("\n")
+  ].filter(Boolean).join("\n");
 }
 
 class FeishuIntakePoller {
@@ -487,7 +555,7 @@ class FeishuIntakePoller {
       const inboxQuery = parseInboxQuery(text);
       if (inboxQuery && typeof this.onQuery === "function") {
         try {
-          await this.onQuery({ ...inboxQuery, messageId, createTime });
+          await this.onQuery({ ...inboxQuery, messageId, createTime, chatId: this.chatId });
         } catch (error) {
           this.logger(`feishu-intake query failed: ${error?.message || error}`);
         }
@@ -645,4 +713,4 @@ class FeishuIntakePoller {
   }
 }
 
-module.exports = { FeishuIntakePoller, extractFirstUrl, fileMessageDescriptor, messagePlainText, parseInboxQuery, resolveLarkCli };
+module.exports = { FeishuIntakePoller, extractFirstUrl, fileMessageDescriptor, messagePlainText, parseInboxQuery, buildInboxQuestionReply, buildInboxContinueReply, resolveLarkCli };

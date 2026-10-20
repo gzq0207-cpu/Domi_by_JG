@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { DocumentReader } = require("../electron/document-reader.cjs");
+const { DocumentReader, createOcrPageExecutor } = require("../electron/document-reader.cjs");
 const PDFDocument = require("pdfkit");
 
 function fixture(t, options = {}) {
@@ -116,4 +116,67 @@ test("reader blocks traversal and symlinks outside the selected repository", asy
   fs.writeFileSync(path.join(outside, "private.md"), "private");
   fs.symlinkSync(outside, path.join(context.rootPath, "link"), process.platform === "win32" ? "junction" : "dir");
   await assert.rejects(context.reader.read({ path: "link/private.md" }), /之外/);
+});
+
+test("OCR fills pages without extractable text and keeps full-read claims honest", async (t) => {
+  const context = fixture(t, { extractPdf: async () => ["", "第二页有正文。", ""] });
+  context.write("scan.pdf", "fixture");
+  const ocrCalls = [];
+  const reader = new DocumentReader({
+    rootPath: context.rootPath,
+    extractPdf: async () => ["", "第二页有正文。", ""],
+    ocrPage: async (pdfPath, pageNumber) => {
+      ocrCalls.push(path.basename(pdfPath) + ":" + pageNumber);
+      return pageNumber === 3 ? "OCR 识别出的第三页内容。" : "";
+    }
+  });
+  const doc = await reader.read({ path: "scan.pdf", mode: "document" });
+  assert.deepEqual(ocrCalls, ["scan.pdf:1", "scan.pdf:3"], "只对空页调用 OCR");
+  assert.match(doc.content, /OCR 识别出的第三页内容/);
+  assert.match(doc.content, /第二页有正文/);
+  assert.ok(doc.warnings.some((warning) => warning.includes("第 3 页使用 OCR")), "OCR 页面必须披露");
+  assert.ok(doc.warnings.some((warning) => warning.includes("第 1 页 OCR 未识别出文字")), "OCR 失败页面如实披露");
+  // OCR 过的页面质量未验证：不能宣称已读全文。
+  assert.equal(doc.extractionIncomplete, true);
+  assert.equal(doc.fullDocument, false);
+});
+
+test("all-empty PDFs load through OCR or fail closed with an OCR-aware message", async (t) => {
+  const context = fixture(t);
+  context.write("blank.pdf", "fixture");
+  context.write("dead.pdf", "fixture");
+  const withOcr = new DocumentReader({
+    rootPath: context.rootPath,
+    extractPdf: async () => ["", ""],
+    ocrPage: async (_pdfPath, pageNumber) => (pageNumber === 1 ? "OCR 第一页。" : "")
+  });
+  const loaded = await withOcr.read({ path: "blank.pdf", mode: "document" });
+  assert.match(loaded.content, /OCR 第一页/);
+  assert.equal(loaded.extractionIncomplete, true);
+  const ocrMissed = new DocumentReader({
+    rootPath: context.rootPath,
+    extractPdf: async () => ["", ""],
+    ocrPage: async () => ""
+  });
+  await assert.rejects(ocrMissed.read({ path: "dead.pdf" }), /且 OCR 未识别出文字/);
+});
+
+test("the OCR command executor quotes paths, substitutes pages and degrades on failure", async () => {
+  assert.equal(createOcrPageExecutor(""), null);
+  assert.equal(createOcrPageExecutor("ocr.py 缺占位符"), null);
+  const commands = [];
+  const executor = createOcrPageExecutor("python ocr.py {pdf} {page}", {
+    execImpl: (line, options, callback) => {
+      commands.push({ line, timeout: options.timeout });
+      if (line.includes("bad.pdf")) callback(new Error("ocr crashed"));
+      else callback(null, "  识别文本 \n");
+    }
+  });
+  const text = await executor("C:/资料 库/a.pdf", 7);
+  assert.equal(text, "识别文本");
+  assert.equal(commands[0].timeout, 60_000);
+  if (process.platform === "win32") {
+    assert.ok(commands[0].line.startsWith('"C:/资料 库/a.pdf"') || commands[0].line.includes('python ocr.py "C:/资料 库/a.pdf" "7"'));
+  }
+  assert.equal(await executor("bad.pdf", 1), "", "失败时降级为空，不阻断读取");
 });

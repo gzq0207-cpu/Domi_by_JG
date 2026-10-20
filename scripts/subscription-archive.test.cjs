@@ -96,6 +96,36 @@ test("YouTube access verification records the browser stage and avoids repeated 
   assert.ok(browserAccess.resolvedAt);
 });
 
+test("blocked command-line acquisition automatically uses the independent browser in the same run", async t => {
+  const f=fixture(t);let cli=0,browser=0;
+  const worker=new SubscriptionArchiveWorker({...f.options,getMedia:async()=>{cli++;return {ok:false,error:{message:"YouTube 要求登录／访问验证"}};},
+    acquireBrowserTranscript:async()=>{browser++;return f.media;}});
+  const result=await worker.runOnce();worker.close();
+  assert.equal(result.completed,1);assert.equal(cli,1);assert.equal(browser,1);assert.equal(f.queue().items[0].status,"done");
+});
+
+test("waiting browser jobs never revisit the blocked CLI and repeated login failures are deduplicated", async t => {
+  const f=fixture(t),q=f.queue();Object.assign(q.items[0],{status:"blocked",requiresBrowserTranscript:true,blockedStage:"browser-transcript"});
+  fs.writeFileSync(f.queuePath,JSON.stringify(q));let browser=0;
+  const worker=new SubscriptionArchiveWorker({...f.options,getMedia:async()=>assert.fail("不能重复命令行入口"),
+    acquireBrowserTranscript:async()=>{browser++;const e=new Error("YouTube 页面要求正常登录。");Object.assign(e,{code:"AUTH_REQUIRED",requiresBrowserTranscript:true,needsUserAction:true,retryAfterMs:60000});throw e;}});
+  const first=await worker.runOnce({force:true});assert.equal(first.newFailures,1);assert.equal(f.queue().items[0].needsUserAction,true);
+  const second=await worker.runOnce({force:true});assert.equal(second.failed,1);assert.equal(second.newFailures,0);assert.equal(browser,2);
+  worker.close();
+});
+
+test("one persistent browser login problem is not reannounced for each newly discovered video", async t => {
+  const f=fixture(t),q=f.queue();q.items.push({...q.items[0],videoId:"lmnopqrstuv",url:"https://www.youtube.com/watch?v=lmnopqrstuv"});
+  for(const item of q.items) Object.assign(item,{status:"blocked",requiresBrowserTranscript:true});
+  fs.writeFileSync(f.queuePath,JSON.stringify(q));
+  const worker=new SubscriptionArchiveWorker({...f.options,getMedia:async()=>assert.fail("CLI blocked"),acquireBrowserTranscript:async()=>{
+    const e=new Error("YouTube 页面要求正常登录。");Object.assign(e,{code:"AUTH_REQUIRED",requiresBrowserTranscript:true,needsUserAction:true,retryAfterMs:60000});throw e;}});
+  const first=await worker.runOnce({force:true,concurrency:2});assert.equal(first.failed,2);assert.equal(first.newFailures,1);
+  const later=f.queue();later.items.push({...later.items[0],videoId:"zyxwvutsrqp",url:"https://www.youtube.com/watch?v=zyxwvutsrqp",error:null,browserErrorCode:null});
+  fs.writeFileSync(f.queuePath,JSON.stringify(later));
+  const second=await worker.runOnce({force:true,concurrency:2});assert.equal(second.failed,3);assert.equal(second.newFailures,0);worker.close();
+});
+
 test("tampered transcripts and subtitle sources are rejected even with complete=true", (t) => {
   const f = fixture(t); fs.appendFileSync(f.media.transcriptPath, "修改");
   assert.throws(() => verifyMedia(f.media), /不可验证/);
@@ -266,4 +296,6 @@ test("an unchanged browser wait produces no repeated failure notification", asyn
   await run({ completed: 0, failed: 1 });
   assert.equal(notifications.length, 1);
   assert.match(notifications[0][1], /等待正规浏览器/);
+  await run({ completed: 0, failed: 1, newFailures: 0 });
+  assert.equal(notifications.length, 1, "同一登录原因不能重复通知");
 });

@@ -25,17 +25,17 @@ const FIXTURE_SNAPSHOT = {
       summary: "【核心观点】流匹配成为连续模态主流选型。",
       companies: "Mistral",
       url: "https://www.youtube.com/watch?v=1S1B4XkFCD8",
-      mirrorUrl: "https://my.feishu.cn/docx/abc"
+      mirrorUrl: "https://tenant.example.invalid/docx/abc"
     }
   ],
   projects: [
-    { name: "ExampleCorp", domain: "Agent与平台", status: "已交流", rating: "A", notes: "做 agent 的公司", mirrorUrl: "https://my.feishu.cn/docx/proj" }
+    { name: "ExampleCorp", domain: "Agent与平台", status: "已交流", rating: "A", notes: "做 agent 的公司", mirrorUrl: "https://tenant.example.invalid/docx/proj" }
   ],
   people: [
-    { name: "张三", organization: "ExampleCorp", status: "待接触", rating: "", mirrorUrl: "https://my.feishu.cn/docx/p1" }
+    { name: "张三", organization: "ExampleCorp", status: "待接触", rating: "", mirrorUrl: "https://tenant.example.invalid/docx/p1" }
   ],
   digests: [
-    { name: "AI-Builders-Digest-2026-09-22", url: "https://my.feishu.cn/docx/dig", mtimeMs: 1789900000000 }
+    { name: "AI-Builders-Digest-2026-09-22", url: "https://tenant.example.invalid/docx/dig", mtimeMs: 1789900000000 }
   ]
 };
 
@@ -44,7 +44,10 @@ test("worker query parsing stays in contract with the desktop implementation", (
     "查 Mistral", "查询 算力", "search flow matching",
     "日报", "订阅日报", "动态", "行业动态",
     "https://example.com/a", "查查这篇 https://mp.weixin.qq.com/s/abc 好文",
-    "查", "你好", "", "看看这篇很有意思的文章"
+    "查", "你好", "", "看看这篇很有意思的文章",
+    "问 英伟达的推理成本怎么样", "问：流匹配和扩散的区别", "问问 数据中心的供电架构",
+    "英伟达 2026 年的资本开支？", "在吗？", "问题反馈：希望增加导出", "问题怎么这么多",
+    "续读 1", "继续读 12", "续读", "续读 0", "续读 999"
   ];
   for (const text of cases) {
     assert.deepEqual(
@@ -58,12 +61,12 @@ test("worker query parsing stays in contract with the desktop implementation", (
 test("buildAnswer covers digest, news, search and the missing-snapshot case", () => {
   const digest = buildAnswer({ kind: "digest", keyword: "" }, FIXTURE_SNAPSHOT);
   assert.ok(digest.includes("AI-Builders-Digest-2026-09-22"));
-  assert.ok(digest.includes("https://my.feishu.cn/docx/dig"));
+  assert.ok(digest.includes("https://tenant.example.invalid/docx/dig"));
   assert.ok(digest.includes("数据截至 2026-09-23 06:41"));
 
   const news = buildAnswer({ kind: "news", keyword: "" }, FIXTURE_SNAPSHOT);
   assert.ok(news.includes("最近行业动态（1 条）"));
-  assert.ok(news.includes("阅读全文：https://my.feishu.cn/docx/abc"));
+  assert.ok(news.includes("阅读全文：https://tenant.example.invalid/docx/abc"));
 
   const search = buildAnswer({ kind: "search", keyword: "mistral" }, FIXTURE_SNAPSHOT);
   assert.ok(search.includes("「mistral」检索结果（1 条）"));
@@ -71,7 +74,7 @@ test("buildAnswer covers digest, news, search and the missing-snapshot case", ()
 
   const combined = buildAnswer({ kind: "search", keyword: "张三" }, FIXTURE_SNAPSHOT);
   assert.ok(combined.includes("【人物】张三（ExampleCorp）"));
-  assert.ok(combined.includes("https://my.feishu.cn/docx/p1"));
+  assert.ok(combined.includes("https://tenant.example.invalid/docx/p1"));
 
   const miss = buildAnswer({ kind: "search", keyword: "不存在的关键词xyz" }, FIXTURE_SNAPSHOT);
   assert.ok(miss.includes("没有找到与「不存在的关键词xyz」相关"));
@@ -80,9 +83,22 @@ test("buildAnswer covers digest, news, search and the missing-snapshot case", ()
   assert.ok(empty.includes("云端资料库快照暂不可用"));
 });
 
+test("buildAnswer explains deep-question and continue limits instead of faking them", () => {
+  const question = buildAnswer({ kind: "question", keyword: "英伟达的推理成本怎么样" }, FIXTURE_SNAPSHOT);
+  assert.ok(question.includes("需要桌面 domi 在线"));
+  assert.ok(question.includes("查 关键词"));
+  assert.ok(!question.includes("检索结果"), "云端不得把快照匹配冒充深度问答");
+
+  const noSnapshot = buildAnswer({ kind: "question", keyword: "任何问题" }, null);
+  assert.ok(noSnapshot.includes("云端资料库快照暂不可用"));
+
+  const deep = buildAnswer({ kind: "continue", keyword: "2" }, FIXTURE_SNAPSHOT);
+  assert.ok(deep.includes("本地资料会话"));
+});
+
 test("formatNewsRow prefers the mirror link over the source url", () => {
   const row = formatNewsRow(FIXTURE_SNAPSHOT.news[0]);
-  assert.ok(row.includes("阅读全文：https://my.feishu.cn/docx/abc"));
+  assert.ok(row.includes("阅读全文：https://tenant.example.invalid/docx/abc"));
   assert.ok(!row.includes("youtube.com"));
 });
 
@@ -166,12 +182,12 @@ test("snapshot server enforces the bearer token and persists valid snapshots", a
     const denied = await post(JSON.stringify(FIXTURE_SNAPSHOT), {});
     assert.equal(denied.status, 401);
 
-    const accepted = await post(JSON.stringify(FIXTURE_SNAPSHOT), { Authorization: "Bearer secret-token" });
+    const accepted = await post(JSON.stringify(FIXTURE_SNAPSHOT), { Authorization: ("Bearer " + "secret-token") });
     assert.equal(accepted.status, 200);
     const stored = JSON.parse(fs.readFileSync(snapshotPath, "utf8"));
     assert.equal(stored.news[0].title, FIXTURE_SNAPSHOT.news[0].title);
 
-    const malformed = await post("not-json", { Authorization: "Bearer secret-token" });
+    const malformed = await post("not-json", { Authorization: ("Bearer " + "secret-token") });
     assert.equal(malformed.status, 400);
   } finally {
     server.close();

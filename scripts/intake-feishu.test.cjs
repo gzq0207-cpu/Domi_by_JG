@@ -9,6 +9,8 @@ const {
   fileMessageDescriptor,
   messagePlainText,
   parseInboxQuery,
+buildInboxQuestionReply,
+buildInboxContinueReply,
   resolveLarkCli
 } = require("../electron/intake-feishu.cjs");
 
@@ -58,6 +60,61 @@ test("parseInboxQuery recognizes search, digest and news commands", () => {
   assert.deepEqual(parseInboxQuery("订阅日报"), { kind: "digest", keyword: "" });
   assert.deepEqual(parseInboxQuery("动态"), { kind: "news", keyword: "" });
   assert.deepEqual(parseInboxQuery("行业动态"), { kind: "news", keyword: "" });
+});
+
+test("parseInboxQuery recognizes deep questions and continue commands", () => {
+  assert.deepEqual(parseInboxQuery("问 英伟达的推理成本怎么样"), { kind: "question", keyword: "英伟达的推理成本怎么样" });
+  assert.deepEqual(parseInboxQuery("问：流匹配和扩散的区别"), { kind: "question", keyword: "流匹配和扩散的区别" });
+  assert.deepEqual(parseInboxQuery("问问 数据中心的供电架构"), { kind: "question", keyword: "数据中心的供电架构" });
+  assert.deepEqual(parseInboxQuery("英伟达 2026 年的资本开支？"), { kind: "question", keyword: "英伟达 2026 年的资本开支？" });
+  assert.deepEqual(parseInboxQuery("续读 1"), { kind: "continue", keyword: "1" });
+  assert.deepEqual(parseInboxQuery("继续读 12"), { kind: "continue", keyword: "12" });
+  // 查询指令优先于 ？结尾判定。
+  assert.deepEqual(parseInboxQuery("查 流匹配？"), { kind: "search", keyword: "流匹配？" });
+});
+
+test("parseInboxQuery keeps ordinary chatter out of deep questions", () => {
+  assert.equal(parseInboxQuery("问题反馈：希望增加导出"), null);
+  assert.equal(parseInboxQuery("问题怎么这么多"), null);
+  assert.equal(parseInboxQuery("在吗"), null);
+  assert.equal(parseInboxQuery("在吗？"), null, "短疑问不打断为深度问答");
+  assert.equal(parseInboxQuery("问题"), null);
+});
+
+test("buildInboxQuestionReply presents original excerpts, coverage and links without inventing conclusions", () => {
+  const sources = [
+    { title: "推理成本调研", date: "2026-09-01", path: "/lib/a.md", relativePath: "a.md", content: "企业客户愿意付费，但推理成本限制了毛利。", totalChars: 500, coveredChars: 200 },
+    { title: "算力芯片动态", path: "/lib/b.md", relativePath: "b.md", content: "B200 供货周期延长。", totalChars: 0 }
+  ];
+  const reply = buildInboxQuestionReply("推理成本", sources, ["文档索引尚不完整"], {
+    mirrorLink: (filePath) => (filePath === "/lib/a.md" ? "https://tenant.example.invalid/docx/a" : "")
+  });
+  assert.ok(reply.includes("本地库原文检索（2 个来源"));
+  assert.ok(reply.includes("【1】推理成本调研 · 2026-09-01"));
+  assert.ok(reply.includes("企业客户愿意付费"));
+  assert.ok(reply.includes("已读 200/500 字"));
+  assert.ok(reply.includes("阅读：https://tenant.example.invalid/docx/a"));
+  assert.ok(reply.includes("覆盖说明：文档索引尚不完整"));
+  assert.ok(reply.includes("「续读 序号」继续读对应来源"));
+  // 无命中时不宣称结论，如实说明检索边界。
+  const empty = buildInboxQuestionReply("量子计算", [], []);
+  assert.ok(empty.includes("没有命中原文"));
+  assert.ok(empty.includes("不代表资料库一定没有相关内容"));
+});
+
+test("buildInboxContinueReply reports lines, more-to-read state and failures", () => {
+  const source = { title: "推理成本调研", path: "/lib/a.md", relativePath: "a.md" };
+  const document = { ok: true, content: "后续正文内容。", startLine: 8, endLine: 14, pages: [3], nextCursor: "eyJvZmZzZXQiOjEwMH0=" };
+  const reply = buildInboxContinueReply(1, source, document, { mirrorLink: () => "https://tenant.example.invalid/docx/a" });
+  assert.ok(reply.includes("【1】推理成本调研 续读"));
+  assert.ok(reply.includes("第 8-14 行"));
+  assert.ok(reply.includes("第 3 页"));
+  assert.ok(reply.includes("后续正文内容。"));
+  assert.ok(reply.includes("仍有未读内容"));
+  const finished = buildInboxContinueReply(1, source, { ok: true, content: "结尾。", startLine: 20, endLine: 21, pages: [], nextCursor: "" });
+  assert.ok(finished.includes("本轮已读完"));
+  const failure = buildInboxContinueReply(1, source, { ok: false, error: "版本已改变" });
+  assert.ok(failure.includes("续读失败：版本已改变"));
 });
 
 test("parseInboxQuery ignores links, forwards and ordinary chatter", () => {
@@ -123,7 +180,7 @@ test("poller routes query commands to onQuery instead of onItem", async () => {
   poller.loadState();
   await poller.pollOnce();
 
-  assert.deepEqual(queries, [{ kind: "search", keyword: "算力芯片", messageId: "om_q1", createTime: feishuTime(5000) }]);
+  assert.deepEqual(queries, [{ kind: "search", keyword: "算力芯片", messageId: "om_q1", createTime: feishuTime(5000), chatId: "oc_test123" }]);
   assert.equal(received.length, 1);
   assert.equal(received[0].url, "https://example.com/normal-forward");
   // The forward still gets its confirmation reply; the query does not.

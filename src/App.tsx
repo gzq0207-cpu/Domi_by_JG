@@ -35,6 +35,7 @@ import {
   PinOff,
   Play,
   Plus,
+  Quote,
   Radio,
   RefreshCw,
   Scale,
@@ -43,7 +44,6 @@ import {
   Sparkles,
   Square,
   Target,
-  TerminalSquare,
   Trash2,
   UsersRound,
   Zap,
@@ -71,7 +71,8 @@ import {
 import { hasNativeWorkbench, workbench } from "./bridge";
 import { CodexModelReadiness } from "./codex-model-readiness";
 import { filesFromClipboardData } from "./clipboard-files";
-import { isLocalPdfResource } from "./document-resources";
+import { isLocalPdfResource, isLocalWordResource } from "./document-resources";
+import type {WordDocument} from './research-types';
 import {
   automaticallyRoutedProject,
   DomiEntityResult,
@@ -84,6 +85,7 @@ import {
   shouldBindProjectToSourceConversation
 } from "./entity-routing";
 import MarkdownEditorErrorBoundary from "./MarkdownEditorErrorBoundary";
+import { flushResearchDocuments } from './research-runtime';
 import SectionErrorBoundary, { RenderRegion } from "./SectionErrorBoundary";
 import AssistantChoiceCard from "./AssistantChoiceCard";
 import { useAppConfirm } from "./AppConfirmDialog";
@@ -187,32 +189,33 @@ import {
   normalizeRadarDomains
 } from "./radar-domains";
 import { parseRadarResult, radarRejectionSummary } from "./radar-result";
+import { isSelectedDocumentScope, remainingScopeDraft, validateDocumentScope as validateSourceSelection } from "./document-scope";
+import { addQuoteToDraft, composeDocumentQuestion, documentPathKey, DOCUMENT_QUESTION_EVENT, normalizeDocumentQuotes, quoteLocation } from './document-question';
+import type { DocumentQuestionRequest, DocumentQuote } from './document-question';
 
-const RichMarkdownEditor = lazy(() => import("./RichMarkdownEditor"));
+const MaterialReader = lazy(() => import('./MaterialReader'));
+const ResearchWorkspace = lazy(() => import('./ResearchWorkspace'));
 const SetupCenter = lazy(() => import("./SetupCenter"));
 const MessageContent = lazy(() => import("./MessageContent"));
 const RadarSourceManager = lazy(() => import("./RadarSourceManager"));
 const SubscriptionsView = lazy(() => import("./SubscriptionsView"));
+const DocumentScopePicker = lazy(() => import("./DocumentScopePicker"));
 
 type Role = "user" | "assistant" | "system";
 const SOURCE_SCOPE_LABELS: Record<SourceScope, string> = {
   selected: "仅选定材料",
   library: "全库资料 · 不联网",
-  research: "全库＋联网研究"
+  research: "全库＋联网研究",
+  model: "模型直答 · 未读取资料",
+  both: "Both · 资料回答＋模型补充"
 };
 function isSourceScope(value: unknown): value is SourceScope {
-  return value === "selected" || value === "library" || value === "research";
+  return value === "selected" || value === "library" || value === "research" || value === 'model' || value === 'both';
 }
 function isRestrictedScope(value?: SourceScope) {
-  return value === "selected" || value === "library";
+  return value === "selected" || value === "library" || value === 'model' || value === 'both';
 }
-function validateSourceSelection(scope: SourceScope | undefined, files: LocalAttachment[]) {
-  if (scope === "selected" && !files.length) throw new Error("请先通过「＋」或「加入提问」添加材料；仅选定材料模式不会自动搜索全库。");
-  if (isRestrictedScope(scope) && files.some((file) => !/\.(?:md|markdown|txt|pdf)$/i.test(file.path))) {
-    throw new Error("受限资料问答支持 Markdown、文本和 PDF；请先转换其他格式，或明确选择联网研究模式。");
-  }
-}
-type WorkspaceView = "conversation" | "tasks" | "news" | "subscriptions" | "data" | "documents";
+type WorkspaceView = "conversation" | "tasks" | "news" | "subscriptions" | "data" | "documents" | "research";
 
 type DomiSearchOption =
   | { key: string; kind: "project"; record: DomiProject }
@@ -242,7 +245,8 @@ const WORKSPACE_VIEW_DEFAULT_RIGHT_PANEL: Record<WorkspaceView, boolean> = {
   news: true,
   subscriptions: true,
   data: false,
-  documents: false
+  documents: true,
+  research: false
 };
 
 const WORKSPACE_SCROLL_SELECTORS: Record<WorkspaceView, string[]> = {
@@ -254,7 +258,8 @@ const WORKSPACE_SCROLL_SELECTORS: Record<WorkspaceView, string[]> = {
   news: [".home-weekly-news", ".right-panel:not(.document-panel)"],
   subscriptions: [".subscriptions", ".right-panel:not(.document-panel)"],
   data: [".database-grid-shell", ".right-panel:not(.document-panel)"],
-  documents: [".rich-markdown-scroll"]
+  documents: [".rich-markdown-scroll"],
+  research: ['.research-document .rich-markdown-scroll', '.research-pdf-scroll']
 };
 
 const COMPOSER_DRAFTS_STORAGE_KEY = "domi.composerDrafts.v1";
@@ -1124,6 +1129,7 @@ type AssistantInteraction = {
 type ComposerDraft = {
   input: string;
   attachments: LocalAttachment[];
+  documentQuotes?: DocumentQuote[];
   attachmentError: string;
   sourceScope?: SourceScope;
   selectedWorkflowId?: string;
@@ -1158,6 +1164,7 @@ function readStoredComposerDrafts(): Record<string, ComposerDraft> {
       const normalized: ComposerDraft = {
         input: typeof draft.input === "string" ? draft.input : "",
         attachments,
+        documentQuotes: normalizeDocumentQuotes(draft.documentQuotes).filter(quote => attachments.some(file => documentPathKey(file.path) === documentPathKey(quote.path))),
         attachmentError: "",
         sourceScope: isSourceScope(draft.sourceScope) ? draft.sourceScope : undefined,
         selectedWorkflowId: typeof draft.selectedWorkflowId === "string"
@@ -1341,13 +1348,6 @@ const nowLabel = () =>
   new Intl.DateTimeFormat("zh-CN", {
     hour: "2-digit",
     minute: "2-digit"
-  }).format(new Date());
-
-const todayLabel = () =>
-  new Intl.DateTimeFormat("zh-CN", {
-    month: "long",
-    day: "numeric",
-    weekday: "short"
   }).format(new Date());
 
 const newsDateLabel = (timestamp?: number | null) => timestamp
@@ -1785,14 +1785,30 @@ function App() {
   const [threads, setThreads] = useState<Thread[]>(initialThreads);
   const [activeThreadId, setActiveThreadId] = useState(initialThreads[0].id);
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("conversation");
+  const [researchRequest, setResearchRequest] = useState<{ topicId?: string; annotationId?: string; nonce: number }>({ nonce: 0 });
+  const [researchMounted, setResearchMounted] = useState(false);
+  useEffect(() => {
+    const open = async (event: Event) => {
+      if (!await navigateWorkspace('research')) return;
+      setResearchMounted(true); setRightPanelOpen(false);
+      if (event.type === 'domi:open-research') {
+        const detail = (event as CustomEvent).detail;
+        setResearchRequest({ ...detail, nonce: Date.now() });
+      } else {
+        setResearchRequest({ annotationId: (event as CustomEvent).detail.annotationId, nonce: Date.now() });
+      }
+    };
+    window.addEventListener('domi:open-research',open); window.addEventListener('domi:open-annotation',open);
+    return () => { window.removeEventListener('domi:open-research',open); window.removeEventListener('domi:open-annotation',open); };
+  }, []);
   const [skillsExpanded, setSkillsExpanded] = useState(true);
-  const [documentLibrarySidebarExpanded, setDocumentLibrarySidebarExpanded] = useState(false);
   const [composerDraftsByThread, setComposerDraftsByThread] = useState<
     Record<string, ComposerDraft>
   >(readStoredComposerDrafts);
   const activeComposerDraft = composerDraftsByThread[activeThreadId] || EMPTY_COMPOSER_DRAFT;
   const input = activeComposerDraft.input;
   const attachments = activeComposerDraft.attachments;
+  const documentQuotes = activeComposerDraft.documentQuotes || [];
   const attachmentError = activeComposerDraft.attachmentError;
   const sourceScope: SourceScope = activeComposerDraft.sourceScope || "research";
   const selectedWorkflowId = isRestrictedScope(sourceScope) ? undefined : activeComposerDraft.selectedWorkflowId;
@@ -1888,6 +1904,8 @@ function App() {
   const [domiTaskSyncElapsed, setDomiTaskSyncElapsed] = useState(0);
   const [domiTaskSyncQueued, setDomiTaskSyncQueued] = useState(false);
   const [documentLibrary, setDocumentLibrary] = useState<DocumentLibrarySnapshot | null>(null);
+  const [documentScopePickerThreadId, setDocumentScopePickerThreadId] = useState<string | null>(null);
+  useEffect(() => { setDocumentScopePickerThreadId(null); }, [activeThreadId]);
   // 订阅日报文档：domi 资料库 13.认知库/订阅日报/ 下的 Markdown 日报
   // （follow-builders 计划任务每日镜像进来，以及 domi 自己生成的订阅日报）。
   const subscriptionDigestDocuments = useMemo(() => {
@@ -1967,7 +1985,7 @@ function App() {
   const [markdownTitleDraft, setMarkdownTitleDraft] = useState("");
   const [markdownError, setMarkdownError] = useState("");
   const [markdownRequestLabel, setMarkdownRequestLabel] = useState("");
-  const [pdfDocument, setPdfDocument] = useState<PdfDocument | null>(null);
+  const [pdfDocument, setPdfDocument] = useState<PdfDocument | WordDocument | null>(null);
   const [pdfTargetPage, setPdfTargetPage] = useState(1);
   const [pdfLoading, setPdfLoading] = useState(false);
   const [pdfFrameLoading, setPdfFrameLoading] = useState(false);
@@ -1979,10 +1997,6 @@ function App() {
   const [threadMenuId, setThreadMenuId] = useState<string | null>(null);
   const [renamingThreadId, setRenamingThreadId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
-  const [openSections, setOpenSections] = useState({
-    domi: true,
-    timeline: true
-  });
   const scrollRef = useRef<HTMLDivElement>(null);
   const chatScrollPositionsRef = useRef(new Map<string, ChatScrollPosition>());
   const chatScrollRestoreFrameRef = useRef<number | null>(null);
@@ -1998,13 +2012,28 @@ function App() {
     news: { rightPanelOpen: true, scrollPositions: [] },
     subscriptions: { rightPanelOpen: true, scrollPositions: [] },
     data: { rightPanelOpen: false, scrollPositions: [] },
-    documents: { rightPanelOpen: false, scrollPositions: [] }
+    documents: { rightPanelOpen: true, scrollPositions: [] },
+    research: { rightPanelOpen: false, scrollPositions: [] }
   });
   const documentPreviewOriginRef = useRef<DocumentPreviewOrigin | null>(null);
   const documentPanelFocusedRef = useRef(false);
   const windowFocusedRef = useRef(true);
   const threadsRef = useRef(threads);
   const composerDraftsByThreadRef = useRef(composerDraftsByThread);
+  const documentQuestionHandlerRef = useRef<(quote: DocumentQuote, threadId: string) => Promise<void>>(async () => {});
+  documentQuestionHandlerRef.current = addDocumentQuoteToComposer;
+  useEffect(() => {
+    let pending = Promise.resolve();
+    const quoted = (event: Event) => {
+      const detail = (event as CustomEvent<DocumentQuestionRequest>).detail;
+      if (!detail?.quote || typeof detail.accept !== 'function') return;
+      const threadId = activeThreadIdRef.current;
+      pending = pending.catch(() => {}).then(() => documentQuestionHandlerRef.current(detail.quote, threadId));
+      detail.accept(pending);
+    };
+    window.addEventListener(DOCUMENT_QUESTION_EVENT, quoted);
+    return () => window.removeEventListener(DOCUMENT_QUESTION_EVENT, quoted);
+  }, []);
   const activeRunsByThreadRef = useRef(activeRunsByThread);
   const domiSnapshotRef = useRef(domiSnapshot);
   const codexModelReadinessRef = useRef<CodexModelReadiness | null>(null);
@@ -2241,6 +2270,7 @@ function App() {
   ): Promise<boolean> {
     if (!preserveDomiEntityOpen) cancelPendingDomiEntityOpen();
     if (view === workspaceViewRef.current) return true;
+    if (workspaceViewRef.current === 'research' && !await flushResearchDocuments()) return false;
     if (
       workspaceViewRef.current === "data"
       && view !== "data"
@@ -2328,6 +2358,7 @@ function App() {
     if (!await saveOpenMarkdown()) {
       return { ok: false, error: "Markdown 文档尚未保存，请处理保存错误后重试关闭。" };
     }
+    if (!await flushResearchDocuments()) return { ok: false, error: '主题研究文档尚未保存，请处理保存错误后再关闭。' };
     while (databaseAutoSaveInFlightRef.current && Date.now() < closeDeadline) {
       await new Promise((resolve) => window.setTimeout(resolve, 50));
     }
@@ -2497,7 +2528,7 @@ function App() {
           attachment.path === submittedAttachments[index]?.path
         );
       if (
-        draft.input !== submittedInput
+        composeDocumentQuestion(draft.input, draft.documentQuotes, draft.sourceScope) !== submittedInput
         || draft.selectedWorkflowId !== submittedWorkflowId
         || (submittedScope !== undefined && (draft.sourceScope || "research") !== submittedScope)
         || !sameAttachments
@@ -2505,7 +2536,7 @@ function App() {
         return current;
       }
       const next = { ...current };
-      if (draft.sourceScope) next[threadId] = { ...EMPTY_COMPOSER_DRAFT, sourceScope: draft.sourceScope };
+      if (draft.sourceScope) next[threadId] = remainingScopeDraft(draft);
       else delete next[threadId];
       return next;
     });
@@ -2531,32 +2562,11 @@ function App() {
   const activeQueuedSubmissions = queuedSubmissionsByThread[activeThread.id] || [];
 
   const timeline = activeThread.timeline || [];
-  const lastUsage = activeThread.lastUsage || null;
-  const lastInputTokens = Math.max(0, Number(lastUsage?.input_tokens || 0));
-  const lastCachedInputTokens = Math.min(
-    lastInputTokens,
-    Math.max(0, Number(lastUsage?.cached_input_tokens || 0))
-  );
-  const lastUncachedInputTokens = lastUsage
-    ? lastInputTokens - lastCachedInputTokens
-    : 0;
-  const lastCacheHitRate = lastInputTokens
-    ? Math.round((lastCachedInputTokens / lastInputTokens) * 100)
-    : 0;
-  const lastCacheWriteInputTokens = Math.max(
-    0,
-    Number(lastUsage?.cache_write_input_tokens || 0)
-  );
-  const lastOutputTokens = Math.max(0, Number(lastUsage?.output_tokens || 0));
-  const lastReasoningOutputTokens = Math.max(
-    0,
-    Number(lastUsage?.reasoning_output_tokens || 0)
-  );
   const markdownDirty = Boolean(markdownDocument && markdownDraft !== markdownDocument.content);
   const markdownPanelActive = Boolean(markdownDocument || markdownLoading || markdownRequestLabel);
   const pdfPanelActive = Boolean(pdfDocument || pdfLoading || pdfRequestLabel);
   const openDocumentActive = markdownPanelActive || pdfPanelActive;
-  const documentPanelActive = workspaceView !== "documents" && openDocumentActive;
+  const documentPanelActive = workspaceView !== "documents" && workspaceView !== 'research' && openDocumentActive;
   const activeRightPanelWidth = documentPanelActive ? documentPanelWidth : contextPanelWidth;
   const filteredDocumentLibraryNodes = useMemo(
     () => filterDocumentLibraryNodes(documentLibrary?.nodes || [], documentLibraryQuery),
@@ -6224,10 +6234,10 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
   function attachDomiDocumentToComposer(result: DocumentLibrarySearchMatch) {
     cancelPendingDomiEntityOpen();
     setDomiSearchError("");
-    setAttachments((current) => {
-      if (current.some((attachment) => attachment.path === result.path)) return current;
-      return [...current, { name: result.name, path: result.path, size: result.size }];
-    });
+    updateComposerDraft(activeThreadId, (draft) => ({ ...draft, sourceScope: "selected", selectedWorkflowId: undefined,
+      attachmentError: "", attachments: draft.attachments.some((file) => file.path === result.path) ? draft.attachments
+        : [...draft.attachments, { name: result.name, path: result.path, size: result.size }] }));
+    window.requestAnimationFrame(() => composerRef.current?.focus());
   }
 
   async function openDomiDocumentSearchResult(result: DocumentLibrarySearchMatch) {
@@ -6235,9 +6245,8 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
     cancelPendingDomiEntityOpen();
     setDomiSearchError("");
     if (!await navigateWorkspace("documents", true)) return;
-    setDocumentLibrarySidebarExpanded(true);
     setThreadMenuId(null);
-    setRightPanelOpen(false);
+    setRightPanelOpen(true);
     setDocumentLibraryQuery("");
     setDocumentLibrarySearchActivePath("");
     let library = documentLibrary;
@@ -6342,9 +6351,8 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
     if (!await navigateWorkspace("documents", true)) return;
     if (requestId !== domiEntityOpenRequestRef.current) return;
 
-    setDocumentLibrarySidebarExpanded(true);
     setThreadMenuId(null);
-    setRightPanelOpen(false);
+    setRightPanelOpen(true);
     setDocumentLibraryQuery("");
     setDocumentLibrarySearchActivePath("");
     setDocumentLibraryError("");
@@ -6464,7 +6472,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
       requestId !== domiEntityOpenRequestRef.current
       || workspaceViewRef.current !== "documents"
     ) return;
-    if (isLocalPdfResource(homepageResource)) {
+    if (isLocalPdfResource(homepageResource) || isLocalWordResource(homepageResource)) {
       await openPdf(homepageResource, undefined, false, requestId);
     } else {
       await openMarkdown(homepageResource, undefined, requestId);
@@ -7777,7 +7785,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
         : displayText,
       workflowId: workflow?.id,
       sourceScope: submittedScope,
-      attachments: selectedAttachments
+      attachments: submittedScope === 'model' ? [] : selectedAttachments
     };
 
     const assistantId = createId("assistant");
@@ -7887,7 +7895,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
         requestOrigin,
         userInstructionText,
         activeDocumentPath: options.activeDocumentPath,
-        attachmentPaths: selectedAttachments.map((attachment) => attachment.path),
+        attachmentPaths: submittedScope === 'model' ? [] : selectedAttachments.map((attachment) => attachment.path),
         sourceScope: submittedScope,
         // A left-sidebar task is one continuous conversation. Filesystem and
         // entity finalization may be isolated without splitting model context.
@@ -8009,7 +8017,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
     event.preventDefault();
     const sourceThread = activeThread;
     const sourceThreadId = sourceThread.id;
-    const submittedInput = input;
+    const submittedInput = composeDocumentQuestion(input, documentQuotes, sourceScope);
     const submittedAttachments = [...attachments];
     const submittedScope = sourceScope;
     try { validateSourceSelection(submittedScope, submittedAttachments); }
@@ -8017,6 +8025,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
     const submittedActiveDocumentPath = selectedDocumentLibraryPath || undefined;
     const submittedWorkflow = selectedWorkflow;
     const submittedRequest = submittedInput;
+    if (submittedScope === 'model' && !submittedInput.trim()) { setThreadAttachmentError(sourceThreadId, '请输入问题或主动引用文字选段。模型直答不会读取已添加的文件。'); return; }
     if (attachmentImportCount > 0) {
       setThreadAttachmentError(sourceThreadId, "附件仍在导入，请等待完成后再发送。");
       return;
@@ -8031,7 +8040,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
         sourceScope: submittedScope,
         activeDocumentPath: submittedActiveDocumentPath,
         requestOrigin: "user",
-        userInstructionText: submittedInput.trim(),
+        userInstructionText: input.trim(),
       });
       return;
     }
@@ -8045,7 +8054,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
       sourceScope: submittedScope,
       activeDocumentPath: submittedActiveDocumentPath,
       requestOrigin: "user",
-      userInstructionText: submittedInput.trim(),
+      userInstructionText: input.trim(),
       useDomiPlugin: domiPluginEnabled,
       model,
       reasoningEffort,
@@ -8171,7 +8180,8 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
     setQueuedSubmissionsByThread(nextState);
     if (queued) {
       void Promise.allSettled(
-        queued.attachments.map((attachment) => workbench.discardStagedAttachment(attachment.path))
+        queued.attachments.filter((attachment) => !attachmentPathInUse(attachment.path))
+          .map((attachment) => workbench.discardStagedAttachment(attachment.path))
       );
     }
     setPausedQueuedSubmissionIds((current) => {
@@ -8341,8 +8351,22 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
     }
   }
 
+  // A selected scope survives sends. Its staging files can also be shared by
+  // an accepted turn, a queued question or an older citation. Removing a chip
+  // edits the next question, and must not revoke any of those source grants.
+  function attachmentPathInUse(filePath: string, ignoreDraftThreadId?: string) {
+    return Object.entries(composerDraftsByThreadRef.current).some(([threadId, draft]) =>
+      threadId !== ignoreDraftThreadId && draft.attachments.some((file) => file.path === filePath))
+      || Object.values(queuedSubmissionsByThreadRef.current).flat().some((queued) => queued.attachments.some((file) => file.path === filePath))
+      || [...runContextRef.current.values()].some((run) => run.attachments?.some((file) => file.path === filePath))
+      || threadsRef.current.some((thread) => thread.messages.some((message) => message.attachments?.some((file) => file.path === filePath)));
+  }
+
   async function removeAttachment(filePath: string) {
-    setAttachments((current) => current.filter((file) => file.path !== filePath));
+    updateComposerDraft(activeThreadId, draft => ({ ...draft,
+      attachments: draft.attachments.filter(file => file.path !== filePath),
+      documentQuotes: draft.documentQuotes?.filter(quote => documentPathKey(quote.path) !== documentPathKey(filePath)) }));
+    if (attachmentPathInUse(filePath, activeThreadId)) return;
     const discarded = await workbench.discardStagedAttachment(filePath);
     if (!discarded.ok && discarded.error && !discarded.error.includes("不是 domi 本轮管理")) {
       setAttachmentError(`附件已从本轮移除，但暂存副本清理失败：${discarded.error}`);
@@ -8660,7 +8684,6 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
     if (!await navigateWorkspace("conversation")) return;
     if (!selectionIsCurrent()) return;
     if (!activateThreadNow(threadId, selectionIntent)) return;
-    setDocumentLibrarySidebarExpanded(false);
     setThreadMenuId(null);
     setComposerDragActive(false);
   }
@@ -8747,10 +8770,6 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
     setThreadMenuId(null);
   }
 
-  function toggleSection(section: keyof typeof openSections) {
-    setOpenSections((current) => ({ ...current, [section]: !current[section] }));
-  }
-
   async function refreshDocumentLibrary(options: { silent?: boolean; force?: boolean } = {}) {
     const requestId = ++documentLibraryRequestRef.current;
     if (!options.silent) setDocumentLibraryLoading(true);
@@ -8783,14 +8802,51 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
     }
   }
 
+  function openDocumentScopePicker() {
+    setDocumentScopePickerThreadId(activeThreadId);
+    if (!documentLibraryLoading) void refreshDocumentLibrary({ silent: Boolean(documentLibrary) });
+  }
+
+  async function addDocumentQuoteToComposer(value: DocumentQuote, threadId: string) {
+    const quote = normalizeDocumentQuotes([value])[0];
+    if (!quote) throw new Error('引用内容无效，请重新选中文字。');
+    const initial = addQuoteToDraft(composerDraftsByThreadRef.current[threadId] || EMPTY_COMPOSER_DRAFT, quote);
+    validateSourceSelection(initial.sourceScope, initial.attachments);
+    if (!await flushResearchDocuments()) throw new Error('研究笔记尚未保存，请先处理保存提示；引用选区仍然保留。');
+    const open = markdownDocumentRef.current;
+    if (open && documentPathKey(open.path) === documentPathKey(quote.path)
+      && markdownDraftRef.current !== open.content && !await saveOpenMarkdown()) {
+      throw new Error('文档尚未保存，请先处理保存提示，再引用提问。');
+    }
+    if (threadId !== activeThreadIdRef.current) throw new Error('当前对话已切换，请在目标对话重新引用，原草稿仍保留。');
+    if (!await navigateWorkspace('conversation')) throw new Error('当前页面尚未保存，引用未加入提问。');
+    const next = addQuoteToDraft(composerDraftsByThreadRef.current[threadId] || EMPTY_COMPOSER_DRAFT, quote);
+    validateSourceSelection(next.sourceScope, next.attachments);
+    updateComposerDraft(threadId, draft => ({ ...next, input: draft.input }));
+    setDocumentScopePickerThreadId(null);
+    setRightPanelOpen(true);
+    if (documentPathKey(selectedDocumentLibraryPath) !== documentPathKey(quote.path)) {
+      openDocument(quote.pages?.[0] ? `${quote.path}#page=${quote.pages[0]}` : quote.path, quote.text.slice(0, 80));
+    }
+    window.requestAnimationFrame(() => composerRef.current?.focus());
+  }
+
+  function applyDocumentScope(files: LocalAttachment[]) {
+    if (documentScopePickerThreadId !== activeThreadId) return;
+    validateSourceSelection("selected", files);
+    const removed = attachments.filter((file) => !files.some((selected) => selected.path === file.path));
+    updateComposerDraft(activeThreadId, (draft) => ({ ...draft, sourceScope: draft.sourceScope === 'both' || draft.sourceScope === 'model' ? draft.sourceScope : 'selected', selectedWorkflowId: undefined,
+      attachments: files, documentQuotes: draft.documentQuotes?.filter(quote => files.some(file => documentPathKey(file.path) === documentPathKey(quote.path))), attachmentError: "" }));
+    setDocumentScopePickerThreadId(null);
+    void Promise.allSettled(removed.filter((file) => !attachmentPathInUse(file.path, activeThreadId))
+      .map((file) => workbench.discardStagedAttachment(file.path)));
+    window.requestAnimationFrame(() => composerRef.current?.focus());
+  }
+
   async function openDocumentLibrary() {
-    const shouldExpand = workspaceViewRef.current === "documents"
-      ? !documentLibrarySidebarExpanded
-      : true;
     if (!await navigateWorkspace("documents")) return;
-    setDocumentLibrarySidebarExpanded(shouldExpand);
     setThreadMenuId(null);
-    setRightPanelOpen(false);
+    setRightPanelOpen(true);
     if (!documentLibraryLoading) {
       void refreshDocumentLibrary({ silent: Boolean(documentLibrary) });
     }
@@ -8798,7 +8854,6 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
 
   async function openPrimaryWorkspace(view: "tasks" | "news" | "subscriptions" | "data") {
     if (!await navigateWorkspace(view)) return;
-    setDocumentLibrarySidebarExpanded(false);
     setThreadMenuId(null);
     if (view !== "data") return;
     setRightPanelOpen(false);
@@ -8921,7 +8976,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
       return;
     }
     setDocumentLibrarySelectedFolder(parentPath);
-    if (node.kind === "pdf") void openPdf(node.path);
+    if (node.kind === "pdf" || node.kind === 'word') openDocument(node.path);
     else void openMarkdown(node.path);
   }
 
@@ -9067,7 +9122,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
     setPdfFrameLoading(false);
     setPdfError("");
     try {
-      const result = await workbench.readPdf({ resource, basePath });
+      const result = await (isLocalWordResource(resource) ? workbench.readWord({resource,basePath}) : workbench.readPdf({ resource, basePath }));
       if (
         requestId !== pdfOpenRequestRef.current
         || (
@@ -9098,7 +9153,8 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
   }
 
   function openDocument(resource: string, initialSearchQuery = "") {
-    if (isLocalPdfResource(resource)) {
+    if (isLocalPdfResource(resource) || isLocalWordResource(resource)) {
+      setMarkdownInitialSearchQuery(initialSearchQuery);
       setPdfTargetPage(Math.max(1, Number(resource.match(/#page=(\d+)/i)?.[1]) || 1));
       void openPdf(resource);
       return;
@@ -9510,13 +9566,14 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
               documentKey={`${markdownDocument.path}:${markdownOpenRequestRef.current}`}
             >
               <Suspense fallback={<div className="markdown-panel-state"><RefreshCw className="spinning" size={18} />正在加载编辑器</div>}>
-                <RichMarkdownEditor
+                <MaterialReader
                   key={`${markdownDocument.path}:${markdownOpenRequestRef.current}`}
-                  documentPath={markdownDocument.path}
-                  markdown={markdownDraft}
+                  markdown={markdownDocument}
+                  draft={markdownDraft}
                   initialSearchQuery={markdownInitialSearchQuery}
                   onCopyDocument={() => void copyOpenMarkdown()}
                   onBlur={() => void saveOpenMarkdown()}
+                  onBeforeComment={saveOpenMarkdown}
                   onOpenDocument={openDocument}
                   onChange={(content) => {
                     markdownAutoSaveRetryRef.current = 0;
@@ -9536,17 +9593,14 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
   }
 
   function renderPdfPanel() {
-    const previewSrc = pdfDocument
-      ? `${pdfDocument.previewUrl}#page=${pdfTargetPage}&toolbar=1&navpanes=0&view=FitH`
-      : "";
-
+    const format=isLocalWordResource(pdfDocument?.path || pdfRequestLabel)?'Word':'PDF';
     return (
       <div className="markdown-panel-shell pdf-panel-shell">
         <div className="markdown-panel-header">
           <div className="markdown-file-title">
             <FileType2 size={17} />
             <span>
-              <strong>{pdfDocument?.name || "PDF"}</strong>
+              <strong>{pdfDocument?.name || format}</strong>
               <small title={pdfDocument?.path || pdfRequestLabel}>
                 {pdfDocument?.path || pdfRequestLabel}
               </small>
@@ -9555,20 +9609,20 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
           <div className="markdown-header-actions">
             {pdfDocument && (
               <>
-                <button type="button" onClick={reloadOpenPdf} title="重新载入" aria-label="重新载入 PDF">
+                <button type="button" onClick={reloadOpenPdf} title="重新载入" aria-label={`重新载入 ${format}`}>
                   <RefreshCw size={16} />
                 </button>
                 <button
                   type="button"
                   onClick={() => workbench.openResource(pdfDocument.path)}
                   title="用其他应用打开"
-                  aria-label="用其他应用打开 PDF"
+                  aria-label={`用其他应用打开 ${format}`}
                 >
                   <ExternalLink size={16} />
                 </button>
               </>
             )}
-            <button type="button" onClick={() => closePdf()} title="关闭文档" aria-label="关闭 PDF">
+            <button type="button" onClick={() => closePdf()} title="关闭文档" aria-label={`关闭 ${format}`}>
               <X size={17} />
             </button>
           </div>
@@ -9576,28 +9630,22 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
 
         {pdfDocument && (
           <div className="pdf-panel-meta">
-            <span>PDF 预览</span>
+            <span>{format} 阅读预览</span>
             <span>{formatFileSize(pdfDocument.size)}</span>
           </div>
         )}
 
         <div className="markdown-panel-body pdf-panel-body">
           {pdfLoading ? (
-            <div className="markdown-panel-state"><RefreshCw className="spinning" size={18} />正在载入 PDF</div>
+            <div className="markdown-panel-state"><RefreshCw className="spinning" size={18} />正在载入 {format}</div>
           ) : !pdfDocument ? (
             <div className="markdown-panel-state error"><AlertCircle size={18} />{pdfError}</div>
           ) : (
             <>
-              <iframe
+              <Suspense fallback={<div className="markdown-panel-state">正在加载 PDF 阅读器…</div>}><MaterialReader
                 key={`${pdfDocument.path}:${pdfDocument.mtimeMs}:${pdfTargetPage}`}
-                className="pdf-preview-frame"
-                src={previewSrc}
-                title={`${pdfDocument.name} PDF 预览`}
-                onLoad={() => setPdfFrameLoading(false)}
-              />
-              {pdfFrameLoading && (
-                <div className="pdf-frame-loading"><RefreshCw className="spinning" size={18} />正在渲染 PDF</div>
-              )}
+                pdf={'html' in pdfDocument ? undefined : pdfDocument} word={'html' in pdfDocument ? pdfDocument : undefined} targetPage={pdfTargetPage} initialSearchQuery={markdownInitialSearchQuery}
+              /></Suspense>
             </>
           )}
         </div>
@@ -9858,12 +9906,12 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
             <div className="document-library-welcome">
               <span><LibraryBig size={28} /></span>
               <h2>选择一篇文档开始阅读</h2>
-              <p>在左侧“文档库”中展开目录，即可查看并编辑本地 Markdown。</p>
+              <p>在右侧文档库目录中选择文件，即可查看并编辑本地 Markdown。</p>
               <div>
                 <button
                   type="button"
                   onClick={() => {
-                    setDocumentLibrarySidebarExpanded(true);
+                    setRightPanelOpen(true);
                     beginDocumentLibraryCreate("markdown");
                   }}
                   disabled={!documentLibrary?.ok}
@@ -12134,12 +12182,32 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
           }}
           onDrop={handleComposerDrop}
         >
+          {documentQuotes.length > 0 && <div className="composer-document-quotes" aria-label="提问引用" aria-live="polite">
+            {documentQuotes.map((quote, index) => <div className="composer-document-quote" key={quote.id}>
+              <div><button type="button" className="composer-quote-source" title={quote.path}
+                onClick={() => openDocument(quote.pages?.[0] ? `${quote.path}#page=${quote.pages[0]}` : quote.path, quote.text.slice(0, 80))}>
+                <Quote size={14} />引用 {index + 1} · {quote.name} · {quoteLocation(quote)}
+              </button><button type="button" aria-label={`移除引用 ${index + 1}`}
+                onClick={() => updateComposerDraft(activeThreadId, draft => ({ ...draft, documentQuotes: draft.documentQuotes?.filter(item => item.id !== quote.id) }))}><X size={13} /></button></div>
+              <blockquote>{quote.text}</blockquote>
+            </div>)}
+          </div>}
+          <div className="composer-answer-modes" role="group" aria-label="回答方式">
+            <span>回答方式</span>
+            <button type="button" aria-pressed={sourceScope === 'selected' || sourceScope === 'library'}
+              title="仅依据选定文档或全库资料回答，关键结论附可核验引用"
+              onClick={() => setSourceScope(sourceScope === 'library' ? 'library' : 'selected')}>已有资料</button>
+            <button type="button" aria-pressed={sourceScope === 'model'} title="使用模型通用知识和主动提供的选段，本轮不读取资料或联网"
+              onClick={() => setSourceScope('model')}>模型直答</button>
+            <button type="button" aria-pressed={sourceScope === 'both'} title="依次展示资料回答与模型补充，模型补充标明未经资料核验"
+              onClick={() => setSourceScope('both')}>Both · 两者结合</button>
+          </div>
           <textarea
             ref={composerRef}
             rows={variant === "home" ? 2 : 1}
             value={input}
             onChange={(event) => setInput(event.target.value)}
-            placeholder={selectedWorkflow
+            placeholder={sourceScope === 'model' ? '直接向模型提问，也可以带上主动引用的选段…' : sourceScope === 'both' ? '提问后分别查看资料依据与模型补充…' : sourceScope === "selected" ? "询问选定文档中的内容，回答将附原文引用…" : selectedWorkflow
               ? `补充材料或目标，运行「${selectedWorkflow.title}」`
               : variant === "dock"
                 ? "随心输入"
@@ -12198,7 +12266,10 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
             </div>
           )}
           {isRestrictedScope(sourceScope) && <div className="composer-source-notice" role="status">
-            只读资料问答 · 不联网、不入库 · 本轮不复用历史回答{sourceScope === "selected" ? ` · 已选 ${attachments.length} 份材料` : ""}
+            {sourceScope === 'model' ? <>使用模型通用知识和主动引用的选段 · 本轮不读取资料、不联网{attachments.length > 0 ? ` · ${attachments.length} 份文档保留供切换模式使用` : ''}</>
+              : sourceScope === 'both' ? <>依据 {attachments.length} 份选定文档回答，另列模型补充（未由资料核验） · <button type="button" onClick={openDocumentScopePicker}>调整范围</button></>
+              : sourceScope === "selected" ? <>仅依据 {attachments.length} 份选定文档 · 关键结论附原文引用 · 范围保留供继续追问 · <button type="button" onClick={openDocumentScopePicker}>调整范围</button></>
+              : "只读资料问答 · 不联网、不入库 · 本轮不复用历史回答"}
           </div>}
           {attachmentImportCount > 0 && (
             <div className="attachment-error" role="status">正在安全导入附件，完成后即可发送…</div>
@@ -12224,14 +12295,18 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
               >
                 <Plus size={20} />
               </button>
-              <label className="composer-source-scope">
+              {sourceScope !== 'model' && sourceScope !== 'both' && <label className="composer-source-scope">
                 <LibraryBig size={14} aria-hidden="true" />
                 <select aria-label="资料来源范围" value={sourceScope} onChange={(event) => setSourceScope(event.target.value as SourceScope)}>
                   <option value="selected">仅选定材料</option>
                   <option value="library">全库资料 · 不联网</option>
                   <option value="research">全库＋联网研究</option>
                 </select>
-              </label>
+              </label>}
+              <button type="button" className={`composer-scope-picker ${isSelectedDocumentScope(sourceScope) ? "active" : ""}`}
+                onClick={openDocumentScopePicker} disabled={attachmentImportCount > 0} title={sourceScope === 'model' ? '文档可保留供切换模式使用；模型直答只使用主动引用选段' : '选择本轮资料范围，资料回答中的关键结论附原文引用'}>
+                <FileText size={14} />{(isSelectedDocumentScope(sourceScope) || sourceScope === 'model') && attachments.length ? `已选 ${attachments.length} 份文档` : "选择文档"}
+              </button>
               {isRestrictedScope(sourceScope) ? <span className="composer-source-readonly">资料问答</span> : selectedWorkflow ? (
                 <button
                   className="selected-workflow"
@@ -12373,7 +12448,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
                   attachmentImportCount > 0
                   || (!isRunning && submissionBusyThreadIds.has(activeThread.id))
                   || !codexStatus?.ok
-                  || (!input.trim() && attachments.length === 0)
+                  || (!input.trim() && (sourceScope === 'model' ? documentQuotes.length === 0 : attachments.length === 0))
                 }
               >
                 <ArrowUp size={20} />
@@ -12602,7 +12677,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
                           <strong>{document.name}</strong>
                           <small className="domi-document-result-snippet">{document.snippet}</small>
                           <small className="domi-document-result-path">
-                            {[document.kind === "pdf" ? "PDF" : "Markdown", document.line ? `第 ${document.line} 行` : "", document.relativePath]
+                            {[document.kind === "pdf" ? "PDF" : document.kind === 'word' ? 'Word' : "Markdown", document.line ? `第 ${document.line} 行` : "", document.relativePath]
                               .filter(Boolean)
                               .join(" · ")}
                           </small>
@@ -12611,7 +12686,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
                           type="button"
                           className="domi-document-result-attach"
                           onClick={() => attachDomiDocumentToComposer(document)}
-                          title="把这个文件作为附件加入当前对话的下一轮提问"
+                          title="加入选定文档范围，仅依据这些文档回答并引用原文"
                         >
                           ＋加入提问
                         </button>
@@ -12652,6 +12727,9 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
         </div>
 
         <nav className="sidebar-primary-nav" aria-label="工作台导航">
+          <button className={`sidebar-nav-item ${workspaceView === 'research' ? 'active' : ''}`} type="button" onClick={async () => {
+            if (await navigateWorkspace('research')) { setResearchMounted(true); setRightPanelOpen(false); }
+          }}><FileText className="sidebar-nav-icon" size={19} strokeWidth={1.9} /><span>主题研究</span><span className="sidebar-nav-meta" /></button>
           <button
             className={`sidebar-nav-item ${workspaceView === "tasks" ? "active" : ""}`}
             type="button"
@@ -12701,23 +12779,15 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
             <strong>资料库</strong>
             <span className="sidebar-nav-meta" />
           </button>
-          <div className={`sidebar-document-section ${documentLibrarySidebarExpanded ? "open" : ""}`}>
-            <button
-              className={`sidebar-nav-item ${workspaceView === "documents" ? "active" : ""}`}
-              type="button"
-              onClick={openDocumentLibrary}
-              aria-expanded={documentLibrarySidebarExpanded}
-            >
-              <LibraryBig className="sidebar-nav-icon" size={19} strokeWidth={1.9} />
-              <strong>文档库</strong>
-              <span className="sidebar-nav-meta">
-                <span className="sidebar-nav-disclosure" aria-hidden="true">
-                  <ChevronRight size={14} strokeWidth={2} />
-                </span>
-              </span>
-            </button>
-            {documentLibrarySidebarExpanded && renderDocumentLibrarySidebar()}
-          </div>
+          <button
+            className={`sidebar-nav-item ${workspaceView === "documents" ? "active" : ""}`}
+            type="button"
+            onClick={openDocumentLibrary}
+          >
+            <LibraryBig className="sidebar-nav-icon" size={19} strokeWidth={1.9} />
+            <strong>文档库</strong>
+            <span className="sidebar-nav-meta" />
+          </button>
         </nav>
 
         <div className={`sidebar-workflow-section ${skillsExpanded ? "open" : ""}`}>
@@ -12971,7 +13041,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
       <main className="workspace">
         <header className={`topbar ${workspaceView === "conversation" && !hasConversation ? "new-task-topbar" : ""}`}>
           <div className="project-title">
-            <strong>{workspaceView === "tasks"
+            <strong>{workspaceView === 'research' ? '主题研究' : workspaceView === "tasks"
               ? "待办事项"
               : workspaceView === "news"
                 ? "行业动态"
@@ -12980,7 +13050,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
                 : workspaceView === "documents"
                   ? "文档库"
                 : activeThread.title}</strong>
-            <span>{workspaceView === "tasks"
+            <span>{workspaceView === 'research' ? '阅读、摘录与自己的分析' : workspaceView === "tasks"
               ? `${taskNavigationCount} 个待办事项`
               : workspaceView === "news"
                 ? "domi 行业雷达"
@@ -12996,7 +13066,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
             <button
               type="button"
               className="icon-button"
-              onClick={() => void (workspaceView === "tasks"
+              onClick={() => void (workspaceView === 'research' ? window.dispatchEvent(new Event('domi:research-changed')) : workspaceView === "tasks"
                 ? refreshDomi()
                 : workspaceView === "news"
                   ? scanWeeklyNews()
@@ -13012,7 +13082,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
                 : workspaceView === "documents"
                   ? documentLibraryLoading
                 : domiSyncing}
-              title={workspaceView === "tasks"
+              title={workspaceView === 'research' ? '刷新主题研究' : workspaceView === "tasks"
                 ? "刷新待办事项来源"
                 : workspaceView === "news"
                   ? "运行 domi 行业雷达"
@@ -13021,7 +13091,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
                   : workspaceView === "documents"
                     ? "刷新本地文档库"
                   : domiError ? `重新同步 domi：${domiError}` : "同步 domi 项目与人脉"}
-              aria-label={workspaceView === "tasks"
+              aria-label={workspaceView === 'research' ? '刷新主题研究' : workspaceView === "tasks"
                 ? "刷新任务来源"
                 : workspaceView === "news"
                   ? "运行 domi 行业雷达"
@@ -13047,8 +13117,8 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
               className={`icon-button ${rightPanelOpen ? "active" : ""}`}
               onClick={() => setRightPanelOpen((current) => !current)}
               title={rightPanelOpen
-                ? documentPanelActive ? "收起文档" : "收起今日工作"
-                : documentPanelActive ? "展开文档" : "展开今日工作"}
+                ? documentPanelActive ? "收起文档" : "收起文档库"
+                : documentPanelActive ? "展开文档" : "展开文档库"}
               aria-label={rightPanelOpen ? "收起侧边栏" : "展开侧边栏"}
             >
               {rightPanelOpen ? <PanelRightClose size={18} /> : <PanelRightOpen size={18} />}
@@ -13057,17 +13127,18 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
         </header>
 
 <div
-className={`main-grid ${rightPanelOpen ? "right-open" : "right-closed"} ${documentPanelActive ? "document-open" : ""} ${workspaceView === "tasks" ? "task-view" : workspaceView === "news" ? "news-view" : workspaceView === "subscriptions" ? "subscriptions-view" : workspaceView === "data" ? "data-view" : workspaceView === "documents" ? "document-library-view" : ""}`}
+className={`main-grid ${rightPanelOpen && workspaceView !== 'research' ? "right-open" : "right-closed"} ${workspaceView === 'research' ? 'research-view' : ''} ${documentPanelActive ? "document-open" : ""} ${workspaceView === "tasks" ? "task-view" : workspaceView === "news" ? "news-view" : workspaceView === "subscriptions" ? "subscriptions-view" : workspaceView === "data" ? "data-view" : workspaceView === "documents" ? "document-library-view" : ""}`}
           style={{ "--right-panel-width": `${activeRightPanelWidth}px` } as CSSProperties}
         >
           <section className={`chat-pane ${workspaceView === "tasks" ? "task-mode" : workspaceView === "news" ? "news-mode" : workspaceView === "subscriptions" ? "subscriptions-mode" : workspaceView === "data" ? "data-mode" : workspaceView === "documents" ? "document-library-mode" : hasConversation ? "has-conversation" : "is-home"}`}>
+            {researchMounted && <SectionErrorBoundary resetKey={`research:${researchRequest.nonce}`} title="主题研究暂时无法显示" description="本地文档与已缓存草稿仍然保留，可以重试加载。"><Suspense fallback={<div className="markdown-panel-state">正在加载主题研究…</div>}><ResearchWorkspace visible={workspaceView === 'research'} request={researchRequest} /></Suspense></SectionErrorBoundary>}
             <SectionErrorBoundary
               resetKey={`${workspaceView}:${activeThread.id}:${visibleMessages.length}:${visibleMessages[visibleMessages.length - 1]?.content.length || 0}:${weeklyNews?.syncedAt || 0}`}
               title="工作区暂时无法显示"
               description="当前任务和本地数据仍然保留，可以重试加载这部分界面。"
             >
               <RenderRegion render={() => (
-              workspaceView === "tasks"
+              workspaceView === 'research' ? null : workspaceView === "tasks"
                 ? renderTaskBoard()
                 : workspaceView === "news"
                   ? renderNewsWorkspace()
@@ -13245,7 +13316,7 @@ className={`main-grid ${rightPanelOpen ? "right-open" : "right-closed"} ${docume
           <div
             className="panel-resizer right-panel-resizer"
             role="separator"
-            aria-label={documentPanelActive ? "调整文档栏宽度" : "调整今日工作栏宽度"}
+            aria-label={documentPanelActive ? "调整文档栏宽度" : "调整文档库目录宽度"}
             aria-orientation="vertical"
             aria-valuemin={documentPanelActive ? 360 : 280}
             aria-valuemax={Math.max(documentPanelActive ? 360 : 280, window.innerWidth - leftPanelWidth - 420)}
@@ -13263,100 +13334,27 @@ className={`main-grid ${rightPanelOpen ? "right-open" : "right-closed"} ${docume
           <aside className={`right-panel ${documentPanelActive ? "document-panel" : ""}`}>
             <SectionErrorBoundary
               resetKey={`${documentPanelActive ? "document" : "context"}:${markdownDocument?.path || pdfDocument?.path || "none"}:${markdownDocument?.mtimeMs || pdfDocument?.mtimeMs || 0}`}
-              title={documentPanelActive ? "文档栏暂时无法显示" : "今日工作暂时无法显示"}
+              title={documentPanelActive ? "文档栏暂时无法显示" : "文档库目录暂时无法显示"}
               description="主任务没有受到影响，可以重试加载右侧内容。"
             >
               <RenderRegion render={() => (
               documentPanelActive ? renderDocumentPanel() : (
-            <>
+            <div className="right-panel-library">
             <div className="right-panel-header">
               <div>
-                <strong>今日工作</strong>
-                <span>
-                  {todayLabel()} · {domiSnapshot
-                    ? `${domiSnapshot.sources.projects.total} 项目 / ${domiSnapshot.sources.people.total} 人脉${domiSnapshot.sources.projects.needsNameReview ? ` · ${domiSnapshot.sources.projects.needsNameReview} 个项目名待确认` : ""}`
-                    : domiSyncing ? "正在连接 domi" : "等待 domi 数据"}
+                <strong>文档库</strong>
+                <span title={documentLibrary?.rootPath || "本地资料库"}>
+                  {documentLibrary?.rootName || "本地资料库"}
                 </span>
               </div>
-              <button type="button" onClick={() => setRightPanelOpen(false)} title="收起今日工作">
+              <button type="button" onClick={() => setRightPanelOpen(false)} title="收起文档库">
                 <PanelRightClose size={18} />
               </button>
             </div>
 
-            <section className={`panel-section ${openSections.domi ? "open" : ""}`}>
-              <button className="panel-title" type="button" onClick={() => toggleSection("domi")}>
-                <span><Gauge size={17} />domi 状态</span>
-                {openSections.domi ? <ChevronDown size={17} /> : <ChevronRight size={17} />}
-              </button>
-              <div className="panel-content">
-                {domiError && (
-                  <div className="domi-inline-error actionable" role="status">
-                    <AlertCircle size={14} />
-                    <span>{domiError}</span>
-                    <button
-                      type="button"
-                      onClick={() => void refreshDomi()}
-                      disabled={domiSyncing}
-                    >
-                      {domiSyncing ? "重试中" : "重试"}
-                    </button>
-                  </div>
-                )}
-                <div className="domi-health-list">
-                  <div>
-                    <span>插件</span>
-                    <strong>
-                      {domiSnapshot?.health.plugin.ok
-                        ? `v${domiSnapshot.health.plugin.version}`
-                        : "等待检测"}
-                    </strong>
-                  </div>
-                  <div>
-                    <span>项目与人脉</span>
-                    <strong>{domiSnapshot?.health.lark.ok
-                      ? domiSnapshot.backend === "local" ? "本地已同步" : "已同步"
-                      : "未连接"}</strong>
-                  </div>
-                </div>
-              </div>
-            </section>
+            {renderDocumentLibrarySidebar()}
 
-            <section className={`panel-section timeline-section ${openSections.timeline ? "open" : ""}`}>
-              <button className="panel-title" type="button" onClick={() => toggleSection("timeline")}>
-                <span><TerminalSquare size={17} />Codex 运行</span>
-                {openSections.timeline ? <ChevronDown size={17} /> : <ChevronRight size={17} />}
-              </button>
-              <div className="panel-content">
-                {lastUsage && (
-                  <div
-                    className="usage-row"
-                    title="本轮可观测用量；新增输入 = Input - Cached。Cached 已包含在 Input 内；失败、取消或旧记录可能不完整。"
-                  >
-                    <span>
-                      本轮可观测用量{lastUsage.usage_complete === false ? "（可能不完整）" : ""}
-                    </span>
-                    <span>新增输入 {lastUncachedInputTokens.toLocaleString("zh-CN")}</span>
-                    <span>缓存读取 {lastCachedInputTokens.toLocaleString("zh-CN")}（{lastCacheHitRate}%）</span>
-                    <span>缓存写入 {lastCacheWriteInputTokens.toLocaleString("zh-CN")}</span>
-                    <span>输出 {lastOutputTokens.toLocaleString("zh-CN")}</span>
-                    <span>推理 {lastReasoningOutputTokens.toLocaleString("zh-CN")}</span>
-                  </div>
-                )}
-                <div className="timeline-list">
-                  {timeline.length === 0 && <div className="empty-state">等待下一次运行</div>}
-                  {timeline.map((item) => (
-                    <div className="timeline-item" key={item.id}>
-                      {item.kind === "error" ? <AlertCircle size={15} /> : <CheckCircle2 size={15} />}
-                      <div>
-                        <strong>{item.title}</strong>
-                        {item.detail && <span>{item.detail}</span>}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </section>
-            </>
+            </div>
             ))} />
             </SectionErrorBoundary>
           </aside>
@@ -13377,6 +13375,13 @@ className={`main-grid ${rightPanelOpen ? "right-open" : "right-closed"} ${docume
           立即重试
         </button>
       </div>
+    )}
+    {documentScopePickerThreadId === activeThreadId && (
+      <Suspense fallback={<div className="lazy-overlay">正在打开文档选择…</div>}>
+        <DocumentScopePicker library={documentLibrary} loading={documentLibraryLoading} error={documentLibraryError} sourceScope={sourceScope}
+          initialSelection={attachments} onRefresh={() => void refreshDocumentLibrary({ force: true })}
+          onApply={applyDocumentScope} onClose={() => setDocumentScopePickerThreadId(null)} />
+      </Suspense>
     )}
     {settingsOpen && appSettings && (
       <Suspense fallback={<div className="lazy-overlay"><RefreshCw className="spinning" size={20} />正在加载设置</div>}>

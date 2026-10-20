@@ -22,6 +22,16 @@ function cache(t, cleanup = true) {
 }
 const fakeBatch = async (blocks) => blocks.map((b) => ({ id: b.id, text: "完整中文译文：" + b.text.split(/(⟪保留[^⟫]+⟫)/).map((p) => p.startsWith("⟪保留") ? p : p.replace(/[A-Za-z][A-Za-z'-]*/g, "文字")).join("") }));
 
+test("short video captions keep timestamps outside model output just like long transcripts",async t=>{
+  const translator=new ChineseTranslator({cacheRoot:cache(t),translateBatch:async blocks=>{
+    assert.ok(blocks.every(block=>!block.text.includes("[0:01]")&&!block.text.includes("[0:07]")));
+    return fakeBatch(blocks);
+  }});t.after(()=>translator.close());
+  const result=await translator.translate("# Full transcript\n\n[0:01] The first complete sentence.\n[0:07] The last complete sentence.");
+  assert.equal(result.receipt.captionRowsVerified,2);assert.equal(result.receipt.captionTimestampsManagedByProgram,true);
+  assert.deepEqual(result.text.match(/^\[.*?\]/gm),["[0:01]","[0:07]"]);
+});
+
 test("timed-out translation batches shrink immediately and preserve every row and cached resume", async (t) => {
   const root = cache(t), calls = [], progress = [];
   const translator = new ChineseTranslator({ cacheRoot: root, translateBatch: async (blocks) => {
@@ -70,7 +80,7 @@ test("numeric values, timestamps, code, URLs and speaker labels cannot be droppe
     assert.equal(restoreText(protectedLabel.text, protectedLabel), label);
   }
   assert.throws(() => restoreText("## Conclusion", protectText("## Conclusion")), /仍是英文/);
-  const contact = "联系：[ClusterMAX3.0@semianalysis.com](mailto:ClusterMAX3.0@semianalysis.com)";
+  const contact = "联系：[contact@example.com](mailto:contact@example.com)";
   const protectedContact = protectText(contact);
   assert.equal(protectedContact.values.length, 2);
   assert.equal(restoreText(protectedContact.text, protectedContact), contact);

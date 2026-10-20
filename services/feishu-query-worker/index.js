@@ -42,6 +42,8 @@ function excerpt(value, maxLength) {
 
 // 与 electron/intake-feishu.cjs 的 parseInboxQuery 保持同步；
 // scripts/feishu-query-worker.test.cjs 有两份实现的契约测试。
+// 云端没有本地库会话：「续读」与深度问答由桌面 domi 在线时作答，
+// 云端只作说明与快照快速检索，不借快照冒充深度问答。
 function parseInboxQuery(text) {
   const trimmed = String(text || "").trim();
   if (!trimmed) return null;
@@ -53,6 +55,13 @@ function parseInboxQuery(text) {
     const keyword = searchMatch[1].trim();
     if (keyword) return { kind: "search", keyword };
   }
+  const continueMatch = trimmed.match(/^(?:续读|继续读)\s*([1-9]\d?)$/);
+  if (continueMatch) return { kind: "continue", keyword: continueMatch[1] };
+  const explicitQuestion = trimmed.match(/^(?:问问?|deep)\s*(?:[:：,，]\s*|\s+)(.{2,500})$/i);
+  const questionText = explicitQuestion
+    ? explicitQuestion[1].trim()
+    : (trimmed.length >= 6 && trimmed.length <= 500 && /[?？]$/.test(trimmed) ? trimmed : "");
+  if (questionText) return { kind: "question", keyword: questionText.slice(0, 200) };
   return null;
 }
 
@@ -153,6 +162,15 @@ function buildAnswer(query, snapshot) {
     body = rows.length
       ? [`最近行业动态（${rows.length} 条）：`, "", ...rows].join("\n\n")
       : "资料库还没有行业动态。";
+  } else if (query?.kind === "question") {
+    // 云端快照只有实体/动态摘要字段，不能支撑原文问答；如实说明边界。
+    const keyword = excerpt(query.keyword, 40);
+    body = [
+      `「${keyword}」是基于本地资料库的深度问答，需要桌面 domi 在线时检索原文并由模型作答（附来源引用）。`,
+      "云端只有快速检索快照；可发「查 关键词」快速查询，或等电脑端的 domi 开机后重发问题。"
+    ].join("\n");
+  } else if (query?.kind === "continue") {
+    body = "「续读」依赖桌面 domi 的本地资料会话（约 2 小时内有效）；电脑开机后重新发一次问题即可重建会话。";
   } else if (query?.kind === "search" && query.keyword) {
     const keyword = query.keyword.toLowerCase();
     const newsHits = (snapshot.news || []).filter((item) =>

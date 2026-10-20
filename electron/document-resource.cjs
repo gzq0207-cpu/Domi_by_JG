@@ -1,7 +1,7 @@
 const path = require("node:path");
 const { fileURLToPath } = require("node:url");
 
-const DOCUMENT_EXTENSION_PATTERN = /\.(?:md|markdown|pdf)$/i;
+const DOCUMENT_EXTENSION_PATTERN = /\.(?:md|markdown|pdf|docx|doc)$/i;
 const LINE_SUFFIX_PATTERN = /:(\d+)(?::(\d+))?$/;
 
 function unwrapDocumentDestination(value) {
@@ -12,7 +12,7 @@ function unwrapDocumentDestination(value) {
     candidate = candidate.slice(1, -1).trim();
   }
   const titled = candidate.match(/^(.+?)(?:\s+["'][^"']*["'])$/s);
-  if (titled && /\.(?:md|markdown|pdf)(?::\d+(?::\d+)?)?(?:[?#].*)?$/i.test(titled[1])) {
+  if (titled && /\.(?:md|markdown|pdf|docx|doc)(?::\d+(?::\d+)?)?(?:[?#].*)?$/i.test(titled[1])) {
     candidate = titled[1].trim();
   }
   return candidate;

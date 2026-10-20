@@ -30,6 +30,7 @@ test("mirrorTargetFiles selects news, digests and entity homepages only", () => 
   write("07.模型层/_行业认知/动态/2026/09/art_a-原文.md");
   write("13.认知库/订阅日报/AI-Builders-Digest-2026-09-22.md");
   write("13.认知库/知识库日报/2026-09-23.md");
+  write("13.认知库/订阅日报/.sources/.backups/内部备份哈希值.md");
   write("03.算力芯片/Agent框架/AI科技/项目主页.md");
   write("03.算力芯片/Agent框架/AI科技/原始材料/尽调报告.md");
   write("03.算力芯片/Agent框架/AI科技/纪要/交流纪要.md");
@@ -45,6 +46,9 @@ test("mirrorTargetFiles selects news, digests and entity homepages only", () => 
   assert.ok(targets.includes("13.认知库/知识库日报/2026-09-23.md"));
   assert.ok(targets.includes("03.算力芯片/Agent框架/AI科技/项目主页.md"));
   assert.ok(targets.includes("12.人脉/张三/人物主页.md"));
+  // 隐藏备份目录（.sources/.backups）不镜像到飞书。
+  assert.ok(!targets.some((item) => item.includes(".sources")));
+  assert.ok(!targets.some((item) => item.includes(".backups")));
   // 主题研究不属于动态镜像范围。
   assert.ok(!targets.includes("08.基础软件与工具链/_行业认知/主题研究/综述.md"));
   // 材料、纪要、待办都不镜像。
@@ -65,6 +69,8 @@ test("isMirrorTarget matches homepages regardless of nesting", () => {
   assert.equal(isMirrorTarget(["07.模型层", "_行业认知", "动态"], "项目主页.md"), true);
   assert.equal(isMirrorTarget(["12.人脉", "某人"], "人物主页.md"), true);
   assert.equal(isMirrorTarget(["12.人脉", "某人"], "背景研究.md"), false);
+  // 隐藏目录（内部备份）即使在订阅日报目录下也不镜像。
+  assert.equal(isMirrorTarget(["13.认知库", "订阅日报", ".sources", ".backups"], "备份.md"), false);
 });
 
 function fakeLarkMirror(root, statePath) {
@@ -118,7 +124,7 @@ function fakeLarkMirror(root, statePath) {
           document: {
             document_id: docId,
             node_token: nodeToken,
-            url: `https://example.feishu.cn/wiki/${nodeToken}`
+            url: `https://tenant.example.invalid/wiki/${nodeToken}`
           }
         }
       };
@@ -225,7 +231,7 @@ test("sync tolerates remote images and rewrites relative links (lenient mirror m
     libraryRoot: root,
     runLark: async (args) => {
       if (args[0] === "docs" && args[1] === "+create") {
-        return { data: { document: { document_id: `dx_${Date.now()}`, node_token: `nt_${Date.now()}`, url: "https://example.feishu.cn/wiki/x" } } };
+        return { data: { document: { document_id: `dx_${Date.now()}`, node_token: `nt_${Date.now()}`, url: "https://tenant.example.invalid/wiki/x" } } };
       }
       if (args[0] === "docs" && args[1] === "+fetch") {
         return { data: { document: { content: "# 内容\n\n正文。" } } };
@@ -287,6 +293,142 @@ test("text completeness allows a title and formatting changes but detects missin
     "结尾。\n" + prepared.content.replace("结尾。", "")]) {
     assert.equal(verifyMirrorText(prepared, actual).ok, false);
   }
+});
+
+test("text completeness tolerates Feishu merging adjacent link tokens but not real loss", () => {
+  // 两个空格分隔的 t.co 链接：飞书导入后导出会丢失中间空格合并成一个单元。
+  const prepared = { content: "感谢促成这件事！ https://t.co/5kDekuLbuS https://t.co/vgkesXELrf 之后见。" };
+  const merged = "感谢促成这件事！ https://t.co/5kDekuLbuShttps://t.co/vgkesXELrf 之后见。";
+  assert.equal(verifyMirrorText(prepared, merged).ok, true, "相邻链接合并必须通过");
+  // 合并只容忍「恰好等于连续预期 token 的拼接」：丢内容、改内容仍然失败。
+  assert.equal(verifyMirrorText(prepared, merged.replace("之后见", "之后")).ok, false, "内容缺失必须失败");
+  assert.equal(verifyMirrorText(prepared, "感谢促成这件事！ https://t.co/5kDekuLbuS 之后见。").ok, false, "缺第二个链接必须失败");
+  // token 前缀多了内容（不是精确拼接）不算合并。
+  assert.equal(verifyMirrorText(prepared, "感谢促成这件事！ https://t.co/5kDekuLbuSXYZ 之后见。").ok, false);
+});
+
+test("lone ordered-list markers are escaped so Feishu keeps their literal numbers", () => {
+  const { escapeLoneOrderedListStarts } = require("../electron/feishu-wiki-mirror.cjs");
+  const source = [
+    "前面是普通段落。",
+    "",
+    "> 2. 找一位世界级领域专家并与其合作",
+    "",
+    "1. 正常第一项",
+    "2. 正常第二项",
+    "",
+    "3. 空行后的第三项",
+    "",
+    "5. 编号跳到第五项",
+    "",
+    "```",
+    "2. 代码块里的编号不动",
+    "```",
+    "",
+    "12. 多位编号也转义"
+  ].join("\n");
+  const escaped = escapeLoneOrderedListStarts(source);
+  assert.ok(escaped.includes("> 2\\. 找一位世界级领域专家"), "引用块里的孤立项要转义");
+  assert.ok(escaped.includes("1. 正常第一项"), "连续列表第一项不转义");
+  assert.ok(escaped.includes("2. 正常第二项"), "连续列表第二项不转义");
+  assert.ok(escaped.includes("3. 空行后的第三项"), "空行不中断列表，编号与位置一致时不转义");
+  assert.ok(escaped.includes("5\\. 编号跳到第五项"), "编号与位置不一致要转义");
+  assert.ok(escaped.includes("2. 代码块里的编号不动"), "代码块内不转义");
+  assert.ok(escaped.includes("12\\. 多位编号"), "多位编号转义");
+  // 转义后的内容与飞书回读的「未转义字面编号」token 等价（校验兼容）。
+  assert.equal(verifyMirrorText({ content: escaped }, escaped.replace(/(\d+)\\\./g, "$1.")).ok, true);
+});
+
+test("remote images are downloaded into the hidden cache and rewritten to local paths", async () => {
+  const { root } = makeLibrary();
+  const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
+  const originalFetch = globalThis.fetch;
+  const requested = [];
+  globalThis.fetch = async (url, options = {}) => {
+    requested.push(String(url));
+    if (String(url).includes("/bad/")) throw new Error("network down");
+    return { ok: true, arrayBuffer: async () => pngBytes.buffer.slice(pngBytes.byteOffset, pngBytes.byteOffset + pngBytes.byteLength) };
+  };
+  try {
+    const mirror = new FeishuWikiMirror({ libraryRoot: root, runLark: async () => ({}) });
+    const markdown = [
+      "开头。",
+      "",
+      "[![原文图片](https://cdn.example.com/a/640?wx_fmt=jpeg)](https://mp.weixin.qq.com/s/xyz)",
+      "",
+      "![坏图](https://cdn.example.com/bad/x.png)",
+      "",
+      "结尾。"
+    ].join("\n");
+    const rewritten = await mirror.materializeRemoteImages(markdown);
+    const cacheDir = path.join(root, ".domi-mirror-assets");
+    const cached = fs.readdirSync(cacheDir);
+    assert.equal(cached.length, 1, "只有可下载的图片落地");
+    assert.ok(cached[0].endsWith(".png"), "按魔数判定扩展名");
+    assert.ok(rewritten.includes(`![原文图片](${path.join(cacheDir, cached[0])})`), "可下载图片改写为本地路径");
+    assert.ok(rewritten.includes("![坏图](https://cdn.example.com/bad/x.png)"), "下载失败保持远程语法");
+    assert.ok(rewritten.includes("](https://mp.weixin.qq.com/s/xyz)"), "改写只动图片语法，外层链接保留");
+    assert.deepEqual(requested.sort(), ["https://cdn.example.com/a/640?wx_fmt=jpeg", "https://cdn.example.com/bad/x.png"].sort());
+    // 第二次调用直接复用缓存；只有下载失败的那张会重试（ eventual 成功）。
+    requested.length = 0;
+    const again = await mirror.materializeRemoteImages(markdown);
+    assert.deepEqual(requested, ["https://cdn.example.com/bad/x.png"], "缓存命中不重复下载，失败的重试");
+    assert.equal(again, rewritten);
+    // 隐藏缓存目录不会被镜像目标扫描收录。
+    const targets = mirrorTargetFiles(root).map((item) => item.relativePath);
+    assert.ok(!targets.some((item) => item.includes(".domi-mirror-assets")));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("asset anchor lookup retries until Feishu finishes importing the overwrite", async () => {
+  const { placeFeishuAssetAtMarker } = require("../electron/feishu-markdown-assets.cjs");
+  const marker = "domi飞书图片1-abc6ab896f";
+  const asset = { marker, caption: "png", path: "C:/fake/a.png" };
+  const calls = [];
+  let keywordFetches = 0;
+  const runLark = async (args) => {
+    calls.push(args.join(" "));
+    if (args[1] === "+fetch" && args.includes("--scope") && args.includes("keyword")) {
+      keywordFetches += 1;
+      // 前两次像真实情况一样拿不到未完成导入的标记，第三次才出现；
+      // 容器标签会在 keyword 属性里回显标记本身（真实返回形态）。
+      const content = keywordFetches >= 3
+        ? `<fragment mode="keyword" keyword="${marker}"><p id="blk-1">${marker} · png</p></fragment>`
+        : "<fragment mode=\"keyword\"></fragment>";
+      return { data: { document: { content } } };
+    }
+    if (args[1] === "+media-insert") {
+      return { data: { data: { block: { block_id: "img-1" } } } };
+    }
+    return { data: {} };
+  };
+  const result = await placeFeishuAssetAtMarker({ runLark, documentId: "doc1", asset, attempts: 4, delayMs: 1 });
+  assert.equal(result.anchorBlockId, "blk-1");
+  assert.equal(result.imageBlockId, "img-1");
+  assert.equal(keywordFetches, 3, "未命中时带退避重试");
+  // 上传后按锚点移动并删除锚点块。
+  assert.ok(calls.some((line) => line.includes("block_move_after") && line.includes("blk-1")));
+  assert.ok(calls.some((line) => line.includes("block_delete") && line.includes("blk-1")));
+  // 重试耗尽仍然失败时如实抛错。
+  await assert.rejects(placeFeishuAssetAtMarker({
+    runLark: async () => ({ data: { document: { content: "<fragment mode=\"keyword\"></fragment>" } } }),
+    documentId: "doc1", asset, attempts: 2, delayMs: 1
+  }), /原位锚点/);
+});
+
+test("markerBlockId ignores the keyword echo inside the fragment opening tag", async () => {
+  const { markerBlockId } = require("../electron/feishu-markdown-assets.cjs");
+  const marker = "domi飞书图片1-abc6ab896f";
+  // lark-cli 真实返回：容器 keyword 属性回显标记，正文在 <p> 里。
+  const response = { data: { document: { content: `<fragment mode="keyword" keyword="${marker}"><p id="blk-9">${marker} · png</p></fragment>` } } };
+  assert.equal(markerBlockId(response, marker), "blk-9");
+  // excerpt 容器路径（top-block-id）仍然生效。
+  const excerptResponse = { data: { document: { content: `<excerpt top-block-id="top-7"><p>${marker} · png</p></excerpt>` } } };
+  assert.equal(markerBlockId(excerptResponse, marker), "top-7");
+  // 标记不在正文时返回空。
+  assert.equal(markerBlockId({ data: { document: { content: "<p>没有标记</p>" } } }, marker), "");
 });
 
 test("asynchronous import retries a nonempty partial body until the whole body appears", async () => {

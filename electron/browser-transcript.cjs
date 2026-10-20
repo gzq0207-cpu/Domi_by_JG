@@ -1,6 +1,8 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { sha256 } = require("./chinese-translation.cjs");
+const { ACQUISITION, PANEL_ACQUISITION, platformCaptionExport, panelCaptionExport } = require("./platform-captions.cjs");
+const NATIVE_ACQUISITION = "browser.content.exportYouTubeTranscript";
 
 function seconds(value) {
   if (!/^\d+:\d{2}(?::\d{2})?$/.test(String(value))) throw new Error("浏览器视频时长格式无效。");
@@ -9,7 +11,8 @@ function seconds(value) {
   return parts.reduce((sum, part) => sum * 60 + part, 0);
 }
 
-function parseExport(text, videoId, durationSeconds) {
+function parseExport(text, videoId, durationSeconds, acquisition = NATIVE_ACQUISITION, panelSource) {
+  if (![NATIVE_ACQUISITION, ACQUISITION, PANEL_ACQUISITION].includes(acquisition)) throw new Error("字幕获取方式不可验证。");
   if (!/^[A-Za-z0-9_-]{11}$/.test(videoId) || !Number.isFinite(durationSeconds) || durationSeconds <= 0)
     throw new Error("浏览器字幕视频标识或时长无效。");
   const lines = String(text).replace(/\r\n/g, "\n").trim().split("\n");
@@ -37,17 +40,36 @@ function parseExport(text, videoId, durationSeconds) {
   const maxFirstTimestampSeconds = lines[3] === "Captions: authored or unspecified" ? 10 : 5;
   // Browser export contains cue starts, not cue ends. This is an extent and
   // omission check, never a claim that synthetic intervals cover the audio.
+  let panelProof;
+  if (acquisition === PANEL_ACQUISITION) {
+    if (panelSource?.videoId !== videoId || panelSource.durationSeconds !== durationSeconds
+        || platformCaptionExport(panelSource).trim() !== String(text).trim()) throw new Error("完整官方文字稿来源不可验证。");
+    panelProof = panelCaptionExport(panelSource).proof;
+  }
+  // The modern official transcript groups several timed cues into paragraphs.
+  // For it, check every original source index and every displayed row rather
+  // than interpreting paragraph-start gaps as omitted captions/audio coverage.
   const complete = firstTimestampSeconds <= maxFirstTimestampSeconds && lastTimestampSeconds <= durationSeconds + 1
-    && timestampSpanCoverage >= 0.98 && durationSeconds - lastTimestampSeconds <= 20 && maxStartGapSeconds <= 15;
+    && (panelProof ? panelProof.sourceSegmentCount === cues.length
+      : timestampSpanCoverage >= 0.98 && durationSeconds - lastTimestampSeconds <= 20 && maxStartGapSeconds <= 15);
   if (!complete) throw new Error("浏览器字幕首尾或中间时间戳存在缺口，需要重新取得完整字幕。");
-  return { text: rows.join("\n"), cues, validation: { version: 1, status: "browser-export-verified", cueCount: cues.length,
+  return { text: rows.join("\n"), cues, validation: { version: panelProof ? 2 : 1, status: "browser-export-verified", cueCount: cues.length,
     firstTimestampSeconds, lastTimestampSeconds, timestampSpanCoverage, maxStartGapSeconds,
-    cueEndTimesAvailable: false, acquisition: "browser.content.exportYouTubeTranscript", accuracy: "platform-captions-not-manually-verified" } };
+    cueEndTimesAvailable: false, acquisition, ...(panelProof || {}), accuracy: "platform-captions-not-manually-verified" } };
 }
 
 function importExport(entry, stateRoot) {
   const durationSeconds = seconds(entry.duration), source = fs.readFileSync(entry.path);
-  const parsed = parseExport(source.toString("utf8"), entry.videoId, durationSeconds);
+  const acquisition = entry.acquisition || NATIVE_ACQUISITION;
+  let platformResponse;
+  let raw;
+  if ([ACQUISITION,PANEL_ACQUISITION].includes(acquisition)) {
+    platformResponse = fs.readFileSync(entry.platformResponsePath);
+    raw = JSON.parse(platformResponse.toString("utf8"));
+    if (raw.videoId !== entry.videoId || raw.durationSeconds !== durationSeconds || raw.title !== entry.title
+        || platformCaptionExport(raw).trim() !== source.toString("utf8").trim()) throw new Error("字幕导出与完整平台响应不一致。");
+  }
+  const parsed = parseExport(source.toString("utf8"), entry.videoId, durationSeconds, acquisition, raw);
   const directory = path.join(stateRoot, entry.videoId, "browser-captions"); fs.mkdirSync(directory, { recursive: true });
   const sourcePath = path.join(directory, "platform-export.txt"), transcriptPath = path.join(directory, "transcript.txt"), jsonPath = path.join(directory, "cues.json");
   fs.writeFileSync(sourcePath, source); fs.writeFileSync(transcriptPath, parsed.text + "\n");
@@ -56,6 +78,11 @@ function importExport(entry, stateRoot) {
   const result = { ok: true, complete: true, contentKind: "browser-transcript", videoId: entry.videoId, metadata, durationSeconds,
     sourcePath, sourceSha256: sha256(source), transcriptPath, transcriptSha256: sha256(fs.readFileSync(transcriptPath)),
     jsonPath, jsonSha256: sha256(fs.readFileSync(jsonPath)), validation: parsed.validation, acquiredAt: new Date().toISOString() };
+  if (platformResponse) {
+    result.platformResponsePath = path.join(directory, "platform-response.json");
+    fs.writeFileSync(result.platformResponsePath, platformResponse);
+    result.platformResponseSha256 = sha256(platformResponse);
+  }
   fs.writeFileSync(path.join(directory, "result.json"), JSON.stringify(result, null, 2));
   return result;
 }
@@ -63,7 +90,16 @@ function importExport(entry, stateRoot) {
 function verifyExport(result) {
   if (!result.sourcePath || !result.sourceSha256 || sha256(fs.readFileSync(result.sourcePath)) !== result.sourceSha256)
     throw new Error("浏览器字幕源文件校验失败。");
-  const parsed = parseExport(fs.readFileSync(result.sourcePath, "utf8"), result.videoId, result.durationSeconds);
+  const acquisition = result.validation?.acquisition || NATIVE_ACQUISITION;
+  let raw;
+  if ([ACQUISITION,PANEL_ACQUISITION].includes(acquisition)) {
+    if (!result.platformResponsePath || sha256(fs.readFileSync(result.platformResponsePath)) !== result.platformResponseSha256)
+      throw new Error("平台字幕原始响应校验失败。");
+    raw = JSON.parse(fs.readFileSync(result.platformResponsePath, "utf8"));
+    if (raw.videoId !== result.videoId || raw.durationSeconds !== result.durationSeconds || raw.title !== result.metadata.title
+        || platformCaptionExport(raw).trim() !== fs.readFileSync(result.sourcePath, "utf8").trim()) throw new Error("平台字幕原始响应与完整导出不一致。");
+  }
+  const parsed = parseExport(fs.readFileSync(result.sourcePath, "utf8"), result.videoId, result.durationSeconds, acquisition, raw);
   if (JSON.stringify(parsed.validation) !== JSON.stringify(result.validation)
       || parsed.text !== fs.readFileSync(result.transcriptPath, "utf8").trim()) throw new Error("浏览器字幕记录或正文与原始导出不一致。");
   const saved = JSON.parse(fs.readFileSync(result.jsonPath, "utf8"));

@@ -6,7 +6,11 @@ const {
   extractSearchKeywords,
   formatDocumentContext,
   mergeSearchResults,
-  reciprocalRankFusion
+  questionEntities,
+  questionYears,
+  reciprocalRankFusion,
+  rerankFusedResults,
+  retrieveDocuments
 } = require("../electron/document-context.cjs");
 
 test("library question wording does not displace the actual topics and dates", () => {
@@ -259,4 +263,74 @@ test("semantic failures never block the keyword channel", async () => {
     settings: { storageBackend: "local", semanticSearchEnabled: true }
   });
   assert.match(bridge.context, /纪要\.md/);
+});
+
+test("question entities and years extract the named objects and time scope", () => {
+  assert.deepEqual(questionEntities("「英伟达」的推理成本和《数据中心供电》的报告"), ["英伟达", "数据中心供电"]);
+  assert.deepEqual(questionEntities("NVIDIA 和 TSMC 的产能对比"), ["nvidia", "tsmc"]);
+  assert.deepEqual(questionEntities("帮我看看这篇"), []);
+  assert.deepEqual(questionYears("比较2025年和2026年的观点变化"), [2025, 2026]);
+  assert.deepEqual(questionYears("没有年份的问题"), []);
+});
+
+test("rerank promotes sub-question coverage without overriding dual-channel wins", () => {
+  const keywords = ["美团", "融资", "估值"];
+  // 三份文档：a/b 各命中 1 个关键词，c 在每个关键词的结果集中都出现（命中 3 个）。
+  const merged = mergeSearchResults([
+    [{ path: "a.md", relativePath: "a.md", snippet: "美团讨论", mtimeMs: 1 },
+     { path: "c.md", relativePath: "c.md", snippet: "美团融资估值", mtimeMs: 1 }],
+    [{ path: "b.md", relativePath: "b.md", snippet: "融资讨论", mtimeMs: 1 },
+     { path: "c.md", relativePath: "c.md", snippet: "美团融资估值", mtimeMs: 1 }],
+    [{ path: "c.md", relativePath: "c.md", snippet: "美团融资估值", mtimeMs: 1 }]
+  ], keywords);
+  const reranked = rerankFusedResults(merged.map((result) => ({ ...result, fusedScore: 0.02 })), { keywords });
+  assert.equal(reranked[0].path, "c.md", "命中全部子问题的文档排最前");
+  assert.equal(reranked[0].coverage, 1);
+  // 加分小于一个 RRF 名次步长（1/61≈0.0164），不能压过双通道共同命中。
+  assert.ok(reranked[0].rerankScore - 0.02 < 0.0164);
+  const dominant = rerankFusedResults([
+    { path: "dual.md", relativePath: "dual.md", snippet: "美团融资估值", fusedScore: 0.035, keywordHits: 3, matchedKeywords: new Set(keywords) },
+    { path: "single.md", relativePath: "single.md", snippet: "美团融资估值", fusedScore: 0.02, keywordHits: 1, matchedKeywords: new Set(["美团"]) }
+  ], { keywords });
+  assert.equal(dominant[0].path, "dual.md", "加分不改变双通道胜出者");
+});
+
+test("rerank promotes named entities and date proximity through the full pipeline", async () => {
+  const hits = {
+    美团: [
+      { path: "/lib/entity.md", relativePath: "entity.md", title: "英伟达调研", line: 1, snippet: "GPU 供给紧张。", mtimeMs: 1 },
+      { path: "/lib/plain.md", relativePath: "plain.md", title: "行业记录", line: 1, snippet: "一些内容。", mtimeMs: 1 }
+    ]
+  };
+  const entityResult = await retrieveDocuments({
+    search: (keyword) => Promise.resolve({ ok: true, results: hits[keyword] || hits.美团 }),
+    requestText: "「英伟达」的供给情况",
+    settings: { storageBackend: "local", semanticSearchEnabled: false }
+  });
+  assert.equal(entityResult.results[0].path, "/lib/entity.md");
+  assert.equal(entityResult.results[0].entityHits, 1);
+
+  const dated = {
+    美团: [
+      { path: "/lib/new.md", relativePath: "new.md", title: "最新记录", date: "2026-09-01", line: 1, snippet: "内容。", mtimeMs: 1 },
+      { path: "/lib/old.md", relativePath: "old.md", title: "历史记录", date: "2019-01-01", line: 1, snippet: "内容。", mtimeMs: 1 }
+    ]
+  };
+  const dateResult = await retrieveDocuments({
+    search: (keyword) => Promise.resolve({ ok: true, results: dated[keyword] || dated.美团 }),
+    requestText: "2026 年的行业记录",
+    settings: { storageBackend: "local", semanticSearchEnabled: false }
+  });
+  assert.equal(dateResult.results[0].path, "/lib/new.md");
+  assert.equal(dateResult.results[0].dateBoost, 1);
+  assert.ok(dateResult.results[1].dateBoost < 1);
+});
+
+test("rerank never downgrades results when the question has no entities or years", () => {
+  const results = [
+    { path: "a.md", relativePath: "a.md", snippet: "x", fusedScore: 0.03 },
+    { path: "b.md", relativePath: "b.md", snippet: "y", fusedScore: 0.02 }
+  ];
+  const reranked = rerankFusedResults(results, { keywords: ["k"], requestText: "普通问题" });
+  assert.equal(reranked[0].path, "a.md");
 });

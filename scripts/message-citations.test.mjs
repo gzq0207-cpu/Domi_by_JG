@@ -3,9 +3,11 @@ import test from "node:test";
 import {
   codexFileCitationHref,
   codexFileCitationPath,
+  domiEvidenceId,
   parseCodexFileCitation,
   remarkCodexFileCitations,
-  splitCodexFileCitations
+  splitCodexFileCitations,
+  splitDomiEvidenceMarkers
 } from "../src/message-citations.ts";
 
 test("turns a local PDF citation into a short material label", () => {
@@ -69,4 +71,40 @@ test("remark conversion does not create nested links or alter code", () => {
   assert.equal(tree.children[0].children[0].type, "link");
   assert.equal(tree.children[1].value, marker);
   assert.equal(tree.children[2].children[0].type, "text");
+});
+
+test("domi evidence markers split around claims and reject malformed ids", () => {
+  const id = "E0123456789ab";
+  const segments = splitDomiEvidenceMarkers(`结论甲 :domi-cite{id="${id}"} 结论乙`);
+  assert.deepEqual(segments.map((segment) => segment.type), ["text", "evidence", "text"]);
+  assert.equal(segments[1].type === "evidence" && segments[1].value, id);
+  const fabricated = `:domi-cite{id="X0123456789ab"}`;
+  assert.deepEqual(splitDomiEvidenceMarkers(fabricated), [{ type: "text", value: fabricated }]);
+  assert.deepEqual(splitDomiEvidenceMarkers(""), []);
+});
+
+test("domi evidence hrefs accept only canonical citation ids", () => {
+  assert.equal(domiEvidenceId("domi-evidence:E0123456789ab"), "E0123456789ab");
+  assert.equal(domiEvidenceId("domi-evidence:E0123456789ABC"), "");
+  assert.equal(domiEvidenceId("domi-evidence:not-an-id"), "");
+  assert.equal(domiEvidenceId("https://example.com"), "");
+  assert.equal(domiEvidenceId(undefined), "");
+});
+
+test("remark conversion turns domi evidence markers into inspectable links", () => {
+  const marker = ':domi-cite{id="E0123456789ab"}';
+  const tree = {
+    type: "root",
+    children: [
+      { type: "paragraph", children: [{ type: "text", value: `结论 ${marker}` }] },
+      { type: "inlineCode", value: marker }
+    ]
+  };
+  remarkCodexFileCitations()(tree);
+  const paragraph = tree.children[0];
+  assert.equal(paragraph.children.length, 2);
+  assert.equal(paragraph.children[0].type, "text");
+  assert.equal(paragraph.children[1].type, "link");
+  assert.equal(paragraph.children[1].url, "domi-evidence:E0123456789ab");
+  assert.equal(tree.children[1].value, marker, "code samples stay verbatim");
 });

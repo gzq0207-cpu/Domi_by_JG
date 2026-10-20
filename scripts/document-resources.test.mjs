@@ -5,11 +5,16 @@ import { createRequire } from "node:module";
 import {
   isLocalMarkdownResource,
   isLocalPdfResource,
+  isLocalWordResource,
   resolveLocalDocumentLink
 } from "../src/document-resources.ts";
 
 const { normalizeLocalDocumentResource } = createRequire(import.meta.url)("../electron/document-resource.cjs");
 const windowsDocument = "C:\\资料库\\domi工作区\\行业认知\\2026\\报告.md";
+test('Word local links preserve Chinese paths and line suffixes',()=>{
+  const resolved=resolveLocalDocumentLink('../原件/研究材料.docx:12',windowsDocument);assert.equal(isLocalWordResource(resolved),true);assert.equal(isLocalWordResource('https://example.com/report.docx'),false);assert.equal(isLocalWordResource('C:\\资料\\旧版.DOC'),true);
+  const normalized=normalizeLocalDocumentResource(resolved);assert.equal(normalized.extension,'.docx');assert.equal(normalized.line,12);assert.match(normalized.path,/研究材料.docx$/);
+});
 
 test("Windows relative PDF links retain the source directory and one drive letter", () => {
   for (const documentPath of [windowsDocument, windowsDocument.replace(/\\/g, "/")]) {
@@ -38,9 +43,9 @@ test("document directories containing literal URL punctuation are preserved", ()
 });
 
 test("POSIX paths and absolute Windows paths resolve as file URLs", () => {
-  const resource = resolveLocalDocumentLink("../原始材料/报告.pdf", "/Users/test/资料库/纪要/记录.md");
-  assert.equal(decodeURIComponent(new URL(resource).pathname), "/Users/test/资料库/原始材料/报告.pdf");
-  if (process.platform !== "win32") assert.equal(fileURLToPath(resource), "/Users/test/资料库/原始材料/报告.pdf");
+  const resource = resolveLocalDocumentLink("../原始材料/报告.pdf", "/home/test/资料库/纪要/记录.md");
+  assert.equal(decodeURIComponent(new URL(resource).pathname), "/home/test/资料库/原始材料/报告.pdf");
+  if (process.platform !== "win32") assert.equal(fileURLToPath(resource), "/home/test/资料库/原始材料/报告.pdf");
   const absolute = resolveLocalDocumentLink("D:\\报告\\原文.pdf", windowsDocument);
   assert.equal(decodeURIComponent(new URL(absolute).pathname), "/D:/报告/原文.pdf");
   assert.equal(resolveLocalDocumentLink(absolute, windowsDocument), absolute);

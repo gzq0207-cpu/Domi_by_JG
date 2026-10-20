@@ -5,6 +5,28 @@ const crypto = require("node:crypto");
 const CLOUD_ROOT_PATTERN = /(?:^|\/)(onedrive|dropbox|nutstore|坚果云|googledrive|google drive|idrive)(?:$|\/)/i;
 const DEFAULT_READ_CHARS = 8_000;
 const MAX_READ_CHARS = 24_000;
+const MAX_OCR_PAGES = 40;
+
+// 可配置的 OCR 命令执行器：命令模板里用 {pdf} 与可选的 {page} 占位符，
+// 例如 `python ocr.py {pdf} {page}`。执行失败或超时返回空字符串（降级，
+// 不阻断读取）；识别质量不内建验证，调用方必须以警告披露 OCR 来源。
+function createOcrPageExecutor(command, options = {}) {
+  const template = String(command || "").trim();
+  if (!template || !template.includes("{pdf}")) return null;
+  const execImpl = options.execImpl || require("node:child_process").exec;
+  const timeoutMs = Number(options.timeoutMs) || 60_000;
+  const quote = (value) => (process.platform === "win32"
+    ? `"${String(value).replace(/"/g, "")}"`
+    : `'${String(value).replace(/'/g, `'\\''`)}'`);
+  return async (pdfPath, pageNumber) => {
+    const line = template.replace(/\{pdf\}/g, quote(pdfPath)).replace(/\{page\}/g, quote(String(pageNumber)));
+    return await new Promise((resolve) => {
+      execImpl(line, { timeout: timeoutMs, maxBuffer: 2 * 1024 * 1024, windowsHide: true }, (error, stdout) => {
+        resolve(error ? "" : String(stdout || "").trim());
+      });
+    });
+  };
+}
 
 function inside(root, candidate) {
   const relative = path.relative(root, candidate);
@@ -91,10 +113,11 @@ function endWithinBudget(text, start, end, budget, anchor = start) {
 }
 
 class DocumentReader {
-  constructor({ rootPath, cloudContentAllowed = false, extractPdf, maxCacheChars = 2_000_000, allowedPaths, attachmentPaths = [] }) {
+  constructor({ rootPath, cloudContentAllowed = false, extractPdf, ocrPage = null, maxCacheChars = 2_000_000, allowedPaths, attachmentPaths = [] }) {
     this.rootPath = path.resolve(rootPath);
     this.cloudContentAllowed = cloudContentAllowed;
     this.extractPdf = extractPdf;
+    this.ocrPage = typeof ocrPage === "function" ? ocrPage : null;
     this.maxCacheChars = maxCacheChars;
     this.cache = new Map();
     // Exact-file grants, not parent-directory grants. Canonical paths are
@@ -128,8 +151,8 @@ class DocumentReader {
     }
     const stat = await fs.promises.stat(realPath);
     const extension = path.extname(realPath).toLowerCase();
-    if (!stat.isFile() || ![".md", ".markdown", ".txt", ".pdf"].includes(extension)) throw new Error("仅支持读取 Markdown、文本和 PDF 资料正文。");
-    const maxBytes = extension === ".pdf" ? 20 * 1024 * 1024 : 2 * 1024 * 1024;
+    if (!stat.isFile() || ![".md", ".markdown", ".txt", ".pdf", ".docx", ".doc"].includes(extension)) throw new Error("仅支持读取 Markdown、文本、PDF 和 Word 资料正文。");
+    const maxBytes = /\.docx?$/.test(extension) ? 64 * 1024 * 1024 : extension === ".pdf" ? 20 * 1024 * 1024 : 2 * 1024 * 1024;
     if (stat.size > maxBytes) throw new Error("资料超过单文件读取上限，请拆分材料后再读取。");
     const stamp = `${stat.size}:${stat.mtimeMs}`;
     const cached = this.cache.get(realPath);
@@ -146,18 +169,41 @@ class DocumentReader {
         finally { await proxy.destroy(); }
       });
       const extracted = await extract(realPath);
-      const pageTexts = Array.isArray(extracted) ? extracted : [String(extracted || "")];
+      const pageTexts = (Array.isArray(extracted) ? extracted : [String(extracted || "")]).map((pageText) => String(pageText || ""));
+      // 无可提取文字的页面可选 OCR：识别结果必须以警告披露，且不能据此宣称已读原文。
+      const ocrApplied = [];
+      const ocrFailed = [];
+      if (this.ocrPage) {
+        const emptyPageNumbers = pageTexts.map((pageText, index) => pageText.trim() ? null : index + 1).filter(Boolean);
+        for (const pageNumber of emptyPageNumbers.slice(0, MAX_OCR_PAGES)) {
+          try {
+            const ocrText = String(await this.ocrPage(realPath, pageNumber) || "").trim();
+            if (ocrText) { pageTexts[pageNumber - 1] = ocrText; ocrApplied.push(pageNumber); }
+            else ocrFailed.push(pageNumber);
+          } catch { ocrFailed.push(pageNumber); }
+        }
+      }
       text = "";
       for (const [index, pageText] of pageTexts.entries()) {
         const start = text.length;
-        text += `## PDF 第 ${index + 1} 页\n${String(pageText).replace(/\u0000/g, "")}\n\n`;
+        text += `## PDF 第 ${index + 1} 页\n${pageText.replace(/\u0000/g, "")}\n\n`;
         pages.push({ page: index + 1, start, end: text.length });
       }
-      if (!pageTexts.some((page) => String(page || "").trim())) throw new Error("PDF 无可提取文字，需要读取原始页面或进行 OCR。");
-      const emptyPages = pageTexts.map((page, index) => String(page || "").trim() ? null : index + 1).filter(Boolean);
-      extractionIncomplete = emptyPages.length > 0;
-      if (emptyPages.length) warnings.push(`PDF 第 ${emptyPages.join("、")} 页没有可提取文字，需要核验原始页面或 OCR。`);
+      if (!pageTexts.some((pageText) => pageText.trim())) {
+        throw new Error(this.ocrPage
+          ? "PDF 无可提取文字，且 OCR 未识别出文字；请核验原始页面或调整 OCR 配置。"
+          : "PDF 无可提取文字，需要读取原始页面或进行 OCR。");
+      }
+      const remainingEmpty = pageTexts.map((pageText, index) => pageText.trim() ? null : index + 1).filter(Boolean);
+      // OCR 过的页面仍不可作为“已读原文”：识别质量未验证，全文标记保持诚实。
+      extractionIncomplete = remainingEmpty.length > 0 || ocrApplied.length > 0;
+      if (remainingEmpty.length) warnings.push(`PDF 第 ${remainingEmpty.join("、")} 页没有可提取文字，需要核验原始页面或 OCR。`);
+      if (ocrApplied.length) warnings.push(`PDF 第 ${ocrApplied.join("、")} 页使用 OCR 提取文字，识别质量未验证，请核验原始页面。`);
+      if (ocrFailed.length) warnings.push(`PDF 第 ${ocrFailed.join("、")} 页 OCR 未识别出文字。`);
       warnings.push("PDF 提供的是可提取文字，图像及复杂表格仍需核验原始页面。");
+    } else if(/\.docx?$/.test(extension)) {
+      const word=await require('./word-document.cjs').readWordFile(realPath,{includeHtml:false});
+      text=word.text;extractionIncomplete=word.incomplete;warnings.push(...word.warnings,'Word 提供正文文字；图片、图形和复杂表格需回到原文核对。');
     } else {
       text = (await fs.promises.readFile(realPath, "utf8")).replace(/\r\n/g, "\n").replace(/\u0000/g, "");
     }
@@ -217,4 +263,4 @@ class DocumentReader {
   }
 }
 
-module.exports = { DocumentReader, documentHeadings, safeBoundary, lineAt };
+module.exports = { DocumentReader, documentHeadings, safeBoundary, lineAt, createOcrPageExecutor };

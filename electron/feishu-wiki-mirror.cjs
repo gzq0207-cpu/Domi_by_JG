@@ -17,6 +17,29 @@ const { placeFeishuAssetAtMarker } = require("./feishu-markdown-assets.cjs");
 const MIRROR_SPACE_NAME = "domi资料库镜像";
 const MAX_MIRROR_FILES = 2000;
 const MAX_DOCUMENT_BYTES = 8 * 1024 * 1024;
+// 远程图片（微信 CDN 等防盗链站点）飞书导入时会整块丢弃、连 alt 文本一起
+// 消失，回读保真校验必败。镜像前先下载到库内隐藏缓存目录，改写为本地路径
+// 走资产上传管线，保证图片真正上传、说明文字不丢。下载失败保持远程语法。
+const REMOTE_ASSET_CACHE_DIR = ".domi-mirror-assets";
+const REMOTE_ASSET_EXTENSIONS = ["jpg", "jpeg", "png", "gif", "webp", "bmp"];
+const MAX_REMOTE_ASSETS_PER_DOCUMENT = 40;
+const REMOTE_ASSET_TIMEOUT_MS = 15_000;
+const REMOTE_ASSET_MAX_BYTES = 15 * 1024 * 1024;
+const IMAGE_MAGIC = [
+  { extension: "jpg", bytes: [0xff, 0xd8, 0xff] },
+  { extension: "png", bytes: [0x89, 0x50, 0x4e, 0x47] },
+  { extension: "gif", bytes: [0x47, 0x49, 0x46, 0x38] },
+  { extension: "bmp", bytes: [0x42, 0x4d] }
+];
+
+function imageExtensionFromMagic(buffer) {
+  for (const candidate of IMAGE_MAGIC) {
+    if (candidate.bytes.every((byte, index) => buffer[index] === byte)) return candidate.extension;
+  }
+  // WEBP: RIFF....WEBP
+  if (buffer.length > 12 && buffer.toString("latin1", 0, 4) === "RIFF" && buffer.toString("latin1", 8, 12) === "WEBP") return "webp";
+  return "";
+}
 const PROJECT_HOME_NAME = "项目主页.md";
 const PERSON_HOME_NAME = "人物主页.md";
 // Legacy ledger entries are revalidated once before incremental skipping.
@@ -25,6 +48,9 @@ const TEXT_VERIFICATION_VERSION = 2;
 // Layout is allowed to change during Markdown import. Every visible source
 // token (including repetitions) must still appear in its original order.
 // Extra document titles are allowed; a nonempty prefix is never sufficient.
+// 飞书回读会把相邻的链接/文本单元合并（中间空格丢失，如两个相邻 t.co
+// 链接导出为 5kDekuLbuShttps）：允许一个回读 token 恰好等于连续多个
+// 预期 token 的无分隔拼接，内容与顺序仍然强制校验。
 function verifyMirrorText(prepared, fetchedMarkdown) {
   const tokens = (markdown) => semanticTokens(String(markdown || "")
     .replace(/<!--[^]*?-->/g, "")
@@ -39,7 +65,25 @@ function verifyMirrorText(prepared, fetchedMarkdown) {
   const expected = tokens(prepared.content);
   const actual = tokens(fetchedMarkdown);
   let matched = 0;
-  for (const token of actual) if (matched < expected.length && token === expected[matched]) matched += 1;
+  for (let index = 0; index < actual.length && matched < expected.length; index += 1) {
+    const token = actual[index];
+    if (token === expected[matched]) {
+      matched += 1;
+      continue;
+    }
+    // 合并容差：token 必须恰好等于从 expected[matched] 起连续若干个
+    // token 的拼接，且至少两个；前缀多余或中途对不上都按普通失配处理。
+    let combined = expected[matched] || "";
+    let end = matched;
+    while (combined.length < token.length && end + 1 < expected.length) {
+      end += 1;
+      combined += expected[end];
+    }
+    if (end > matched && combined === token) {
+      matched = end + 1;
+    }
+    // 其余情况：actual 多出的 token 被跳过（额外内容允许），matched 不动。
+  }
   const ok = expected.length > 0 && matched === expected.length;
   return { ok, textCoverage: expected.length ? matched / expected.length : 0,
     verificationVersion: TEXT_VERIFICATION_VERSION,
@@ -82,6 +126,8 @@ function walkFiles(rootPath, predicate, collector = [], depth = 0) {
 function isMirrorTarget(relativeSegments, fileName) {
   const parts = relativeSegments;
   const lowerName = fileName.toLowerCase();
+  // 隐藏目录（如订阅日报的 .sources/.backups 内部备份）不镜像到飞书。
+  if (parts.some((segment) => segment.startsWith("."))) return false;
   if (parts.includes("_行业认知") && parts.includes("动态") && lowerName.endsWith(".md")) return true;
   if (parts[0] === "13.认知库" && (parts[1] === "订阅日报" || parts[1] === "知识库日报") && lowerName.endsWith(".md")) return true;
   if (fileName === PROJECT_HOME_NAME || fileName === PERSON_HOME_NAME) return true;
@@ -252,7 +298,79 @@ class FeishuWikiMirror {
     );
   }
 
-  prepareDocument(filePath, relativePath) {
+  // 飞书按「位置」重编号有序列表（实验验证：孤立的 "2." 回读为 "1."；
+  // "1."+空行+"3." 回读为 "1."+"2."；连续且编号与位置一致时原样保留；
+  // "2\." 转义后按字面文本保留、回读还原为 "2."）。因此书写编号与列表内
+  // 位置序号不一致的项必须转义句点，否则回读保真校验必然失败；空行不会
+  // 中断列表，非列表正文行才会。校验 token 化本来就会剔除转义反斜杠，
+  // 两侧等价。
+  static escapeLoneOrderedListStarts(markdown) {
+    const lines = String(markdown || "").split("\n");
+    let inFence = false;
+    const marker = /^(\s*)((?:>\s?)*)(\d+)\.(?=\s|$)/;
+    let last = null; // 最近一个列表项的 { prefix, position }
+    return lines.map((line) => {
+      if (/^\s*(```|~~~)/.test(line)) { inFence = !inFence; return line; }
+      if (inFence) return line;
+      const match = line.match(marker);
+      if (!match) {
+        // 非空的非列表行中断当前列表；空行不影响（飞书视空行为列表内分隔）。
+        if (line.trim()) last = null;
+        return line;
+      }
+      const prefix = match[2];
+      const written = Number(match[3]);
+      const position = last && last.prefix === prefix ? last.position + 1 : 1;
+      last = { prefix, position };
+      if (written === position) return line;
+      return line.replace(marker, `$1$2${written}\\.`);
+    }).join("\n");
+  }
+
+  // 下载远程图片到库内隐藏缓存（.domi-mirror-assets，点开头目录不会被镜像
+  // 扫描收录），并把图片语法改写为本地绝对路径，交给本地资产上传管线。
+  // 任一环节失败都保持原远程语法，不阻塞镜像。
+  async materializeRemoteImages(markdown) {
+    const source = String(markdown || "");
+    if (typeof fetch !== "function" || !this.libraryRoot) return source;
+    const urls = [...new Set([...source.matchAll(/!\[[^\]]*\]\(\s*(https?:\/\/[^)\s'"]+)/g)].map((match) => match[1]))];
+    if (!urls.length) return source;
+    const cacheRoot = path.join(this.libraryRoot, REMOTE_ASSET_CACHE_DIR);
+    try { fs.mkdirSync(cacheRoot, { recursive: true }); } catch { return source; }
+    const downloaded = new Map();
+    for (const url of urls.slice(0, MAX_REMOTE_ASSETS_PER_DOCUMENT)) {
+      const key = crypto.createHash("sha1").update(url).digest("hex").slice(0, 20);
+      try {
+        let target = "";
+        for (const extension of REMOTE_ASSET_EXTENSIONS) {
+          const candidate = path.join(cacheRoot, `${key}.${extension}`);
+          if (fs.existsSync(candidate)) { target = candidate; break; }
+        }
+        if (!target) {
+          const response = await fetch(url, {
+            signal: AbortSignal.timeout(REMOTE_ASSET_TIMEOUT_MS),
+            headers: { "user-agent": "Mozilla/5.0 (compatible; domi-mirror/1.0)" }
+          });
+          if (!response?.ok) continue;
+          const buffer = Buffer.from(await response.arrayBuffer());
+          const extension = imageExtensionFromMagic(buffer);
+          if (!extension || !buffer.length || buffer.length > REMOTE_ASSET_MAX_BYTES) continue;
+          target = path.join(cacheRoot, `${key}.${extension}`);
+          fs.writeFileSync(target, buffer);
+        }
+        downloaded.set(url, target);
+      } catch {
+        // 单张下载失败：保持远程语法，不阻塞整篇镜像。
+      }
+    }
+    if (!downloaded.size) return source;
+    return source.replace(
+      /!\[([^\]]*)\]\(\s*(https?:\/\/[^)\s'"]+)(?:\s+["'][^"']*["'])?\s*\)/g,
+      (full, alt, url) => (downloaded.has(url) ? `![${alt}](${downloaded.get(url)})` : full)
+    );
+  }
+
+  async prepareDocument(filePath, relativePath) {
     const stat = fs.statSync(filePath);
     if (stat.size > MAX_DOCUMENT_BYTES) {
       throw new Error(`${path.basename(filePath)} 超过 8 MB，跳过镜像。`);
@@ -267,8 +385,9 @@ class FeishuWikiMirror {
     // Remove managed comments before preparing so the frontmatter parser can
     // recognize YAML at the start. Internal metadata is not document prose.
     const processed = this.rewriteRelativeMarkdownLinks(original.replace(/<!-- domi:managed:(?:start|end) -->\s*/g, ""), relativeDir);
+    const withLocalImages = await this.materializeRemoteImages(processed);
     const prepared = prepareMarkdownForFeishu({
-      markdown: processed,
+      markdown: FeishuWikiMirror.escapeLoneOrderedListStarts(withLocalImages),
       sourcePath: filePath,
       libraryRoot: this.libraryRoot,
       title
@@ -309,7 +428,7 @@ class FeishuWikiMirror {
   }
 
   async writeDocument(spaceId, parentToken, entry, filePath, relativePath) {
-    const prepared = this.prepareDocument(filePath, relativePath);
+    const prepared = await this.prepareDocument(filePath, relativePath);
     // 宽松模式：预检 blocked（远程图片/相对链接）不再阻塞——内容完整可读，
     // 本地图片仍正常上传，只是不承诺与源文件 100% 等价。
     const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "domi-wiki-mirror-"));
@@ -442,7 +561,7 @@ class FeishuWikiMirror {
       }
       try {
         if (entry?.sha256 === sha && entry?.documentId && entry?.url) {
-          const verification = await this.verifyFidelity(entry.documentId, this.prepareDocument(target.path, relativePath));
+          const verification = await this.verifyFidelity(entry.documentId, await this.prepareDocument(target.path, relativePath));
           if (verification.ok) {
             this.state.documents[relativePath] = { ...entry, textCoverage: 1,
               verificationVersion: verification.verificationVersion, textSha256: verification.textSha256,
@@ -510,5 +629,6 @@ module.exports = {
   isMirrorTarget,
   mirrorTargetFiles,
   sha256File,
-  verifyMirrorText
+  verifyMirrorText,
+  escapeLoneOrderedListStarts: (markdown) => FeishuWikiMirror.escapeLoneOrderedListStarts(markdown)
 };

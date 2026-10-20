@@ -171,7 +171,7 @@ test("bareIntakeInput ignores links accompanied by wording or attachments", () =
 
 test("bareIntakeInput detects a single supported file dropped without any text", () => {
   assert.deepEqual(
-    bareIntakeInput("", [{ path: "C:/Users/me/inbox/算力行业报告.PDF" }]),
+    bareIntakeInput("", [{ path: "C:\\Users\\example\\inbox\\算力行业报告.PDF" }]),
     { kind: "file", fileName: "算力行业报告.PDF" }
   );
   assert.deepEqual(bareIntakeInput("   ", [{ path: "/tmp/report.pdf" }]), {

@@ -25,9 +25,11 @@ import {
   X
 } from "lucide-react";
 import { workbench } from "./bridge";
-import { isLocalMarkdownResource, isLocalPdfResource, resolveLocalDocumentLink } from "./document-resources";
+import { isLocalMarkdownResource, isLocalPdfResource, isLocalWordResource, resolveLocalDocumentLink } from "./document-resources";
 import { prepareMarkdownForEditor, restoreMarkdownFromEditor } from "./markdownDialect";
 import "./RichMarkdownEditor.css";
+import { anchorRange, editorTextIndex, readingAnnotationExtension, readingAnnotationKey, researchNoteExtension } from './research-editor';
+import type { ReadingAnnotation, ResearchSelection } from './research-types';
 
 type RichMarkdownEditorProps = {
   documentPath: string;
@@ -37,6 +39,16 @@ type RichMarkdownEditorProps = {
   onCopyDocument?: () => void;
   onOpenDocument?: (resource: string) => void;
   initialSearchQuery?: string;
+  readOnly?: boolean;
+  annotations?: ReadingAnnotation[];
+  sourceVersion?: string;
+  annotationTarget?: { id: string; nonce: number };
+  onAnnotationLocate?: (result: { found: boolean; rebased: boolean }) => void;
+  onSelection?: (selection: ResearchSelection | null) => void;
+  onAnnotationClick?: (annotation: ReadingAnnotation) => void;
+  onOpenAnnotation?: (id: string) => void;
+  onReady?: (editor: Editor | null) => void;
+  externalRevision?: number;
 };
 
 const MARKDOWN_CHANGE_PUBLISH_DELAY_MS = 120;
@@ -208,6 +220,36 @@ function splitFrontmatter(markdown: string) {
     frontmatter: match?.[1] || "",
     body: match ? markdown.slice(match[1].length) : markdown
   };
+}
+
+function researchSelection(editor: Editor, from: number, to: number): ResearchSelection | null {
+  if (from === to) return null;
+  const { text, positions } = editorTextIndex(editor.state.doc);
+  const start = positions.findIndex(position => position >= from);
+  let end = positions.length;
+  for (let index = Math.max(0, start); index < positions.length; index++) if (positions[index] >= to) { end = index; break; }
+  while (end > start && positions[end - 1] < 0) end--;
+  if (start < 0 || start >= end) return null;
+  const quote = text.slice(start, end);
+  let heading = '';
+  editor.state.doc.descendants((node, pos) => { if (pos < from && node.type.name === 'heading') heading = node.textContent; });
+  const coords = editor.view.coordsAtPos(to);
+  return { kind: 'text', quote, anchor: { quote, offset: start, documentOffset: from, prefix: text.slice(Math.max(0, start - 48), start), suffix: text.slice(end, end + 48), heading }, x: coords.left, y: coords.bottom };
+}
+
+function snapshotSelection(editor: Editor): ResearchSelection | null {
+  const selection = window.getSelection();
+  if (!selection?.rangeCount || selection.isCollapsed) return null;
+  const range = selection.getRangeAt(0);
+  const element = range.startContainer.nodeType === Node.TEXT_NODE ? range.startContainer.parentElement : range.startContainer instanceof Element ? range.startContainer : null;
+  const block = element?.closest('.research-note blockquote');
+  if (!block || !editor.view.dom.contains(block) || !block.contains(range.endContainer)) return null;
+  const quote = range.toString(); if (!quote.trim()) return null;
+  const coords = range.getBoundingClientRect();
+  const before = range.cloneRange(); before.selectNodeContents(block); before.setEnd(range.startContainer, range.startOffset);
+  const offset = before.toString().length, full = block.textContent || '';
+  return { kind: 'text', quote, anchor: { quote, noteId: block.closest<HTMLElement>('[data-research-note]')?.dataset.researchNote,
+    offset, documentOffset: editor.view.posAtDOM(block, 0), prefix: full.slice(Math.max(0,offset-48),offset), suffix: full.slice(offset+quote.length,offset+quote.length+48) }, snapshot: true, x: coords.left, y: coords.bottom };
 }
 
 function markdownImageExtension(documentPath: string) {
@@ -448,8 +490,13 @@ export default function RichMarkdownEditor({
   onBlur,
   onCopyDocument,
   onOpenDocument,
-  initialSearchQuery = ""
+  initialSearchQuery = "",
+  readOnly = false, annotations = [], sourceVersion, annotationTarget, onAnnotationLocate, onSelection, onAnnotationClick, onOpenAnnotation, onReady, externalRevision
 }: RichMarkdownEditorProps) {
+  const researchRef = useRef({ annotations, sourceVersion, annotationTarget, onAnnotationLocate, onSelection, onAnnotationClick, onOpenAnnotation, onReady });
+  researchRef.current = { annotations, sourceVersion, annotationTarget, onAnnotationLocate, onSelection, onAnnotationClick, onOpenAnnotation, onReady };
+  const annotationExtension = useMemo(() => readingAnnotationExtension(() => researchRef.current.annotations, () => researchRef.current.sourceVersion, () => researchRef.current.annotationTarget), []);
+  const noteExtension = useMemo(() => researchNoteExtension(documentPath, id => researchRef.current.onOpenAnnotation?.(id), () => researchRef.current.annotations, () => researchRef.current.sourceVersion, annotation => researchRef.current.onAnnotationClick?.(annotation), () => researchRef.current.annotationTarget), [documentPath]);
   const { frontmatter, body } = useMemo(() => splitFrontmatter(markdown), [markdown]);
   const preparedBody = useMemo(() => prepareMarkdownForEditor(body), [body]);
   const imageExtension = useMemo(() => markdownImageExtension(documentPath), [documentPath]);
@@ -488,6 +535,8 @@ export default function RichMarkdownEditor({
 
   useEffect(() => {
     const handleFindShortcut = (event: KeyboardEvent) => {
+      const container = editorRef.current?.view.dom.closest('.rich-markdown-editor');
+      if (!(event.target instanceof Node) || !container?.contains(event.target)) return;
       if ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase("en-US") === "f") {
         event.preventDefault();
         setSearchOpen(true);
@@ -548,7 +597,7 @@ export default function RichMarkdownEditor({
   }
 
   function publishEditorMarkdown(current = editorRef.current) {
-    if (!current || current.isDestroyed || !current.isInitialized) return;
+    if (!current || current.isDestroyed || !current.isInitialized || !current.isEditable) return;
     if (changePublishTimerRef.current !== null) {
       window.clearTimeout(changePublishTimerRef.current);
       changePublishTimerRef.current = null;
@@ -655,12 +704,15 @@ export default function RichMarkdownEditor({
   }
 
   const editor = useEditor({
+    editable: !readOnly,
     extensions: [
+      annotationExtension,
+      noteExtension,
       StarterKit.configure({
         link: {
           openOnClick: false,
           autolink: true,
-          protocols: ["domi-wiki", "domi-callout", "domi-folder"]
+          protocols: ["domi-wiki", "domi-callout", "domi-folder", "domi-annotation"]
         },
         underline: {
           HTMLAttributes: {
@@ -683,9 +735,11 @@ export default function RichMarkdownEditor({
     editorProps: {
       attributes: {
         class: "rich-markdown-content",
+        tabindex: '0',
         spellcheck: "false"
       },
       handlePaste: (view, event) => {
+        if (!view.editable) return false;
         const imageFiles = Array.from(event.clipboardData?.items || [])
           .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
           .map((item) => item.getAsFile())
@@ -696,6 +750,7 @@ export default function RichMarkdownEditor({
         return true;
       },
       handleDrop: (view, event) => {
+        if (!view.editable) return false;
         const files = Array.from(event.dataTransfer?.files || []);
         if (!files.length) return false;
         event.preventDefault();
@@ -711,11 +766,17 @@ export default function RichMarkdownEditor({
       },
       handleDOMEvents: {
         click: (_view, event) => {
+          const mark = event.target instanceof Element ? event.target.closest<HTMLElement>('[data-reading-annotation]') : null;
+          if (mark) {
+            const annotation = researchRef.current.annotations.find(item => item.id === mark.dataset.readingAnnotation);
+            if (annotation) researchRef.current.onAnnotationClick?.(annotation);
+          }
           const element = event.target instanceof Element
             ? event.target.closest<HTMLAnchorElement>("a[href]")
             : null;
           const href = element?.getAttribute("href")?.trim() || "";
           if (!href) return false;
+          if (href.startsWith('domi-annotation:')) { event.preventDefault(); researchRef.current.onOpenAnnotation?.(href.slice(16)); return true; }
           if (href === "domi-folder:current") {
             event.preventDefault();
             const separator = Math.max(documentPath.lastIndexOf("/"), documentPath.lastIndexOf("\\"));
@@ -731,7 +792,7 @@ export default function RichMarkdownEditor({
           const target = resolveLocalDocumentLink(href, documentPath);
           if (target) {
             event.preventDefault();
-            if ((isLocalMarkdownResource(target) || isLocalPdfResource(target)) && onOpenDocument) {
+            if ((isLocalMarkdownResource(target) || isLocalPdfResource(target) || isLocalWordResource(target)) && onOpenDocument) {
               onOpenDocument(target);
             } else {
               void workbench.openResource(target);
@@ -760,6 +821,7 @@ export default function RichMarkdownEditor({
     onCreate: ({ editor: current }) => {
       if (!current.isDestroyed) {
         editorRef.current = current;
+        researchRef.current.onReady?.(current);
         hydratingRef.current = false;
         if (initialSearchQuery.trim()) {
           setSearchOpen(true);
@@ -771,6 +833,7 @@ export default function RichMarkdownEditor({
       }
     },
     onDestroy: () => {
+      researchRef.current.onReady?.(null);
       editorRef.current = null;
       hydratingRef.current = true;
     },
@@ -780,12 +843,85 @@ export default function RichMarkdownEditor({
       if (searchOpenRef.current && searchQueryRef.current) {
         refreshSearch(current, searchQueryRef.current, searchIndexRef.current);
       }
+    },
+    onSelectionUpdate: ({ editor: current }) => {
+      if (!researchRef.current.onSelection) return;
+      const snapshot = snapshotSelection(current);
+      if (snapshot) { researchRef.current.onSelection(snapshot); return; }
+      const { from, to } = current.state.selection;
+      researchRef.current.onSelection(researchSelection(current, from, to));
     }
   });
 
+  useEffect(() => { if (editor && !editor.isDestroyed) editor.setEditable(!readOnly); }, [editor, readOnly]);
+  useEffect(() => {
+    if (!editor) return;
+    // Native selection also handles re-selecting the same text after the
+    // composer took focus, and read-only source snapshots in node views.
+    const selectedSnapshot = () => {
+      if (editor.isDestroyed || !researchRef.current.onSelection) return;
+      const focused = document.activeElement;
+      if (focused?.closest('.research-capture, .document-comments')) return;
+      if ((focused instanceof HTMLInputElement || focused instanceof HTMLTextAreaElement) && !editor.view.dom.contains(focused)) {
+        researchRef.current.onSelection(null); return;
+      }
+      const selection = window.getSelection();
+      if (!selection?.rangeCount) return;
+      const range = selection.getRangeAt(0);
+      const element = range.startContainer.nodeType === Node.TEXT_NODE ? range.startContainer.parentElement : range.startContainer instanceof Element ? range.startContainer : null;
+      if (!editor.view.dom.contains(range.startContainer) || !editor.view.dom.contains(range.endContainer)) {
+        if (!element?.closest('.research-capture, .document-comments')) researchRef.current.onSelection(null);
+        return;
+      }
+      if (selection.isCollapsed) { researchRef.current.onSelection(null); return; }
+      const snapshot = snapshotSelection(editor);
+      if (snapshot) {
+        researchRef.current.onSelection(snapshot);
+      } else {
+        const from = editor.view.posAtDOM(range.startContainer, range.startOffset);
+        const to = editor.view.posAtDOM(range.endContainer, range.endOffset);
+        researchRef.current.onSelection(researchSelection(editor, from, to));
+      }
+    };
+    document.addEventListener('selectionchange', selectedSnapshot);
+    return () => document.removeEventListener('selectionchange', selectedSnapshot);
+  }, [editor]);
+  useEffect(() => { if (editor && !editor.isDestroyed) editor.view.dispatch(editor.state.tr.setMeta(readingAnnotationKey, true)); }, [editor, annotations, sourceVersion, annotationTarget?.id, annotationTarget?.nonce]);
+  useEffect(() => {
+    if (!editor || editor.isDestroyed || !annotationTarget) return;
+    const annotation = researchRef.current.annotations.find(item=>item.id === annotationTarget.id);
+    if (!annotation || annotation.kind === 'document') return;
+    const rebased = Boolean(researchRef.current.sourceVersion && annotation.sourceVersion !== researchRef.current.sourceVersion);
+    let element: HTMLElement | null = null;
+    if (annotation.anchor.noteId) element = editor.view.dom.querySelector<HTMLElement>(`[data-reading-annotation="${annotation.id}"], [data-reading-annotations~="${annotation.id}"]`);
+    else {
+      const { text, positions } = editorTextIndex(editor.state.doc), range = anchorRange(text, annotation.anchor, !rebased);
+      if (range) {
+        const mapped = positions.slice(range.start, range.end).filter(pos=>pos>=0);
+        const native = mapped.length ? editorDomRange(editor, { from: mapped[0], to: mapped[mapped.length-1]+1 }) : null;
+        element = editor.view.dom.querySelector<HTMLElement>(`.reading-mark[data-reading-annotation="${annotation.id}"]`)
+          || (native?.startContainer.nodeType === Node.TEXT_NODE ? native.startContainer.parentElement : native?.startContainer instanceof HTMLElement ? native.startContainer : null);
+      }
+    }
+    editor.view.dom.querySelectorAll('.research-target').forEach(item=>item.classList.remove('research-target'));
+    if (element) { element.scrollIntoView({ block: 'center' }); void element.offsetWidth; element.classList.add('research-target'); }
+    researchRef.current.onAnnotationLocate?.({ found: Boolean(element), rebased });
+  }, [editor, annotationTarget?.id, annotationTarget?.nonce, annotations, sourceVersion]);
+  useEffect(() => {
+    if (externalRevision === undefined || !editor || editor.isDestroyed) return;
+    if (changePublishTimerRef.current !== null) { window.clearTimeout(changePublishTimerRef.current); changePublishTimerRef.current = null; }
+    const selection = editor.state.selection;
+    const container = editor.view.dom.closest('.rich-markdown-scroll');
+    const scrollTop = container?.scrollTop || 0;
+    editor.commands.setContent(preparedBody, { contentType: 'markdown', emitUpdate: false });
+    const maximum = Math.max(1,editor.state.doc.content.size - 1);
+    editor.commands.setTextSelection({ from: Math.min(selection.from,maximum), to: Math.min(selection.to,maximum) });
+    if (container) container.scrollTop = scrollTop;
+  }, [editor, externalRevision]);
+
   return (
     <div
-      className={`rich-markdown-editor${imageDragging ? " image-dragging" : ""}`}
+      className={`rich-markdown-editor${readOnly ? ' is-readonly' : ''}${imageDragging ? " image-dragging" : ""}`}
       onDragEnter={(event) => {
         if (!Array.from(event.dataTransfer.types).includes("Files")) return;
         imageDragDepthRef.current += 1;
@@ -826,12 +962,12 @@ export default function RichMarkdownEditor({
           void insertImageFiles(files, imageInsertionPositionRef.current);
         }}
       />
-      <RichMarkdownToolbar
+      {!readOnly && <RichMarkdownToolbar
         editor={editor}
         searchOpen={searchOpen}
         onOpenSearch={openSearch}
         onInsertImages={openImagePicker}
-      />
+      />}
       {searchOpen && (
         <div className="rich-markdown-search" role="search" aria-label="搜索 Markdown 文档">
           <Search size={14} aria-hidden="true" />

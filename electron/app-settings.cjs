@@ -129,6 +129,7 @@ const defaultSettings = Object.freeze({
   radarFollowedDomains: [...LEGACY_RADAR_DEFAULT_DOMAINS],
 documentSearchCloudContent: false,
 semanticSearchEnabled: true,
+documentOcrCommand: "",
 updateChannel: "stable"
 });
 
@@ -246,6 +247,7 @@ function normalizeSettings(value = {}) {
     radarFollowedDomains: normalizeRadarFollowedDomains(value.radarFollowedDomains),
 documentSearchCloudContent: value.documentSearchCloudContent === true,
 semanticSearchEnabled: value.semanticSearchEnabled !== false,
+documentOcrCommand: String(value.documentOcrCommand || "").trim(),
 updateChannel: value.updateChannel === "beta" ? "beta" : "stable"
   };
 }

@@ -52,7 +52,8 @@ const {
 } = require("./codex-turn-status.cjs");
 const { isSelectedCodexConnectionReady } = require("./codex-protocol.cjs");
 const { startIntakeServer, DEFAULT_PORT: INTAKE_DEFAULT_PORT } = require("./intake-server.cjs");
-const { FeishuIntakePoller } = require("./intake-feishu.cjs");
+const { FeishuIntakePoller, buildInboxQuestionReply, buildInboxContinueReply } = require("./intake-feishu.cjs");
+const { InboxAnswerGenerator, composeAnswerReply } = require("./inbox-answer.cjs");
 const { FeishuWikiMirror } = require("./feishu-wiki-mirror.cjs");
 const { KnowledgeTranslationService } = require("./knowledge-translation.cjs");
 const { ChineseTranslator } = require("./chinese-translation.cjs");
@@ -92,6 +93,24 @@ const {
   listDocumentLibrary
 } = require("./document-library.cjs");
 const { DocumentSearchService } = require("./document-search-service.cjs");
+const { ResearchStore } = require("./research-store.cjs");
+const {createDocumentAnnotationService}=require('./document-annotations.cjs');
+const { createPdfPreviewRegistry } = require('./pdf-preview.cjs');
+const pdfPreviewRegistry = createPdfPreviewRegistry({ net });
+const researchAllowedPaths = new Set();
+let researchStore = null;
+function getResearchStore() {
+  const location = currentDocumentLibraryLocation();
+  const rootPath = fs.realpathSync(location.rootPath);
+  if (researchStore?.root !== rootPath) {
+    researchStore?.close();
+    researchStore = new ResearchStore({ rootPath, allowedPaths: researchAllowedPaths,
+      onFileChanged: (file) => { invalidateDocumentLibraryCache(); getDocumentSearchService().updateFile(rootPath, file); }
+    });
+  }
+  return researchStore;
+}
+const documentAnnotations=createDocumentAnnotationService({getStore:getResearchStore,allowedPaths:researchAllowedPaths,cacheDir:()=>path.join(app.getPath('userData'),'word-preview'),chooseSave:(options,owner)=>dialog.showSaveDialog(owner,options)});
 const { normalizeWebResource } = require("./resource-target.cjs");
 const { normalizeLocalDocumentResource } = require("./document-resource.cjs");
 const { prepareApplicationBrandPaths } = require("./brand-migration.cjs");
@@ -104,7 +123,8 @@ const {
 const { buildDocumentContext } = require("./document-context.cjs");
 const { LibrarySession, libraryToolSpecs, libraryInstructions, startLibraryThread,
   normalizeSourceScope, isRestrictedSourceScope, restrictedLibraryConfig, verifyCitationOriginal } = require("./library-tools.cjs");
-const { DocumentReader } = require("./document-reader.cjs");
+const { usesSelectedDocuments, questionNeedsLibrary, normalizeQuestionPayload, questionPrompt } = require('./question-modes.cjs');
+const { DocumentReader, createOcrPageExecutor } = require("./document-reader.cjs");
 const { LibraryToolGateway } = require("./library-tool-gateway.cjs");
 const libraryToolGateway = new LibraryToolGateway();
 const libraryToolThreads = new Set();
@@ -151,7 +171,8 @@ protocol.registerSchemesAsPrivileged([
       standard: true,
       secure: true,
       supportFetchAPI: true,
-      stream: true
+      stream: true,
+      corsEnabled: true
     }
   },
   {
@@ -814,7 +835,7 @@ async function selectLocalFiles(sender, requestedWorkspacePath, entityRequest) {
         name: "常用材料",
         extensions: [
           "pdf", "doc", "docx", "xls", "xlsx", "csv", "ppt", "pptx",
-          "md", "txt", "json", "png", "jpg", "jpeg", "webp", "heic",
+          "md", "txt", "json", "srt", "vtt", "png", "jpg", "jpeg", "webp", "heic",
           "mp3", "m4a", "wav", "mp4", "mov"
         ]
       },
@@ -870,10 +891,18 @@ function getDocumentSearchService() {
       databasePath: path.join(app.getPath("cache"), "domi", "document-search.sqlite3"),
       cloudContentAllowed: () => getAppSettings().load().settings.documentSearchCloudContent === true,
       semanticEnabled: () => getAppSettings().load().settings.semanticSearchEnabled !== false,
+      ocrCommand: () => String(getAppSettings().load().settings.documentOcrCommand || "").trim(),
       semanticCacheDir: path.join(app.getPath("cache"), "domi", "semantic-models")
     });
   }
   return documentSearchService;
+}
+
+// OCR 为可选能力：未配置命令时保持原行为；识别结果必须带质量未验证披露。
+function documentOcrPageFromSettings() {
+  const command = String(getAppSettings().load().settings.documentOcrCommand || "").trim();
+  if (!command) return null;
+  try { return createOcrPageExecutor(command); } catch { return null; }
 }
 
 function semanticSearchDocumentLibrary(request = {}) {
@@ -910,28 +939,30 @@ function searchDocumentLibrary(request = {}) {
 }
 
 async function prepareLibraryAccess(settings, sender, runId, payload = {}) {
+  if (!questionNeedsLibrary(payload)) return null;
   const restricted = isRestrictedSourceScope(payload);
-  if (payload.sourceScope !== "selected" && (settings.storageBackend !== "local" || !settings.localRepositoryDir)) {
+  if (!usesSelectedDocuments(payload.sourceScope) && (settings.storageBackend !== "local" || !settings.localRepositoryDir)) {
     if (restricted) throw new Error("全库资料模式需要已连接的本地资料库，本轮未改用飞书或联网。");
     return null;
   }
   const attachmentPaths = Array.isArray(payload.attachmentPaths) ? payload.attachmentPaths : [];
-  if (payload.sourceScope === "selected" && !attachmentPaths.length) throw new Error("请先添加选定材料；本轮不会自动检索全库。");
+  if (usesSelectedDocuments(payload.sourceScope) && !attachmentPaths.length) throw new Error("请先添加选定材料；本轮不会自动检索全库。");
   if (attachmentPaths.length > 64) throw new Error("本轮材料超过 64 份，请缩小来源范围后重试。");
   const supportedPaths = [];
   for (const filePath of attachmentPaths) {
     if (typeof filePath !== "string" || !path.isAbsolute(filePath)) throw new Error("所选材料缺少有效的绝对路径，请重新添加。");
     const canonical = fs.realpathSync(filePath);
-    const supported = [".md", ".markdown", ".txt", ".pdf"].includes(path.extname(canonical).toLowerCase());
-    if (!supported && restricted) throw new Error(`受限来源暂不支持 ${path.basename(filePath)}，请转换为 Markdown、文本或 PDF；不会扩大来源范围。`);
+    const supported = [".md", ".markdown", ".txt", ".pdf", ".docx", ".doc"].includes(path.extname(canonical).toLowerCase());
+    if (!supported && restricted) throw new Error(`受限来源暂不支持 ${path.basename(filePath)}，请转换为 Markdown、文本、PDF 或 Word；不会扩大来源范围。`);
     if (supported) supportedPaths.push(filePath);
   }
   const { rootPath } = documentLibraryLocation(settings);
   const session = new LibrarySession({
     rootPath, settings,
     sourceScope: normalizeSourceScope(payload.sourceScope, payload.webSearch),
-    selectedPaths: payload.sourceScope === "selected" ? supportedPaths : [],
+    selectedPaths: usesSelectedDocuments(payload.sourceScope) ? supportedPaths : [],
     attachmentPaths: supportedPaths,
+    ocrPage: documentOcrPageFromSettings(),
     search: (query, options) => searchDocumentLibrary({ query, ...options }),
     semanticSearch: (query, options) => semanticSearchDocumentLibrary({ query, ...options }),
     isCurrent: () => {
@@ -1163,9 +1194,8 @@ function resolvePdfPath(resource, basePath) {
   return resolved;
 }
 
-function pdfPreviewUrl(filePath) {
-  const token = Buffer.from(filePath, "utf8").toString("base64url");
-  return `${pdfProtocol}://local/${token}`;
+function pdfPreviewUrl(filePath,version) {
+  return pdfPreviewRegistry.url(filePath,version);
 }
 
 function markdownAssetPreviewUrl(filePath) {
@@ -1191,13 +1221,17 @@ async function readPdfDocument(request) {
     if (signature.toString("ascii") !== "%PDF-") {
       return { ok: false, error: "文件扩展名为 PDF，但内容不是有效的 PDF 文件。" };
     }
+    const version=crypto.createHash('sha256').update(await fs.promises.readFile(resolved)).digest('hex');
+    const after=await fs.promises.stat(resolved);if(after.size!==stat.size||after.mtimeMs!==stat.mtimeMs)return {ok:false,error:'读取期间 PDF 已变化，请重试。'};
 
+    researchAllowedPaths.add(fs.realpathSync(resolved));
     return {
       ok: true,
       document: {
         path: resolved,
         name: path.basename(resolved),
-        previewUrl: pdfPreviewUrl(resolved),
+        previewUrl: pdfPreviewUrl(resolved,version),
+        version,
         size: stat.size,
         mtimeMs: stat.mtimeMs
       }
@@ -1208,19 +1242,7 @@ async function readPdfDocument(request) {
 }
 
 function installPdfProtocol() {
-  protocol.handle(pdfProtocol, (request) => {
-    try {
-      const requestUrl = new URL(request.url);
-      if (requestUrl.hostname !== "local") {
-        return new Response("Not found", { status: 404 });
-      }
-      const token = requestUrl.pathname.replace(/^\//, "");
-      const resolved = resolvePdfPath(Buffer.from(token, "base64url").toString("utf8"));
-      return net.fetch(pathToFileURL(resolved).href);
-    } catch {
-      return new Response("Invalid PDF resource", { status: 400 });
-    }
-  });
+  protocol.handle(pdfProtocol, request => pdfPreviewRegistry.handle(request));
 }
 
 function installMarkdownAssetProtocol() {
@@ -1264,6 +1286,7 @@ async function readMarkdownDocument(request) {
       return { ok: false, error: "Markdown 文件超过 8 MB，暂不在 domi 中打开。" };
     }
     const content = await fs.promises.readFile(resolved, "utf8");
+    researchAllowedPaths.add(fs.realpathSync(resolved));
     return {
       ok: true,
       document: {
@@ -2799,11 +2822,11 @@ async function resolveThread(client, payload, workspacePath, sandbox) {
     approvalPolicy: "never",
     sandbox,
     serviceName: "domi",
-    ...(payload.libraryTools && client.capabilities().experimentalApi ? { dynamicTools: libraryToolSpecs } : {}),
+    ...(payload.libraryTools && questionNeedsLibrary(payload) && client.capabilities().experimentalApi ? { dynamicTools: libraryToolSpecs } : {}),
     ...threadPersistenceOptions(payload),
     config: threadConfig
-  }, { requireDynamicTools: restricted });
-  if (restricted && (!toolsRegistered || started.instructionSources?.length)) throw new Error("受限来源隔离未能生效：存在未授权的工作区指令或缺少资料工具，本轮未运行。");
+  }, { requireDynamicTools: restricted && questionNeedsLibrary(payload) });
+  if (restricted && ((questionNeedsLibrary(payload) && !toolsRegistered) || started.instructionSources?.length)) throw new Error("受限来源隔离未能生效：存在未授权的工作区指令或缺少资料工具，本轮未运行。");
   if (toolsRegistered) libraryToolThreads.add(started.thread.id);
   if (sourceScopeAllowsResume(payload)) {
     liveCodexThreads.set(
@@ -2882,6 +2905,9 @@ async function saveRuntimeSettings(request) {
         && settingsRequest[key] !== current[key]
     )) {
       allowedMarkdownAssetPaths.clear();
+      pdfPreviewRegistry.clear();
+      // 资料库根目录变化时重建自动镜像监听；镜像账本在下次同步时重新对账。
+      startLibraryMirrorWatcher();
     }
     getUpdateService().configureChannel(result.settings.updateChannel);
     const warning = current.storageBackend === "feishu"
@@ -3361,11 +3387,10 @@ async function runCodex(sender, payload) {
   }
   ensureDemoWorkspace();
   const settings = getAppSettings().load().settings;
-  try { normalizeSourceScope(payload?.sourceScope, payload?.webSearch); }
+  try { payload = normalizeQuestionPayload(payload); }
   catch (error) { return { ok: false, runId: payload?.runId || "", output: "", error: error.message }; }
   const restricted = isRestrictedSourceScope(payload);
   if (restricted && settings.authMode === "agent-cli") return { ok: false, runId: payload?.runId || "", output: "", error: "当前 CLI 执行器无法证明受限来源权限，请选择 Codex 后重试；本轮未放宽来源范围。" };
-  if (restricted) payload = { ...payload, webSearch: false, ephemeral: true, externalType: undefined, externalRecordId: undefined, activeDocumentPath: undefined };
   const localEntityRequest = !restricted && settings.storageBackend === "local"
     && ["project", "person"].includes(payload?.externalType)
     && String(payload?.externalRecordId || "").trim()
@@ -3391,7 +3416,7 @@ async function runCodex(sender, payload) {
   const runId = payload?.runId || `run-${Date.now()}`;
   const acceptedAt = Date.now();
   const prompt = restricted
-    ? `请在本轮锁定的来源范围内，以只读资料问答方式完成以下用户问题。不要调用投资入库、外部连接或其他工作流。关键结论必须绑定已提供原文，缺少证据时明确说明。\n\n${String(payload?.requestText || "").trim() || "请分析选定材料。"}`
+    ? questionPrompt(payload)
     : String(payload?.prompt || "").trim();
   let libraryAccess = null;
   if (localEntityRequest && !canonicalEntityWorkspace) {
@@ -3447,7 +3472,7 @@ async function runCodex(sender, payload) {
     const client = getCodexClient();
     libraryAccess = !restricted && (payload?.workflowId === "connection-guidance" || payload?.privateOutput === true)
       ? null : await prepareLibraryAccess(settings, sender, runId, payload);
-    if (restricted && !libraryAccess) throw new Error("未能建立本轮受限资料会话，本轮未运行。");
+    if (restricted && questionNeedsLibrary(payload) && !libraryAccess) throw new Error("未能建立本轮受限资料会话，本轮未运行。");
     const researchCacheScope = restricted ? { allowed: false, workspacePath: "" } : projectResearchCacheScope(payload, workspacePath);
     const researchCachePromise = restricted ? Promise.resolve({ context: "", cacheHit: false, identity: null, inventory: null, previous: null }) : prepareProjectResearchCache({
       stateStore: getStateStore(),
@@ -3509,7 +3534,8 @@ async function runCodex(sender, payload) {
       researchCache.context,
       documentContext?.context,
       libraryAccess ? libraryInstructions({ fallbackCommand: restricted ? "" : libraryAccess.command,
-        dynamicTools: libraryToolThreads.has(threadId), sourceScope: libraryAccess.session.sourceScope }) : ""
+        dynamicTools: libraryToolThreads.has(threadId), sourceScope: libraryAccess.session.sourceScope,
+        selectedPaths: libraryAccess.session.selectedPaths }) : ""
     ]
       .filter(Boolean)
       .join("\n\n");
@@ -4135,6 +4161,60 @@ let feishuWikiMirrorSyncing = false;
 // 未配置 DOMI_QUERY_WORKER_URL 时全部无行为。
 const querySnapshotLastShaRef = { current: "" };
 
+// 本地更新 → 飞书自动同步：递归监听资料库目录，.md 变更防抖 5 秒后触发
+// 一次增量镜像（sha256 账本保证未变文件零 API 调用；与 30 分钟兜底互补）。
+// 递归监听仅 Windows/macOS 支持，失败时记日志并依赖周期兜底。
+let libraryMirrorWatcher = null;
+let libraryMirrorWatcherRoot = "";
+let libraryMirrorDebounceTimer = null;
+const LIBRARY_MIRROR_DEBOUNCE_MS = 5_000;
+
+function stopLibraryMirrorWatcher() {
+  if (libraryMirrorDebounceTimer) { clearTimeout(libraryMirrorDebounceTimer); libraryMirrorDebounceTimer = null; }
+  if (libraryMirrorWatcher) {
+    try { libraryMirrorWatcher.close(); } catch { /* best-effort */ }
+    libraryMirrorWatcher = null;
+  }
+  libraryMirrorWatcherRoot = "";
+}
+
+function scheduleMirrorFileSync(trigger) {
+  if (libraryMirrorDebounceTimer) return;
+  libraryMirrorDebounceTimer = setTimeout(() => {
+    libraryMirrorDebounceTimer = null;
+    void syncFeishuWikiMirror(trigger);
+  }, LIBRARY_MIRROR_DEBOUNCE_MS);
+  libraryMirrorDebounceTimer.unref?.();
+}
+
+function startLibraryMirrorWatcher() {
+  const root = getAppSettings().load().settings.localRepositoryDir || "";
+  if (!root || libraryMirrorWatcherRoot === root) return;
+  if (!fs.existsSync(root)) return;
+  stopLibraryMirrorWatcher();
+  try {
+    libraryMirrorWatcher = fs.watch(root, { recursive: true }, (_event, fileName) => {
+      const segments = String(fileName || "").split(/[\\/]/);
+      const base = segments[segments.length - 1] || "";
+      if (!/\.(md|markdown)$/i.test(base)) return;
+      scheduleMirrorFileSync("file-change");
+    });
+    libraryMirrorWatcherRoot = root;
+    libraryMirrorWatcher.on("error", () => {
+      appendRuntimeLog("feishu-wiki-mirror-watcher-error", { root });
+      stopLibraryMirrorWatcher();
+    });
+    appendRuntimeLog("feishu-wiki-mirror-watcher-started", { root });
+  } catch (error) {
+    libraryMirrorWatcher = null;
+    libraryMirrorWatcherRoot = "";
+    appendRuntimeLog("feishu-wiki-mirror-watcher-failed", {
+      root,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
 function getFeishuWikiMirror() {
   if (!feishuWikiMirror) {
     feishuWikiMirror = new FeishuWikiMirror({
@@ -4406,6 +4486,127 @@ function formatInboxQueryNewsRow(row) {
   return lines.join("\n");
 }
 
+// 方案 C：收件箱深度问答的本地资料会话。与桌面 Codex/CLI 共用同一套
+// LibrarySession 混合检索、章节展开与覆盖 ledger；会话按群缓存供「续读」
+// 使用，约 2 小时后过期，避免陈旧版本被当作当前原文。
+const inboxQuestionSessions = new Map();
+const INBOX_QUESTION_SESSION_TTL_MS = 2 * 60 * 60 * 1000;
+const INBOX_QUESTION_SESSION_MAX = 8;
+
+function closeInboxQuestionSession(entry) {
+  try { entry?.session?.close(); } catch { /* best-effort cleanup */ }
+}
+
+function evictInboxQuestionSessions() {
+  const now = Date.now();
+  for (const [chatId, entry] of inboxQuestionSessions) {
+    if (now - entry.createdAt <= INBOX_QUESTION_SESSION_TTL_MS) continue;
+    inboxQuestionSessions.delete(chatId);
+    closeInboxQuestionSession(entry);
+  }
+  while (inboxQuestionSessions.size > INBOX_QUESTION_SESSION_MAX) {
+    const oldest = [...inboxQuestionSessions.entries()].sort((left, right) => left[1].createdAt - right[1].createdAt)[0];
+    if (!oldest) break;
+    inboxQuestionSessions.delete(oldest[0]);
+    closeInboxQuestionSession(oldest[1]);
+  }
+}
+
+function answerInboxQuestionSessionSettings() {
+  const settings = getAppSettings().load().settings;
+  if (settings.storageBackend !== "local" || !settings.localRepositoryDir) return null;
+  const { rootPath } = documentLibraryLocation(settings);
+  return { settings, rootPath };
+}
+
+// NotebookLM 式作答器：与中文翻译共用 Codex app-server 通道（read-only、无工具、
+// 断网）。app-server 退出时置空，下一个问题自动重建。
+let inboxAnswerGenerator = null;
+function getInboxAnswerGenerator() {
+  if (!inboxAnswerGenerator?.ready) {
+    inboxAnswerGenerator?.close?.();
+    inboxAnswerGenerator = new InboxAnswerGenerator({
+      cwd: path.join(app.getPath("userData"), "inbox-answer"),
+      runtimeProvider: getCodexRuntime
+    });
+  }
+  return inboxAnswerGenerator;
+}
+
+async function answerInboxQuestion(query) {
+  const chatId = String(query?.chatId || "");
+  const library = answerInboxQuestionSessionSettings();
+  if (!library) {
+    return "深度问答需要已连接的本地资料库；当前不是本地存储模式，请在 domi 设置中确认后再试。";
+  }
+  const session = new LibrarySession({
+    rootPath: library.rootPath, settings: library.settings, sourceScope: "library",
+    ocrPage: documentOcrPageFromSettings(),
+    search: (question, options) => searchDocumentLibrary({ query: question, ...options }),
+    semanticSearch: (question, options) => semanticSearchDocumentLibrary({ query: question, ...options }),
+    isCurrent: () => {
+      const current = answerInboxQuestionSessionSettings();
+      return Boolean(current && current.rootPath === library.rootPath);
+    }
+  });
+  let contextResult;
+  try {
+    contextResult = await session.initialContext(String(query?.keyword || ""));
+  } catch (error) {
+    closeInboxQuestionSession({ session });
+    return `深度问答检索失败：${error instanceof Error ? error.message : String(error)}。可发「查 关键词」快速检索。`;
+  }
+  const previous = chatId ? inboxQuestionSessions.get(chatId) : null;
+  if (previous) closeInboxQuestionSession(previous);
+  if (chatId) {
+    inboxQuestionSessions.set(chatId, { session, sources: contextResult.sources, createdAt: Date.now() });
+    evictInboxQuestionSessions();
+  } else {
+    closeInboxQuestionSession({ session });
+  }
+  // NotebookLM 式作答：模型基于检索到的原文作答并标注【n】来源；模型通道
+  // 失败时回退到原文摘录模式并如实说明，不断对话。
+  try {
+    const answer = await getInboxAnswerGenerator().answer(String(query?.keyword || ""), contextResult.sources);
+    if (answer) {
+      return composeAnswerReply(String(query?.keyword || ""), answer, contextResult.sources, contextResult.warnings,
+        { mirrorLink: inboxQueryMirrorLink });
+    }
+  } catch (error) {
+    appendRuntimeLog("inbox-answer-failed", {
+      question: String(query?.keyword || "").slice(0, 80),
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+  const fallback = buildInboxQuestionReply(String(query?.keyword || ""), contextResult.sources, contextResult.warnings,
+    { mirrorLink: inboxQueryMirrorLink });
+  return `（模型作答暂不可用，以下为原文摘录）\n\n${fallback}`;
+}
+
+async function answerInboxContinue(query) {
+  const chatId = String(query?.chatId || "");
+  const entry = chatId ? inboxQuestionSessions.get(chatId) : null;
+  if (!entry) {
+    return "没有可续读的本地资料会话（会话约 2 小时后过期）。请重新发送一次问题，再发「续读 序号」。";
+  }
+  const index = Number(query?.keyword);
+  const source = entry.sources[index - 1];
+  if (!source) {
+    return `上一轮答案只有 ${entry.sources.length} 个来源，没有第 ${index} 个；请检查序号。`;
+  }
+  if (!source.nextCursor && source.fullDocument) {
+    return `【${index}】${source.title || source.relativePath || "资料"}在上一轮已全文读完；可发新问题检索其他资料。`;
+  }
+  try {
+    const document = source.nextCursor
+      ? await entry.session.read({ path: source.path, cursor: source.nextCursor, mode: "document", maxChars: 1500 })
+      : await entry.session.read({ path: source.path, mode: "document", offset: source.endOffset, maxChars: 1500 });
+    return buildInboxContinueReply(index, source, document, { mirrorLink: inboxQueryMirrorLink });
+  } catch (error) {
+    return `续读失败：${error instanceof Error ? error.message : String(error)}；可重新发一次问题重建会话。`;
+  }
+}
+
 async function answerInboxQuery(query) {
   const messageId = String(query?.messageId || "");
   if (!messageId) return;
@@ -4413,7 +4614,11 @@ async function answerInboxQuery(query) {
   let replyText = "";
   const db = inboxQueryDatabase();
   try {
-    if (query?.kind === "digest") {
+    if (query?.kind === "question") {
+      replyText = await answerInboxQuestion(query);
+    } else if (query?.kind === "continue") {
+      replyText = await answerInboxContinue(query);
+    } else if (query?.kind === "digest") {
       // 最近一份订阅日报（今天优先，找不到就回退最新镜像过的日报）。
       const today = inboxQueryDateString(Date.now());
       const libraryRoot = getAppSettings().load().settings.localRepositoryDir || "";
@@ -4678,6 +4883,7 @@ intakeFeishuPoller = new FeishuIntakePoller({
   // 让手机端随时可读。sha256 账本保证无变化时几乎零 API 调用。
   const mirrorStartupTimer = setTimeout(() => {
     void syncFeishuWikiMirror("startup");
+    startLibraryMirrorWatcher();
   }, 3 * 60_000);
   mirrorStartupTimer.unref?.();
   // 中文正文与摘要独立处理：Luna/medium/standard，不运行本地推理。
@@ -4768,6 +4974,8 @@ app.on("before-quit", (event) => {
     updateService?.stop();
     clearInterval(knowledgeTranslationTimer);
     knowledgeTranslationService?.close();
+    stopLibraryMirrorWatcher();
+    inboxAnswerGenerator?.close();
     codexClient?.close();
     if (remaining === 0) stateStore?.close();
     applicationQuitFlushComplete = true;
@@ -4843,7 +5051,8 @@ ipcMain.handle("library:citation-verify", async (_event, request = {}) => {
     const citation = saved?.usage?.citations?.find((item) => item.id === request.citationId);
     if (!citation || !saved.rootPath || active?.privateOutput) return { ok: false, error: "该引用不在宿主保存的本轮证据记录中。" };
     const reader = new DocumentReader({ rootPath: saved.rootPath, allowedPaths: [citation.path],
-      cloudContentAllowed: getAppSettings().load().settings.documentSearchCloudContent === true });
+      cloudContentAllowed: getAppSettings().load().settings.documentSearchCloudContent === true,
+      ocrPage: documentOcrPageFromSettings() });
     const checked = await verifyCitationOriginal(citation, reader);
     return { ok: true, citation: checked };
   } catch (error) { return { ok: false, error: error.message || "引用原文回查失败，不能认定当前版本已核验。" }; }
@@ -4933,12 +5142,18 @@ ipcMain.handle("domi:subscription-digest-finalize", async (_event, request) => {
   } finally { translator.close(); }
 });
 ipcMain.handle("markdown:read", (_event, request) => readMarkdownDocument(request));
+ipcMain.handle("research:request", async (_event, request) => {
+  try { return await getResearchStore().handle(request); }
+  catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
+});
 ipcMain.handle("markdown:save", (_event, request) => saveMarkdownDocument(request));
 ipcMain.handle("markdown:rename", (_event, request) => renameMarkdownDocument(request));
 ipcMain.handle("markdown:image-preview", (_event, request) => resolveMarkdownImagePreview(request));
 ipcMain.handle("markdown:image-save", (_event, request) => saveMarkdownImage(request));
 ipcMain.handle("markdown:copy", (_event, request) => copyMarkdownDocument(request));
 ipcMain.handle("pdf:read", (_event, request) => readPdfDocument(request));
+ipcMain.handle('word:read',(_event,request)=>documentAnnotations.readWord(request));
+ipcMain.handle('document:export-annotated',(event,request)=>documentAnnotations.exportAnnotated(request,BrowserWindow.fromWebContents(event.sender)));
 ipcMain.handle("domi:entity-workspace", async (_event, request) => {
   try {
     return await resolveCanonicalEntityWorkspace(request, {

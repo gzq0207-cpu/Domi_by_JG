@@ -57,7 +57,7 @@ const CHAIN_PROJECT_ROOTS = Object.freeze([
 const PROJECT_PAGE_NAME = "项目主页.md";
 const PERSON_PAGE_NAME = "人物主页.md";
 const PROJECT_STRUCTURE_DIRECTORIES = new Set(["原始材料", "研究", "纪要", "导出"]);
-const PREVIEW_DOCUMENT_EXTENSIONS = new Set([".md", ".markdown", ".pdf"]);
+const PREVIEW_DOCUMENT_EXTENSIONS = new Set([".md", ".markdown", ".pdf", ".docx", ".doc"]);
 const PERSON_INTERACTION_NAME_PATTERN = /(?:交流|纪要|会议|访谈|沟通|会面|电话|路演|聊天)/i;
 const PERSON_PROFILE_NAME_PATTERN = /(?:人物主页|人物资料|人物画像|公开资料|背景研究|背景调查|背调)/i;
 const PERSON_RESEARCH_NAME_PATTERN = /(?:研究|调研|人物画像|背景|背调|资料|分析|profile)/i;
@@ -2429,7 +2429,7 @@ if (!directory) throw new Error("该记录尚未关联本地资料目录。");
 assertWithin(this.libraryDir, directory);
     const previewPath = bestPreviewDocument(directory, canonicalPath);
     if (!previewPath) {
-      throw new Error("该资料目录中还没有可在 domi 内预览的 Markdown 或 PDF 文档。");
+      throw new Error("该资料目录中还没有可在 domi 内预览的 Markdown、PDF 或 Word 文档。");
     }
     assertWithin(directory, previewPath);
     return {

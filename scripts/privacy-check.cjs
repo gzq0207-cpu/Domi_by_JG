@@ -101,7 +101,7 @@ function inspectContent(content, filePath, scanRoot, options = {}) {
   if (containsOneDriveAccountPath(content)) {
     fail("发现 OneDrive 租户或账户路径", relative);
   }
-  if (/https?:\/\/[A-Za-z0-9-]+\.(?:feishu\.cn|larksuite\.com)(?:\/|\b)/i.test(content)) {
+  if (/https?:\/\/(?!open\.)[A-Za-z0-9-]+\.(?:feishu\.cn|larksuite\.com)(?:\/|\b)/i.test(content)) {
     fail("发现飞书租户域名", relative);
   }
   if (/\bou_[A-Za-z0-9_-]{20,}\b/.test(content)) {

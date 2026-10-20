@@ -63,7 +63,7 @@ assert.match(
 );
 assert.match(
   editor,
-  /protocols: \["domi-wiki", "domi-callout", "domi-folder"\][\s\S]*?href === "domi-folder:current"[\s\S]*?workbench\.openResource\(directory\)/,
+  /protocols: \["domi-wiki", "domi-callout", "domi-folder", "domi-annotation"\][\s\S]*?href === "domi-folder:current"[\s\S]*?workbench\.openResource\(directory\)/,
   "Project homepages must expose a safe shortcut that opens only the current entity directory."
 );
 assert.match(
@@ -88,7 +88,7 @@ assert.match(
 );
 assert.match(
   messageContent,
-  /const citationPath = codexFileCitationPath\(href\)[\s\S]*?isLocalMarkdownResource\(target\) \|\| isLocalPdfResource\(target\)[\s\S]*?onOpenDocument\(target\)[\s\S]*?workbench\.openResource\(target\)/,
+  /const citationPath = codexFileCitationPath\(href\)[\s\S]*?isLocalMarkdownResource\(target\) \|\| isLocalPdfResource\(target\)[\s\S]*?openDocumentRef\.current\(target\)[\s\S]*?workbench\.openResource\(target\)/,
   "Material citations must open Markdown and PDF inside domi while delegating other files and folders to the system."
 );
 assert.match(
@@ -378,7 +378,7 @@ assert.match(
 );
 assert.match(
   app,
-  /<RichMarkdownEditor[\s\S]*?markdown=\{markdownDraft\}/,
+  /<MaterialReader[\s\S]*?markdown=\{markdownDocument\}[\s\S]*?draft=\{markdownDraft\}/,
   "Editor remounts must retain text entered while a save was in flight."
 );
 assert.match(
@@ -393,7 +393,7 @@ assert.match(
 );
 assert.match(
   app,
-  /复制 Markdown 全文和图片[\s\S]*?documentPath=\{markdownDocument\.path\}/,
+  /复制 Markdown 全文和图片[\s\S]*?markdown=\{markdownDocument\}[\s\S]*?onCopyDocument=\{\(\) => void copyOpenMarkdown\(\)\}/,
   "The Markdown panel must expose image-aware full-document copy and bind the editor to its path."
 );
 assert.match(

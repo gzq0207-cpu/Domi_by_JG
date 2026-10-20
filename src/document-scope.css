@@ -1,0 +1,44 @@
+.document-scope-dialog {
+  width: min(740px, calc(100vw - 48px)); max-height: calc(100vh - 64px);
+  padding: 0; border: 1px solid var(--line); border-radius: 16px;
+  color: var(--text); background: var(--canvas); box-shadow: 0 24px 80px #16161330;
+}
+.document-scope-dialog::backdrop { background: #1d1d184d; }
+.document-scope-content { display: flex; flex-direction: column; max-height: calc(100vh - 66px); }
+.document-scope-content button { cursor: pointer; border: 1px solid var(--line); border-radius: 7px; background: var(--canvas); color: var(--text); }
+.document-scope-content button:disabled { opacity: .5; cursor: default; }
+.document-scope-content header { display: flex; gap: 20px; align-items: flex-start; padding: 22px 24px 14px; }
+.document-scope-content h2 { font-size: 18px; margin: 0 0 8px; }
+.document-scope-content header p { font-size: 13px; line-height: 1.6; color: var(--muted); margin: 0; }
+.document-scope-content header > button { border: 0; padding: 4px; margin-left: auto; }
+.document-scope-search { display: flex; align-items: center; gap: 8px; margin: 0 24px 12px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); }
+.document-scope-search input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; font-size: 13px; }
+.document-scope-search button { border: 0; display: flex; padding: 3px; }
+.document-scope-browser { min-height: 140px; height: 310px; flex: 1 1 auto; overflow: auto; margin: 0 24px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface, #fff); }
+.document-scope-browser > p { padding: 12px; font-size: 13px; color: var(--muted); }
+.document-scope-row { display: flex; align-items: center; gap: 6px; min-width: max-content; min-height: 38px; padding-right: 12px; }
+.document-scope-row:hover { background: var(--selected); }
+.document-scope-disclosure { width: 20px; flex: 0 0 20px; display: flex; padding: 2px; border: 0 !important; background: transparent !important; }
+.document-scope-disclosure svg.open { transform: rotate(90deg); }
+.document-scope-row label { flex: 1; display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; }
+.document-scope-row input { accent-color: var(--accent); }
+.document-scope-row small { padding-left: 18px; color: var(--muted); font-size: 11px; }
+.document-scope-selection { margin: 14px 24px 0; }
+.document-scope-selection > div:first-child { display: flex; align-items: center; justify-content: space-between; font-size: 12px; }
+.document-scope-selection > div > button { border: 0; color: var(--muted); font-size: 12px; padding: 4px; }
+.document-scope-chips { display: flex; flex-wrap: wrap; gap: 5px; max-height: 94px; overflow: auto; margin-top: 6px; }
+.document-scope-chips button { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; padding: 5px 8px; font-size: 12px; }
+.document-scope-chips button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.document-scope-content footer { display: flex; align-items: center; gap: 8px; padding: 18px 24px; }
+.document-scope-content footer span { margin-right: auto; color: var(--muted); font-size: 12px; }
+.document-scope-content footer button { padding: 8px 12px; font-size: 12px; white-space: nowrap; }
+.document-scope-content footer .primary { color: #fff; background: var(--accent); border-color: var(--accent); }
+.document-scope-hint, .document-scope-error { margin: 10px 24px 0; font-size: 12px; line-height: 1.6; color: var(--muted); }
+.document-scope-error { color: var(--danger); }
+@media (max-width: 600px) {
+  .document-scope-content header { padding: 16px; }
+  .document-scope-search, .document-scope-browser { margin-left: 16px; margin-right: 16px; }
+  .document-scope-selection { margin-left: 16px; margin-right: 16px; }
+  .document-scope-content footer { flex-wrap: wrap; padding: 16px; }
+  .document-scope-content footer span { width: 100%; }
+}

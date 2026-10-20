@@ -83,6 +83,9 @@ declare global {
       saveMarkdownImage: (request: MarkdownImageSaveRequest) => Promise<MarkdownImageSaveResult>;
       copyMarkdown: (request: MarkdownCopyRequest) => Promise<MarkdownCopyResult>;
       readPdf: (request: PdfReadRequest) => Promise<PdfReadResult>;
+      research: (request: import('./research-types').ResearchRequest) => Promise<import('./research-types').ResearchResult>;
+      readWord: (request: PdfReadRequest) => Promise<{ok:boolean;document?:import('./research-types').WordDocument;error?:string}>;
+      exportAnnotatedDocument: (request:{path:string;expectedVersion:string;preserveUnlocated?:boolean}) => Promise<{ok:boolean;path?:string;count?:number;unlocatedCount?:number;canceled?:boolean;error?:string}>;
       loadState: (defaultState: unknown) => Promise<StateLoadResult>;
       saveState: (state: unknown) => Promise<StateSaveResult>;
       saveStatePatch: (patch: unknown) => Promise<StateSaveResult>;
@@ -211,7 +214,7 @@ export type MarkdownDocument = {
 };
 
 export type DocumentLibraryNode = {
-  kind: "folder" | "markdown" | "pdf";
+  kind: "folder" | "markdown" | "pdf" | "word";
   name: string;
   displayName?: string;
   path: string;
@@ -249,7 +252,7 @@ export type DocumentLibrarySearchMatch = {
   path: string;
   name: string;
   relativePath: string;
-  kind: "markdown" | "pdf";
+  kind: "markdown" | "pdf" | "word";
   size: number;
   mtimeMs: number;
   snippet: string;
@@ -368,6 +371,7 @@ export type PdfDocument = {
   path: string;
   name: string;
   previewUrl: string;
+    version?:string;
   size: number;
   mtimeMs: number;
 };
@@ -1560,7 +1564,7 @@ export type CodexModel = {
   }>;
 };
 
-export type SourceScope = "selected" | "library" | "research";
+export type SourceScope = "selected" | "library" | "research" | "model" | "both";
 
 export type LibraryCitation = {
   id: string;

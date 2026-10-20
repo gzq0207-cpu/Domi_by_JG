@@ -18,6 +18,9 @@ function browserWebResource(resource: string) {
 }
 
 const browserFallback: Window["workbench"] = {
+  readWord: async()=>({ok:false,error:'Word 阅读需要在 Domi 桌面应用中使用。'}),
+  exportAnnotatedDocument: async()=>({ok:false,error:'导出带批注副本需要在 Domi 桌面应用中使用。'}),
+  research: async () => ({ ok: false, error: '主题研究需要在 Domi 桌面应用中使用。' }),
   loadSettings: async () => ({
     ok: true,
     settings: {
@@ -251,7 +254,7 @@ const browserFallback: Window["workbench"] = {
     ok: true,
     runId: payload.runId,
     sourceScope: payload.sourceScope,
-    sourceScopeIsolated: payload.sourceScope === "selected" || payload.sourceScope === "library",
+    sourceScopeIsolated: payload.sourceScope === "selected" || payload.sourceScope === "library" || payload.sourceScope === 'model' || payload.sourceScope === 'both',
     output:
       "当前是浏览器预览模式，界面已正常渲染，但不能直接调用本地 Codex。\n\n请使用 `npm run dev` 自动打开的 Electron 窗口，或运行 `npm run preview`，即可通过 Electron 主进程连接 `codex app-server`。",
     workspacePath: "demo-workspace",

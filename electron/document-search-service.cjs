@@ -7,6 +7,7 @@ class DocumentSearchService {
     this.workerPath = options.workerPath || path.join(__dirname, "document-search-worker.cjs");
     this.cloudContentAllowed = options.cloudContentAllowed || (() => false);
     this.semanticEnabled = options.semanticEnabled || (() => false);
+    this.ocrCommand = options.ocrCommand || (() => "");
     this.semanticCacheDir = options.semanticCacheDir || "";
     this.worker = null;
     this.sequence = 0;
@@ -26,6 +27,14 @@ class DocumentSearchService {
       return this.semanticEnabled() === true;
     } catch {
       return false;
+    }
+  }
+
+  ocrCommandFlag() {
+    try {
+      return String(this.ocrCommand() || "").trim();
+    } catch {
+      return "";
     }
   }
 
@@ -66,7 +75,8 @@ class DocumentSearchService {
     this.ensureWorker().postMessage({
       ...message,
       cloudContentAllowed: this.cloudContentFlag(),
-      semanticEnabled: this.semanticEnabledFlag()
+      semanticEnabled: this.semanticEnabledFlag(),
+      ocrCommand: this.ocrCommandFlag()
     });
   }
 

@@ -42,3 +42,5 @@ demo-workspace/
 /资料库/
 /.catpaw/
 /scripts/tmp-*
+/output/
+/tmp/

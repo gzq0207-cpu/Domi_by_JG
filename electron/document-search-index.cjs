@@ -3,13 +3,13 @@ const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
 const { createSemanticSchema, replaceSemanticChunks } = require("./semantic-chunks.cjs");
 
-const SEARCHABLE_EXTENSIONS = new Set([".md", ".markdown", ".pdf"]);
+const SEARCHABLE_EXTENSIONS = new Set([".md", ".markdown", ".pdf", ".docx", ".doc"]);
 const MARKDOWN_EXTENSIONS = new Set([".md", ".markdown"]);
 const MAX_MARKDOWN_BYTES = 2 * 1024 * 1024;
 const MAX_PDF_BYTES = 20 * 1024 * 1024;
 const MAX_PDF_TEXT_CHARS = 200_000;
 const TRANSCRIPT_PATTERN = /(?:PLAUD\s*)?文字稿|transcript/i;
-const SCHEMA_VERSION = "5";
+const SCHEMA_VERSION = "6";
 const BM25_WEIGHTS = "0.0, 4.0, 2.0, 3.0";
 // Corpus budget (in content characters) for substring scans on queries that
 // cannot use the trigram FTS index. Exported so tests can tighten it.
@@ -37,7 +37,7 @@ function createSearchSchema(database) {
       root_path TEXT NOT NULL,
       name TEXT NOT NULL,
       relative_path TEXT NOT NULL,
-      kind TEXT NOT NULL CHECK(kind IN ('markdown', 'pdf')),
+      kind TEXT NOT NULL CHECK(kind IN ('markdown', 'pdf', 'word')),
       size INTEGER NOT NULL,
       mtime_ms REAL NOT NULL,
       content TEXT NOT NULL,
@@ -161,7 +161,25 @@ function loadUnpdf() {
   return unpdfModulePromise;
 }
 
-async function extractPdfText(filePath, stat, { skipContent = false } = {}) {
+// 对无可提取文字的页面执行 OCR（有页数上限，失败降级为空）。返回更新后的
+// 页文本与成功/失败页号，供调用方如实披露；不验证识别质量。
+async function applyOcrToEmptyPages(pageTexts, ocrPage, filePath, maxPages = 40) {
+  const pages = (Array.isArray(pageTexts) ? pageTexts : [String(pageTexts || "")]).map((pageText) => String(pageText || ""));
+  const applied = [];
+  const failed = [];
+  if (typeof ocrPage !== "function") return { pages, applied, failed };
+  const emptyPageNumbers = pages.map((pageText, index) => pageText.trim() ? null : index + 1).filter(Boolean);
+  for (const pageNumber of emptyPageNumbers.slice(0, maxPages)) {
+    try {
+      const ocrText = String(await ocrPage(filePath, pageNumber) || "").trim();
+      if (ocrText) { pages[pageNumber - 1] = ocrText; applied.push(pageNumber); }
+      else failed.push(pageNumber);
+    } catch { failed.push(pageNumber); }
+  }
+  return { pages, applied, failed };
+}
+
+async function extractPdfText(filePath, stat, { skipContent = false, ocrPage = null } = {}) {
   if (skipContent) return "";
   if (!Number.isFinite(stat.size) || stat.size === 0 || stat.size > MAX_PDF_BYTES) return "";
   if (isCloudPlaceholder(stat)) return "";
@@ -170,9 +188,14 @@ async function extractPdfText(filePath, stat, { skipContent = false } = {}) {
     const bytes = new Uint8Array(await fs.promises.readFile(filePath));
     const proxy = await getDocumentProxy(bytes);
     const { text } = await extractText(proxy, { mergePages: true });
-    return String(text || "")
-      .replace(/\u0000/g, "")
-      .slice(0, MAX_PDF_TEXT_CHARS);
+    const merged = String(text || "");
+    // 只有常规提取为空且配置了 OCR 时才逐页重提 + OCR；其余情况保持原行为。
+    if (merged.trim() || typeof ocrPage !== "function") {
+      return merged.replace(/\u0000/g, "").slice(0, MAX_PDF_TEXT_CHARS);
+    }
+    const pageResult = await extractText(proxy, { mergePages: false });
+    const { pages } = await applyOcrToEmptyPages(pageResult.text, ocrPage, filePath);
+    return pages.join("\n\n").replace(/\u0000/g, "").slice(0, MAX_PDF_TEXT_CHARS);
   } catch {
     // Unreadable or encrypted PDFs stay name-only; extraction must never
     // invalidate the rest of the index.
@@ -185,7 +208,7 @@ async function upsertIndexedDocument(database, rootPath, filePath, stat, generat
   if (!pathInsideRoot(rootPath, resolvedPath)) return false;
   const relativePath = path.relative(rootPath, resolvedPath);
   const extension = path.extname(resolvedPath).toLocaleLowerCase("en-US");
-  const kind = extension === ".pdf" ? "pdf" : "markdown";
+  const kind = extension === ".pdf" ? "pdf" : /\.docx?$/.test(extension) ? 'word' : "markdown";
   const skipContent = options.skipContent === true;
   const existing = database.prepare(`
     SELECT size, mtime_ms FROM search_documents WHERE path = ?
@@ -197,15 +220,17 @@ async function upsertIndexedDocument(database, rootPath, filePath, stat, generat
     return false;
   }
   const transcript = isTranscript(relativePath);
-  let content = "";
+  let content = "",wordIncomplete=false;
   if (kind === "markdown") {
     content = readMarkdownContent(resolvedPath, stat, { skipContent });
+  } else if(kind==='word') {
+    if(!skipContent && stat.size<=64*1024*1024)try{const word=await require('./word-document.cjs').readWordFile(resolvedPath,{includeHtml:false});content=word.text.slice(0,MAX_PDF_TEXT_CHARS);wordIncomplete=word.incomplete;}catch{/* Filename search remains available when Word conversion is unavailable. */}
   } else {
-    content = await extractPdfText(resolvedPath, stat, { skipContent });
+    content = await extractPdfText(resolvedPath, stat, { skipContent, ocrPage: options.ocrPage || null });
   }
   const contentStatus = skipContent ? "blocked"
     : !content && stat.size > 0 ? "unreadable"
-    : kind === "pdf" && content.length >= MAX_PDF_TEXT_CHARS ? "truncated" : "complete";
+    : wordIncomplete || (kind === "pdf" || kind === 'word') && content.length >= MAX_PDF_TEXT_CHARS ? "truncated" : "complete";
   database.exec("BEGIN IMMEDIATE");
   try {
     database.prepare("DELETE FROM search_documents_fts WHERE path = ?").run(resolvedPath);
@@ -454,6 +479,7 @@ function searchIndexedDocuments(database, request = {}) {
 module.exports = {
   MAX_MARKDOWN_BYTES,
   SEARCH_LIMITS,
+  applyOcrToEmptyPages,
   configureRoot,
   openDocumentSearchIndex,
   pathInsideRoot,

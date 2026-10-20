@@ -6,6 +6,7 @@ const test = require("node:test");
 const PDFDocument = require("pdfkit");
 const {
   SEARCH_LIMITS,
+  applyOcrToEmptyPages,
   configureRoot,
   openDocumentSearchIndex,
   removeStaleDocuments,
@@ -312,4 +313,25 @@ test("serialized worker updates are visible to the immediately following search"
     await service.close();
     sample.close();
   }
+});
+
+test("applyOcrToEmptyPages fills only empty pages within the page cap and reports failures", async () => {
+  const calls = [];
+  const ocrPage = async (filePath, pageNumber) => {
+    calls.push(`${path.basename(String(filePath))}:${pageNumber}`);
+    if (pageNumber === 3) throw new Error("ocr engine down");
+    return pageNumber === 1 ? "OCR 文字" : "";
+  };
+  const pageTexts = ["", "有正文", "", "", ""];
+  const { pages, applied, failed } = await applyOcrToEmptyPages(pageTexts, ocrPage, "/lib/a.pdf", 2);
+  assert.equal(pages[0], "OCR 文字");
+  assert.equal(pages[1], "有正文");
+  assert.equal(pages[2], "");
+  assert.deepEqual(applied, [1]);
+  assert.deepEqual(failed, [3]);
+  assert.deepEqual(calls, ["/lib/a.pdf".split("/").pop() + ":1", "/lib/a.pdf".split("/").pop() + ":3"], "页数上限内只处理前两个空页");
+  // 未提供 OCR 函数时保持原页文本不变。
+  const untouched = await applyOcrToEmptyPages(["", "x"], null, "/lib/a.pdf");
+  assert.deepEqual(untouched.pages, ["", "x"]);
+  assert.deepEqual(untouched.applied, []);
 });

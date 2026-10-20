@@ -339,7 +339,7 @@ class ChineseTranslator {
   }
 
   async translate(source, { context = "", checkEnglishProse = true, onProgress = this.onProgress, captionRows = true, properNames = "", modelReferences = "" } = {}) {
-    if (captionRows && (String(source).match(/^\[\d+(?::\d{2}){1,2}\] .+$/gm) || []).length >= 20) {
+    if (captionRows && (String(source).match(/^\[\d+(?::\d{2}){1,2}\] .+$/gm) || []).length >= 1) {
       const captioned = await this.translateCaptionedDocument(source, { context, checkEnglishProse, onProgress, properNames, modelReferences });
       if (captioned) return captioned;
     }

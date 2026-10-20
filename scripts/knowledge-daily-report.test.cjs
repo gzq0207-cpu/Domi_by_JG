@@ -88,8 +88,8 @@ test("buildKnowledgeDailyReport groups news by domain and renders two formats", 
   const mirror = {
     mirroredUrlFor: (absolutePath) => {
       const normalized = String(absolutePath || "").replace(/\\/g, "/");
-      if (normalized.includes("a1")) return "https://my.feishu.cn/docx/a1";
-      if (normalized.includes("proj")) return "https://my.feishu.cn/docx/proj";
+      if (normalized.includes("a1")) return "https://tenant.example.invalid/docx/a1";
+      if (normalized.includes("proj")) return "https://tenant.example.invalid/docx/proj";
       return "";
     }
   };
@@ -113,7 +113,7 @@ test("buildKnowledgeDailyReport groups news by domain and renders two formats", 
   assert.ok(report.archiveMarkdown.includes("# domi 知识库日报 — 2026-09-23"));
   assert.ok(report.archiveMarkdown.includes("### 模型层（1 条）"));
   assert.ok(report.archiveMarkdown.includes("### 算力芯片（1 条）"));
-  assert.ok(report.archiveMarkdown.includes("[阅读](https://my.feishu.cn/docx/a1)"));
+  assert.ok(report.archiveMarkdown.includes("[阅读](https://tenant.example.invalid/docx/a1)"));
   assert.ok(report.archiveMarkdown.includes("《AI 构建者日报 — 2026-09-22》"));
   assert.ok(report.archiveMarkdown.includes("ExampleCorp（Agent与平台 · 已交流 · A）"));
   // 窗口外的旧条目不出现在日报里。
@@ -121,7 +121,7 @@ test("buildKnowledgeDailyReport groups news by domain and renders two formats", 
 
   // 群消息版：纯文本 URL，不出现 Markdown 链接语法。
   assert.ok(report.messageMarkdown.includes("新增行业认知 2 条"));
-  assert.ok(report.messageMarkdown.includes("https://my.feishu.cn/docx/a1"));
+  assert.ok(report.messageMarkdown.includes("https://tenant.example.invalid/docx/a1"));
   assert.ok(!/\]\(https?:/.test(report.messageMarkdown));
   assert.ok(report.messageMarkdown.length <= 4000);
 });

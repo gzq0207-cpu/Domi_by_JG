@@ -59,7 +59,9 @@ const FALLBACK_SEGMENT_DIRECTORY = "_其他行业";
 const DOCUMENT_EXTENSIONS = new Map([
   [".md", "markdown"],
   [".markdown", "markdown"],
-  [".pdf", "pdf"]
+  [".pdf", "pdf"],
+  [".docx", "word"],
+  [".doc", "word"]
 ]);
 
 function expandHomePath(value) {
@@ -299,6 +301,7 @@ function ensureDocumentLibraryStructure(rootPath) {
   migrateLegacyLibraryLayout(rootPath);
   for (const directory of DOCUMENT_LIBRARY_DIRECTORIES) {
     fs.mkdirSync(path.join(rootPath, directory), { recursive: true });
+    if(require('../shared/investment-chain-segments.json').segments.some(segment=>segment.directory===directory)) fs.mkdirSync(path.join(rootPath,directory,'主题研究'),{recursive:true});
   }
 }
 

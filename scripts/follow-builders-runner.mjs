@@ -138,10 +138,15 @@ export async function processPendingArchives({ consumer = execFileAsync, userDir
   const completed = entries.findLast((entry) => entry?.phase === "finished");
   if (!completed?.ok) throw new Error("ChatGPT 订阅处理未返回有效执行结果。");
   logger(`ChatGPT archive completed=${completed.completed || 0}, failed=${completed.failed || 0}, remaining=${completed.remaining || 0}`);
-  if (completed.remaining && (completed.completed || completed.failed)) notifier("YouTube 订阅归档待处理", `本次完成 ${completed.completed || 0} 个，仍有 ${completed.remaining} 个待处理。`
-    + (completed.waitingForBrowser ? `其中 ${completed.waitingForBrowser} 个等待正规浏览器补取完整字幕，已停止重复命令行抓取。` : "已完成段落和断点保留，后续继续处理。"));
-  else if (completed.completed) notifier("YouTube 订阅已归档", `ChatGPT 已完成 ${completed.completed} 个视频的中文摘要、全文翻译与归档。`);
+  notifyArchiveResult(completed, { notifier });
   return completed;
+}
+
+export function notifyArchiveResult(completed, { notifier = notify } = {}) {
+  if (completed.remaining && (completed.completed || (completed.newFailures ?? completed.failed))) return notifier("YouTube 订阅归档待处理", `本次完成 ${completed.completed || 0} 个，仍有 ${completed.remaining} 个待处理。`
+    + (completed.waitingForBrowser ? `其中 ${completed.waitingForBrowser} 个等待正规浏览器独立补取完整字幕；若原站要求登录，请在保留的 Tabbit 页面正常登录。` : "已完成段落和断点保留，后续继续处理。"));
+  if (completed.completed) return notifier("YouTube 订阅已归档", `ChatGPT 已完成 ${completed.completed} 个视频的中文摘要、全文翻译与归档。`);
+  return false;
 }
 
 const FEEDS = {

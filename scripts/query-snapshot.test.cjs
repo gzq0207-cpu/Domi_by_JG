@@ -41,8 +41,8 @@ test("buildQuerySnapshot joins database rows with mirror urls and digest files",
   const fakeMirror = {
     mirroredUrlFor: (absolutePath) => {
       const normalized = String(absolutePath || "").replace(/\\/g, "/");
-      if (normalized.includes("art_1")) return "https://my.feishu.cn/docx/art1";
-      if (normalized.includes("订阅日报")) return "https://my.feishu.cn/docx/digest";
+      if (normalized.includes("art_1")) return "https://tenant.example.invalid/docx/art1";
+      if (normalized.includes("订阅日报")) return "https://tenant.example.invalid/docx/digest";
       return "";
     }
   };
@@ -53,14 +53,14 @@ test("buildQuerySnapshot joins database rows with mirror urls and digest files",
   assert.equal(snapshot.news.length, 2);
   // 最新记录排前，且镜像 URL 正确联接。
   assert.equal(snapshot.news[0].title, "流匹配访谈");
-  assert.equal(snapshot.news[0].mirrorUrl, "https://my.feishu.cn/docx/art1");
+  assert.equal(snapshot.news[0].mirrorUrl, "https://tenant.example.invalid/docx/art1");
   assert.deepEqual(snapshot.news[0].domains, ["模型层"]);
   assert.equal(snapshot.news[1].mirrorUrl, "");
   assert.equal(snapshot.projects[0].notes.length <= 201, true);
   assert.equal(snapshot.people[0].name, "张三");
   assert.equal(snapshot.digests.length, 1);
   assert.equal(snapshot.digests[0].name, "日报-2026-09-22");
-  assert.equal(snapshot.digests[0].url, "https://my.feishu.cn/docx/digest");
+  assert.equal(snapshot.digests[0].url, "https://tenant.example.invalid/docx/digest");
 
   // 同一输入 → 稳定 sha（除非 generatedAt 变化；构建两次内容一致仅校验函数本身）。
   const first = snapshotSha256({ ...snapshot, generatedAt: "fixed" });

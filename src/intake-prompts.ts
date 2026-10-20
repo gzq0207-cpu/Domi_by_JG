@@ -67,8 +67,15 @@ export function isMediaIntakeUrl(url: string): boolean {
 }
 
 export function intakeMediaLinkPrompt(item: IntakeArticlePromptInput): string {
+  let bilibili = false;
+  try {
+    bilibili = ["bilibili.com", "www.bilibili.com", "m.bilibili.com", "b23.tv", "www.b23.tv"].includes(new URL(item.url).hostname.toLowerCase());
+  } catch { /* Malformed input is left to the skill's URL validation. */ }
   return [
     "请采用 domi 插件的 intake-archive 技能，处理我转发到 domi 的一条音视频内容（视频/播客链接）：按技能的链接分诊流程确定类型（哔哩哔哩/YouTube 视频、小宇宙播客单集或普通文章）并采用对应抓取策略——视频先调用技能的 media-intake.cjs helper 获取公开字幕，字幕缺失或不完整时提取公开音频并本地转写全文；播客单集下载公开音频并本地转写全文；分诊后实为普通文章则按普通文章流程处理。把取到的完整内容归档进本地行业认知库（行业信息库），按行业与公司分类，并生成结构化摘要卡片。",
+    bilibili
+      ? "B 站字幕获取顺序按技能 references/vcaptions-bilibili.md 执行：先 media-intake.cjs --subtitles-only；直接字幕失败时尝试 vCaptions 导出原始 SRT/VTT，用 import-vcaptions.cjs 核对视频分 P、实际时长及完整性；扩展不可用或字幕不完整时继续 --force-asr。已有用户字幕可直接核验导入，扩展的 AI 总结和翻译不能代替原始字幕。"
+      : "",
     INTAKE_SUMMARY_STRUCTURE,
     INTAKE_CHINESE_POLICY,
     "保留 helper 返回的原始字幕、逐条时间戳、validation 和 SHA-256。先检查开头、中间缺口、末尾与视频时长，再完整阅读 transcriptPath。原文通过 originalContentFile 直接从完整文件入库，传入 originalContentFileSha256，不要让模型复制或压缩字幕。写后核对 storageReceipt.originalContentVerified 和全文哈希；飞书镜像必须回读并核对完整正文。平台字幕通过时间轴校验不等于人工逐字核对，必须注明自动字幕的来源与准确性边界。",
@@ -91,7 +98,7 @@ export function intakeLinkPrompt(item: IntakeArticlePromptInput): string {
     : intakeArticlePrompt(item);
 }
 
-export type IntakeFileCategory = "pdf" | "spreadsheet" | "image" | "media" | "document";
+export type IntakeFileCategory = "pdf" | "spreadsheet" | "image" | "media" | "subtitle" | "document";
 
 const INTAKE_CATEGORY_BY_EXTENSION: Record<string, IntakeFileCategory> = {
   pdf: "pdf",
@@ -109,7 +116,9 @@ const INTAKE_CATEGORY_BY_EXTENSION: Record<string, IntakeFileCategory> = {
   m4a: "media",
   wav: "media",
   mp4: "media",
-  mov: "media"
+  mov: "media",
+  srt: "subtitle",
+  vtt: "subtitle"
 };
 
 // Files that count as a "bare drop" (no accompanying text) in a fresh task:
@@ -118,7 +127,7 @@ const INTAKE_CATEGORY_BY_EXTENSION: Record<string, IntakeFileCategory> = {
 // points behave identically.
 const BARE_INTAKE_FILE_EXTENSIONS = new Set([
   "pdf", "doc", "docx", "xls", "xlsx", "csv", "ppt", "pptx",
-  "md", "txt", "json",
+  "md", "txt", "json", "srt", "vtt",
   "png", "jpg", "jpeg", "webp", "heic", "gif", "bmp",
   "mp3", "m4a", "wav", "mp4", "mov"
 ]);
@@ -133,6 +142,7 @@ const INTAKE_FILE_CATEGORY_LABEL: Record<IntakeFileCategory, string> = {
   spreadsheet: "表格数据文件",
   image: "图片文件",
   media: "音视频文件",
+  subtitle: "字幕文件",
   document: "文档文件"
 };
 
@@ -141,6 +151,7 @@ const INTAKE_FILE_CATEGORY_EXTRACT: Record<IntakeFileCategory, string> = {
   spreadsheet: "用表格解析工具逐个工作表完整读取：字段结构、行数、时间范围和关键数据点，不要只看文件名猜测内容",
   image: "完整查看图片内容：提取图中全部可见文字（OCR），并对图表或截图做视觉描述；图中没有文字时如实描述画面信息",
   media: "调用 intake-archive 的 media-intake.cjs helper 处理本地音视频文件，提取音轨并本地转写全文；长音频分段处理，失败后复用已完成分段继续转写",
+  subtitle: "按 references/vcaptions-bilibili.md 核对来源视频和分 P，用 import-vcaptions.cjs 导入并校验原始时间轴",
   document: "完整读取并提取文档全文"
 };
 
@@ -149,11 +160,22 @@ const INTAKE_FILE_CATEGORY_CONTENT: Record<IntakeFileCategory, string> = {
   spreadsheet: "originalContent 写结构化提取结果：工作表清单、字段名、行数、时间范围与关键数据点；数字必须与原表一致，不得编造。",
   image: "originalContent 写 OCR 提取的全部文字与视觉描述；看不清的部分如实标注，不得编造。",
   media: "完整文字稿和来源先保存为文件，以 originalContentFile 和 originalContentFileSha256 直接入库，核对 originalContentVerified；保留带时间戳的完整转写文本，不让模型复制或压缩原文。只有转写实际失败才保存可用部分，明确失败原因和覆盖范围，不得把部分转写或元数据说成全文完成。",
+  subtitle: "保留原始字幕字节、逐条时间轴和哈希，按来源视频 URL 更新已有记录",
   document: "originalContent 写文档完整提取文本；无法提取的部分如实说明缺口，不得编造。"
 };
 
 export function intakeFilePrompt(item: { fileName: string }): string {
   const category = intakeFileCategory(item.fileName);
+  if (category === "subtitle") {
+    return [
+      `请采用 domi 插件的 intake-archive 技能，处理字幕文件《${item.fileName}》：读取 references/vcaptions-bilibili.md，核对对应视频链接、分 P、页面实际时长与字幕来源；缺少视频链接时先询问，不猜测来源。`,
+      "用 import-vcaptions.cjs 导入原始 SRT/VTT，保留原始字幕、逐条时间戳、validation 和 SHA-256。仅 ok=true 且 complete=true 才称全文完成；不完整则继续来源视频的公开音频转写。字幕不是待转写的音视频，不对 SRT/VTT 运行 ASR。",
+      "归档 url 使用核验后的视频 canonicalUrl（含分 P），按同一视频更新已有记录，不为字幕文件另建哈希记录。完整文字稿以 originalContentFile 和 originalContentFileSha256 直接入库，写后核对 originalContentVerified 和全文哈希。",
+      INTAKE_SUMMARY_STRUCTURE,
+      INTAKE_CHINESE_POLICY,
+      "入库完成后汇报行业与公司分类、值得关注的信号和真实缺口；平台字幕须注明未经人工逐字核对。"
+    ].join("\n");
+  }
   return [
     `请采用 domi 插件的 intake-archive 技能，处理我转发到 domi 的一份${INTAKE_FILE_CATEGORY_LABEL[category]}《${item.fileName}》（输入变体：本地文件代替原文链接）：${INTAKE_FILE_CATEGORY_EXTRACT[category]}，把内容归档进本地行业认知库（行业信息库），按行业与公司分类，并生成结构化摘要卡片。`,
     INTAKE_SUMMARY_STRUCTURE,

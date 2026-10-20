@@ -57,7 +57,7 @@ function main() {
   const markdown = [`# YouTube 积压视频处理核验`, `核验时间：${report.checkedAt}。共 ${report.videos} 个视频，完整字幕 ${report.captionsComplete} 份，归档回读通过 ${report.archivesVerified} 篇，剩余 ${report.remaining} 篇。`,
     `总时长 ${(report.totalDurationSeconds / 3600).toFixed(2)} 小时，字幕 ${report.totalCaptionRows} 条，原文 ${report.totalTranscriptCharacters} 字符。`,
     `摘要：GPT-6.1 Sol／高智能／标准速度，采用全文重要观点、各论点的相应论据与论证。中文全文：GPT-6 Luna／标准智能／标准速度。`,
-    `字幕来自 YouTube 正常浏览器原生导出。全量保存字幕行与原始文件，校验视频标识、首尾及中间时间戳、文件哈希、完整中文全文、摘要和数据库唯一记录。字幕导出只有开始时间；时间戳跨度并不等同于逐秒音频覆盖率。字幕识别准确性未人工校对。`,
+    `字幕来自 YouTube 正规浏览器读取的平台字幕。全量保存字幕行与原始文件，校验视频标识、首尾及中间时间戳、文件哈希、完整中文全文、摘要和数据库唯一记录。文字稿保留逐条开始时间；时间戳跨度并不等同于逐秒音频覆盖率。字幕识别准确性未人工校对。`,
     `| 视频 | 时长 | 字幕条数 | 状态 | 文档 |`, `| --- | --- | ---: | --- | --- |`,
     ...rows.map((row) => `| ${row.title.replace(/\|/g, "\\|")} | ${row.duration} | ${row.cueCount} | ${row.verified ? "完成，回读通过" : "已取得字幕，处理"} | ${row.documentPath ? `[打开](<${row.documentPath.replace(/\\/g, "/")}>)` : "处理中"} |`)].join("\n\n");
   fs.writeFileSync(reportPath, markdown);

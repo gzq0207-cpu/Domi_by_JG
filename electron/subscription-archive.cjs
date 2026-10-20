@@ -179,9 +179,9 @@ function verifyMedia(result) {
 class SubscriptionArchiveWorker {
   constructor({ queuePath = path.join(os.homedir(), ".follow-builders", "pending-archive.json"),
     stateRoot = path.join(path.dirname(queuePath), "archives"), pluginRoot = path.resolve(__dirname, "../build/domi-plugin"),
-    configPath, mediaEnv = {}, readingCharacters = 60000, getMedia, summarize, translate, archive, onProgress = () => {} } = {}) {
+    configPath, mediaEnv = {}, readingCharacters = 60000, getMedia, acquireBrowserTranscript, summarize, translate, archive, onProgress = () => {} } = {}) {
     if (!Number.isInteger(readingCharacters) || readingCharacters < 60000 || readingCharacters > 120000) throw new Error("全文阅读分段长度必须为 60000 至 120000 字符。");
-    Object.assign(this, { queuePath, stateRoot, pluginRoot, configPath, mediaEnv, readingCharacters, getMedia, summarize, translate, archive, onProgress });
+    Object.assign(this, { queuePath, stateRoot, pluginRoot, configPath, mediaEnv, readingCharacters, getMedia, acquireBrowserTranscript, summarize, translate, archive, onProgress });
     this.stopped = false;
   }
 
@@ -191,14 +191,22 @@ class SubscriptionArchiveWorker {
     if (!/^[A-Za-z0-9_-]{11}$/.test(item.videoId || "") || item.url !== `https://www.youtube.com/watch?v=${item.videoId}`) throw new Error("订阅视频标识或链接无效。");
     const jobDir = path.join(this.stateRoot, item.videoId); fs.mkdirSync(jobDir, { recursive: true });
     this.progress(item.videoId, "subtitle", { title: item.title });
-    const media = this.getMedia ? await this.getMedia(item) : readExport(item.videoId, this.stateRoot) || await require(path.join(this.pluginRoot, "skills/intake-archive/scripts/media-intake.cjs")).intakeMedia(
-      { url: item.url, subtitlesOnly: true }, { env: this.mediaEnv, ytdlpTimeoutMs: 90000 });
+    let media = readExport(item.videoId, this.stateRoot);
+    if (!media && item.requiresBrowserTranscript && this.acquireBrowserTranscript) media = await this.acquireBrowserTranscript(item);
+    if (!media) {
+      media = this.getMedia ? await this.getMedia(item) : await require(path.join(this.pluginRoot, "skills/intake-archive/scripts/media-intake.cjs")).intakeMedia(
+        { url: item.url, subtitlesOnly: true }, { env: this.mediaEnv, ytdlpTimeoutMs: 90000 });
+      if (!media?.ok && /YouTube[^\n]*(?:要求登录|访问验证)/i.test(media?.error?.message || "") && this.acquireBrowserTranscript) {
+        try { media = await this.acquireBrowserTranscript(item); }
+        catch (error) { error.upstreamError = media.error.message; throw error; }
+      }
+    }
     const transcript = verifyMedia(media);
     atomicJson(path.join(jobDir, "media.json"), media);
     const original = [`# ${media.metadata.title || item.title}`, `- 来源：YouTube·${item.channel}`, `- 原始链接：${item.url}`,
       `- 时长：${media.durationSeconds} 秒`, media.metadata.description ? "\n## 完整简介\n" + media.metadata.description : "",
       "\n## 完整文字稿\n" + transcript, "\n> 来源：" + (media.contentKind === "browser-transcript"
-        ? "YouTube 浏览器原生导出完整字幕，首尾时间戳、行数及原始文件已核验；导出不含逐条结束时间，未人工校对识别准确性。"
+        ? (media.validation.acquisition.startsWith("tabbit.") ? "YouTube 正规浏览器读取平台字幕或完整官方文字稿面板，全部源字幕索引／显示行、时间戳及源文件已核验；文字稿保留逐条或逐段起始时间，未人工校对识别准确性。" : "YouTube 浏览器原生导出完整字幕，首尾时间戳、行数及原始文件已核验；导出不含逐条结束时间，未人工校对识别准确性。")
         : media.contentKind === "subtitle" ? "平台字幕，时间轴已核验；未人工校对识别准确性。" : "已有完整转写，未人工校对识别准确性。")
     ].filter(Boolean).join("\n\n").trim();
     const originalPath = path.join(jobDir, "original.md"); fs.writeFileSync(originalPath, original, "utf8");
@@ -315,7 +323,7 @@ class SubscriptionArchiveWorker {
     if (!fs.existsSync(this.queuePath)) return { ok: true, completed: 0, failed: 0, remaining: 0 };
     const release = acquireLock(path.join(path.dirname(this.queuePath), ".archive.lock"));
     if (!release) return { ok: true, busy: true };
-    const result = { ok: true, completed: 0, failed: 0, remaining: 0 };
+    const result = { ok: true, completed: 0, failed: 0, newFailures: 0, remaining: 0 };
     const started = Date.now();
     try {
       const queue = readQueue(this.queuePath);
@@ -325,7 +333,7 @@ class SubscriptionArchiveWorker {
         if (this.stopped || result.paused || Date.now() - started >= budgetMs) break;
         const item = pendingItems[cursor++];
         if (!/^[A-Za-z0-9_-]{11}$/.test(item.videoId || "")) throw new Error("订阅队列包含无效视频标识。");
-        if (!force && item.requiresBrowserTranscript && !readExport(item.videoId, this.stateRoot)) continue;
+        if (item.requiresBrowserTranscript && !readExport(item.videoId, this.stateRoot) && !this.acquireBrowserTranscript && (!force || !this.getMedia)) continue;
         if (!force && item.nextRetryAt && Date.parse(item.nextRetryAt) > Date.now()) continue;
         const attempts = Number(item.attempts || 0) + 1;
         updateItem(this.queuePath, item.videoId, { status: "processing", processor: "chatgpt", attempts, lastAttemptAt: new Date().toISOString(), error: null,
@@ -333,7 +341,7 @@ class SubscriptionArchiveWorker {
         try {
           const receipt = await this.processItem(item);
           updateItem(this.queuePath, item.videoId, { status: "done", completedAt: new Date().toISOString(), nextRetryAt: null, error: null,
-            blockedStage: null, requiresBrowserTranscript: false, browserStatus: null,
+            blockedStage: null, requiresBrowserTranscript: false, browserStatus: null, browserErrorCode: null, browserError: null, needsUserAction: false,
             eventId: receipt.event.eventId, documentPath: receipt.event.documentPath, storageReceipt: receipt.storageReceipt });
           const jobDir = path.join(this.stateRoot, item.videoId);
           fs.rmSync(path.join(jobDir, "failure.json"), { force: true });
@@ -345,10 +353,33 @@ class SubscriptionArchiveWorker {
           result.completed++; this.progress(item.videoId, "done", { documentPath: receipt.event.documentPath });
         } catch (error) {
           const quota = isTranslationQuotaError(error), message = String(error.message || error).slice(-2000);
-          const browserRequired = !quota && /YouTube[^\n]*(?:要求登录|访问验证)/i.test(message);
+          const browserRequired = !quota && (error.requiresBrowserTranscript || /YouTube[^\n]*(?:要求登录|访问验证)/i.test(message));
+          let reasonChanged = item.error !== message || item.browserErrorCode !== (error.code || null);
+          if (browserRequired && ["AUTH_REQUIRED", "CAPTCHA_REQUIRED", "NETWORK_UNAVAILABLE", "CLI_REGISTRATION_UNAVAILABLE",
+            "BROWSER_CLI_UNAVAILABLE", "BROWSER_STARTUP_FAILED", "BROWSER_CLI_TIMEOUT", "BROWSER_REQUEST_PENDING"].includes(error.code)) {
+            const globalPath = path.join(this.stateRoot, "browser-status.json");
+            let previous = {}; try { previous = JSON.parse(fs.readFileSync(globalPath, "utf8")); } catch {}
+            if (previous.status === "waiting-for-browser" && previous.errorCode === error.code) reasonChanged = false;
+            atomicJson(globalPath, { status: "waiting-for-browser", errorCode: error.code, error: message,
+              needsUserAction: !!error.needsUserAction, checkedAt: new Date().toISOString(),
+              notificationRecordedAt: reasonChanged ? new Date().toISOString() : previous.notificationRecordedAt,
+              waitingVideoIds: [...new Set([...(previous.waitingVideoIds || []), item.videoId])].slice(-200) });
+          }
+          if (reasonChanged) result.newFailures = (result.newFailures || 0) + 1;
+          if (browserRequired) {
+            const accessPath = path.join(this.stateRoot, item.videoId, "browser-access.json");
+            let previous = {}; try { previous = JSON.parse(fs.readFileSync(accessPath, "utf8")); } catch {}
+            atomicJson(accessPath, { ...previous, videoId: item.videoId, stage: "browser-transcript", status: "waiting-for-browser",
+              browser: this.acquireBrowserTranscript ? "tabbit" : previous.browser, connectionChecked: true,
+              errorCode: error.code || "YOUTUBE_ACCESS_VERIFICATION", error: message, needsUserAction: !!error.needsUserAction,
+              upstreamError: error.upstreamError || previous.upstreamError, checkedAt: new Date().toISOString(),
+              notificationRecordedAt: reasonChanged ? new Date().toISOString() : previous.notificationRecordedAt });
+          }
           updateItem(this.queuePath, item.videoId, { status: "blocked", error: message,
             blockedStage: quota ? "model-quota" : browserRequired ? "browser-transcript" : "processing", requiresBrowserTranscript: browserRequired,
-            nextRetryAt: new Date(Date.now() + (quota ? 6 : Math.min(24, 2 ** Math.min(attempts, 5))) * 3600000).toISOString() });
+            ...(browserRequired ? { browserStatus: error.code || "YOUTUBE_ACCESS_VERIFICATION", browserErrorCode: error.code || null,
+              browserError: message, browserAttemptAt: new Date().toISOString(), needsUserAction: !!error.needsUserAction } : {}),
+            nextRetryAt: new Date(Date.now() + (error.retryAfterMs || (quota ? 6 : Math.min(24, 2 ** Math.min(attempts, 5))) * 3600000)).toISOString() });
           atomicJson(path.join(this.stateRoot, item.videoId, "failure.json"), { phase: browserRequired ? "browser-transcript" : "incomplete", error: message, updatedAt: new Date().toISOString() });
           result.failed++; this.progress(item.videoId, browserRequired ? "awaiting-browser" : "blocked", { error: message });
           if (quota || this.stopped) { result.paused = quota ? "chatgpt-quota" : "stopped"; break; }

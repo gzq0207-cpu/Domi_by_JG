@@ -1,5 +1,16 @@
 # Third-party notices
 
+## PDF.js
+
+domi uses Mozilla PDF.js (`pdfjs-dist` 5.6.205) to render local PDFs and provide
+text selection for reading annotations. The worker, CMaps, standard fonts and
+WASM resources are distributed locally with the application.
+
+- Source: https://github.com/mozilla/pdf.js
+- License: Apache License, Version 2.0
+- Copyright: Mozilla Foundation and PDF.js contributors
+- The package license is copied into `dist/pdfjs/LICENSE` during the build.
+
 ## Tencent openclaw-weixin protocol implementation
 
 domi's optional Weixin bridge contains adapted protocol, encrypted-media
@@ -33,6 +44,19 @@ package's bundled `rg` and `zsh` helper executables. The Codex and
 `codex-code-mode-host` executables retain their original OpenAI signatures.
 The packaged manifest records both the original upstream digest and the digest
 of the notarization-ready archive.
+
+## Word and annotated document export libraries
+
+domi bundles JSZip (MIT license), @xmldom/xmldom (MIT license), and PDF-LIB
+(MIT license) for offline OOXML reading and Word/PDF annotation export.
+
+- JSZip source and license: https://github.com/Stuk/jszip
+- xmldom source and license: https://github.com/xmldom/xmldom
+- PDF-LIB source and license: https://github.com/Hopding/pdf-lib
+
+Existing document parts and annotations are preserved in exported copies.
+Microsoft Word and LibreOffice are optional external applications used only
+for legacy DOC conversion; they are not bundled with domi.
 
 ## Lark CLI
 
