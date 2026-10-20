@@ -40,7 +40,7 @@ async function resolveEntityWorkspaceWithRecovery({
   let initialCandidate = "";
   let initialWorkspace = "";
   try {
-    initialCandidate = resolveWorkspace(request) || "";
+    initialCandidate = await resolveWorkspace(request) || "";
     initialWorkspace = validateWorkspace(initialCandidate) || "";
   } catch (error) {
     return {
@@ -88,7 +88,7 @@ async function resolveEntityWorkspaceWithRecovery({
   }
 
   try {
-    const recoveredWorkspace = validateWorkspace(resolveWorkspace(request) || "") || "";
+    const recoveredWorkspace = validateWorkspace(await resolveWorkspace(request) || "") || "";
     if (!recoveredWorkspace) {
       return {
         ok: false,

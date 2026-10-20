@@ -204,6 +204,9 @@ async function extractPdfText(filePath, stat, { skipContent = false, ocrPage = n
 }
 
 async function upsertIndexedDocument(database, rootPath, filePath, stat, generation, options = {}) {
+  const isCurrent = () => currentRoot(database) === path.resolve(rootPath)
+    && (!options.isCurrent || options.isCurrent());
+  if (!isCurrent()) return false;
   const resolvedPath = path.resolve(filePath);
   if (!pathInsideRoot(rootPath, resolvedPath)) return false;
   const relativePath = path.relative(rootPath, resolvedPath);
@@ -231,6 +234,9 @@ async function upsertIndexedDocument(database, rootPath, filePath, stat, generat
   const contentStatus = skipContent ? "blocked"
     : !content && stat.size > 0 ? "unreadable"
     : wordIncomplete || (kind === "pdf" || kind === 'word') && content.length >= MAX_PDF_TEXT_CHARS ? "truncated" : "complete";
+  // PDF/Word extraction can await while the worker adopts a different root.
+  // Check again at the commit boundary, including A -> B -> A switches.
+  if (!isCurrent()) return false;
   database.exec("BEGIN IMMEDIATE");
   try {
     database.prepare("DELETE FROM search_documents_fts WHERE path = ?").run(resolvedPath);
@@ -278,6 +284,16 @@ async function upsertIndexedDocument(database, rootPath, filePath, stat, generat
     throw error;
   }
   return true;
+}
+
+function removeIndexedDocument(database, filePath) {
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    for (const table of ['search_documents_fts', 'semantic_chunks', 'search_documents']) {
+      database.prepare(`DELETE FROM ${table} WHERE path=?`).run(path.resolve(filePath));
+    }
+    database.exec('COMMIT');
+  } catch (error) { database.exec('ROLLBACK'); throw error; }
 }
 
 function removeStaleDocuments(database, generation) {
@@ -392,6 +408,7 @@ function searchIndexedDocuments(database, request = {}) {
   const query = String(request.query || "").trim();
   if (!query) return { results: [], degraded: false };
   const limit = Math.max(1, Math.min(Number(request.limit) || 8, 60));
+  const rootPath = request.rootPath ? path.resolve(request.rootPath) : currentRoot(database);
   // Transcripts are now indexed and returned by default (ranked below regular
   // documents). excludeTranscripts opts out; the legacy includeTranscripts
   // value is still honoured when callers explicitly passed false.
@@ -405,8 +422,8 @@ function searchIndexedDocuments(database, request = {}) {
   if (shortTokens.length) {
     const contentChars = Number(
       database
-        .prepare("SELECT COALESCE(SUM(content_chars), 0) AS total FROM search_documents")
-        .get()?.total || 0
+        .prepare("SELECT COALESCE(SUM(content_chars), 0) AS total FROM search_documents WHERE root_path = ?")
+        .get(rootPath)?.total || 0
     );
     includeContent = contentChars <= SEARCH_LIMITS.shortQueryContentChars;
   }
@@ -414,8 +431,8 @@ function searchIndexedDocuments(database, request = {}) {
   const shortOptions = { includeContent };
   let rows;
   if (longTokens.length) {
-    const conditions = ["search_documents_fts MATCH ?"];
-    const params = [longTokens.map(ftsPhrase).join(" AND ")];
+    const conditions = ["search_documents_fts MATCH ?", 'd.root_path = ?'];
+    const params = [longTokens.map(ftsPhrase).join(" AND "), rootPath];
     if (excludeTranscripts) conditions.push("d.is_transcript = 0");
     for (const token of shortTokens) {
       conditions.push(shortTokenCondition(token, shortOptions));
@@ -437,8 +454,8 @@ function searchIndexedDocuments(database, request = {}) {
       LIMIT ?
     `).all(...params);
   } else {
-    const conditions = [];
-    const params = [];
+    const conditions = ['d.root_path = ?'];
+    const params = [rootPath];
     if (excludeTranscripts) conditions.push("d.is_transcript = 0");
     const nameHitParts = [];
     const nameHitParams = [];
@@ -484,6 +501,7 @@ module.exports = {
   openDocumentSearchIndex,
   pathInsideRoot,
   removeStaleDocuments,
+  removeIndexedDocument,
   searchIndexedDocuments,
   shouldIndexFile,
   upsertIndexedDocument

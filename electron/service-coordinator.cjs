@@ -11,6 +11,7 @@ class ServiceCoordinator {
         value: undefined,
         expiresAt: 0,
         inFlight: null,
+        generation: 0,
         failures: 0,
         circuitUntil: 0,
         lastError: ""
@@ -48,7 +49,8 @@ class ServiceCoordinator {
       throw error;
     }
 
-    entry.inFlight = (async () => {
+    const generation = entry.generation;
+    const inFlight = (async () => {
       let lastError;
       for (let attempt = 0; attempt <= retries; attempt += 1) {
         try {
@@ -59,11 +61,13 @@ class ServiceCoordinator {
           const valueTtlMs = typeof options.ttlForValue === "function"
             ? Math.max(0, Number(options.ttlForValue(value)) || 0)
             : ttlMs;
-          entry.value = value;
-          entry.expiresAt = this.now() + valueTtlMs;
-          entry.failures = 0;
-          entry.circuitUntil = 0;
-          entry.lastError = "";
+          if (entry.generation === generation) {
+            entry.value = value;
+            entry.expiresAt = this.now() + valueTtlMs;
+            entry.failures = 0;
+            entry.circuitUntil = 0;
+            entry.lastError = "";
+          }
           return value;
         } catch (error) {
           lastError = error;
@@ -73,18 +77,20 @@ class ServiceCoordinator {
         }
       }
 
-      entry.failures += 1;
-      entry.lastError = lastError instanceof Error ? lastError.message : String(lastError || "未知错误");
-      if (entry.failures >= failureThreshold) {
-        entry.circuitUntil = this.now() + circuitCooldownMs;
+      if (entry.generation === generation) {
+        entry.failures += 1;
+        entry.lastError = lastError instanceof Error ? lastError.message : String(lastError || "未知错误");
+        if (entry.failures >= failureThreshold) {
+          entry.circuitUntil = this.now() + circuitCooldownMs;
+        }
       }
-      if (allowStale && entry.value !== undefined) return this.staleValue(entry.value, lastError);
+      if (entry.generation === generation && allowStale && entry.value !== undefined) return this.staleValue(entry.value, lastError);
       throw lastError;
     })().finally(() => {
-      entry.inFlight = null;
+      if (entry.inFlight === inFlight) entry.inFlight = null;
     });
-
-    return entry.inFlight;
+    entry.inFlight = inFlight;
+    return inFlight;
   }
 
   invalidate(prefix) {
@@ -93,6 +99,8 @@ class ServiceCoordinator {
       if (!normalizedPrefix || key.startsWith(normalizedPrefix)) {
         entry.expiresAt = 0;
         entry.circuitUntil = 0;
+        entry.generation += 1;
+        entry.inFlight = null;
       }
     }
   }

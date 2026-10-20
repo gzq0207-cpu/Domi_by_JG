@@ -4,7 +4,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { DatabaseSync } = require("node:sqlite");
-const { ensureDocumentLibraryStructure } = require("./document-library.cjs");
+const { assertInsideRoot, ensureDocumentLibraryStructure } = require("./document-library.cjs");
 const CANONICAL_PROJECT_TAXONOMY = require("../shared/investment-taxonomy.json");
 const CHAIN_SEGMENTS = require("../shared/investment-chain-segments.json");
 const SEGMENT_DIRECTORY_BY_NAME = new Map(
@@ -1371,6 +1371,33 @@ function newsRow(row) {
 }
 
 class LocalDomiRepository {
+  relocateMaterial(sourcePath, targetPath) {
+    const source = assertInsideRoot(this.libraryDir, sourcePath, false);
+    const target = assertInsideRoot(this.libraryDir, targetPath, false);
+    if (['projects', 'people'].some(table => this.database.prepare(`SELECT 1 FROM ${table} WHERE document_path IN (?,?)`).get(source, target))) {
+      throw new Error('项目和人物主页需要随对应工作区管理，不能单独移动。');
+    }
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      for (const column of ['document_path', 'content_path']) {
+        this.database.prepare(`UPDATE news_events SET ${column}=? WHERE ${column}=?`).run(target, source);
+      }
+      this.database.prepare('UPDATE documents SET path=? WHERE path=?').run(target, source);
+      const rewrite = value => {
+        if (typeof value === 'string') return value === source ? target : value === pathToFileURL(source).href ? pathToFileURL(target).href : value;
+        if (Array.isArray(value)) return value.map(rewrite);
+        if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, rewrite(item)]));
+        return value;
+      };
+      for (const row of this.database.prepare('SELECT id, interaction_documents_json FROM people').all()) {
+        let previous;
+        try { previous = JSON.parse(row.interaction_documents_json || '[]'); } catch { continue; }
+        const updated = JSON.stringify(rewrite(previous));
+        if (updated !== JSON.stringify(previous)) this.database.prepare('UPDATE people SET interaction_documents_json=? WHERE id=?').run(updated, row.id);
+      }
+      this.database.exec('COMMIT');
+    } catch (error) { this.database.exec('ROLLBACK'); throw error; }
+  }
   constructor({ databasePath, libraryDir }) {
     this.databasePath = path.resolve(resolveHomePath(databasePath));
     this.libraryDir = path.resolve(resolveHomePath(libraryDir));

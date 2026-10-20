@@ -159,7 +159,7 @@ test("export context distinguishes cleaned and orphaned failed creates", () => {
 test("the host fixes publisher state under Application Support and ignores renderer manifest paths", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "electron", "domi-integration.cjs"), "utf8");
   const start = source.indexOf("async publishLocalMarkdownToFeishu");
-  const end = source.indexOf("\n  databaseSnapshot()", start);
+  const end = source.indexOf("\n  async databaseSnapshot()", start);
   const method = source.slice(start, end);
   assert.match(method, /path\.dirname\(path\.resolve\(this\.domiConfigPath\)\)/);
   assert.match(method, /feishu-markdown-manifests/);

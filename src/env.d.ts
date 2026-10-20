@@ -73,6 +73,7 @@ declare global {
       createDocumentLibraryEntry: (
         request: DocumentLibraryCreateRequest
       ) => Promise<DocumentLibraryCreateResult>;
+      moveDocumentLibraryEntry: (request: DocumentLibraryMoveRequest) => Promise<DocumentLibraryMoveResult>;
       finalizeSubscriptionDigest: (request: { day: string }) => Promise<{ ok: boolean; files?: string[]; error?: string }>;
       readMarkdown: (request: MarkdownReadRequest) => Promise<MarkdownReadResult>;
       saveMarkdown: (request: MarkdownSaveRequest) => Promise<MarkdownSaveResult>;
@@ -281,8 +282,17 @@ export type DocumentLibraryCreateResult = {
   kind?: "folder" | "markdown";
   path?: string;
   name?: string;
+  rootPath?: string;
+  parentPath?: string;
+  node?: DocumentLibraryNode;
   snapshot?: DocumentLibrarySnapshot;
   error?: string;
+};
+
+export type DocumentLibraryMoveRequest = { path: string; parentPath: string; expectedMtimeMs?: number };
+export type DocumentLibraryMoveResult = {
+  ok: boolean; rootPath?: string; previousPath?: string; path?: string; parentPath?: string;
+  node?: DocumentLibraryNode; unchanged?: boolean; error?: string;
 };
 
 export type MarkdownReadRequest = {

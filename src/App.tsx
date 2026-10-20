@@ -1,6 +1,7 @@
 import {
   AlertCircle,
   ArrowUp,
+  AtSign,
   BriefcaseBusiness,
   Brain,
   CalendarPlus,
@@ -61,6 +62,7 @@ import {
   SyntheticEvent,
   Suspense,
   lazy,
+  useCallback,
   useDeferredValue,
   useEffect,
   useLayoutEffect,
@@ -70,6 +72,9 @@ import {
 } from "react";
 import { hasNativeWorkbench, workbench } from "./bridge";
 import { CodexModelReadiness } from "./codex-model-readiness";
+import DocumentLibraryTree from './DocumentLibraryTree';
+import { insertDocumentLibraryNode, moveDocumentLibraryNode } from './document-library-tree';
+import { hasDocumentLibraryDrag, readDocumentLibraryDrag } from './document-library-drag';
 import { filesFromClipboardData } from "./clipboard-files";
 import { isLocalPdfResource, isLocalWordResource } from "./document-resources";
 import type {WordDocument} from './research-types';
@@ -192,6 +197,9 @@ import { parseRadarResult, radarRejectionSummary } from "./radar-result";
 import { isSelectedDocumentScope, remainingScopeDraft, validateDocumentScope as validateSourceSelection } from "./document-scope";
 import { addQuoteToDraft, composeDocumentQuestion, documentPathKey, DOCUMENT_QUESTION_EVENT, normalizeDocumentQuotes, quoteLocation } from './document-question';
 import type { DocumentQuestionRequest, DocumentQuote } from './document-question';
+import DocumentMentionMenu from './DocumentMentionMenu';
+import { addMentionToDraft, documentMentionAt, matchMentionDocuments, mentionDocuments, removeDocumentMention } from './document-mentions';
+import type { DocumentMention } from './document-mentions';
 
 const MaterialReader = lazy(() => import('./MaterialReader'));
 const ResearchWorkspace = lazy(() => import('./ResearchWorkspace'));
@@ -1904,8 +1912,54 @@ function App() {
   const [domiTaskSyncElapsed, setDomiTaskSyncElapsed] = useState(0);
   const [domiTaskSyncQueued, setDomiTaskSyncQueued] = useState(false);
   const [documentLibrary, setDocumentLibrary] = useState<DocumentLibrarySnapshot | null>(null);
+  const documentLibraryRef = useRef(documentLibrary);
+  documentLibraryRef.current = documentLibrary;
+  const documentLibraryCreateFormRef = useRef<HTMLFormElement>(null);
+  const documentLibraryNodeOpenRef = useRef(openDocumentLibraryNode);
+  documentLibraryNodeOpenRef.current = openDocumentLibraryNode;
+  // Keep history messages memoized while input, streaming output or panels
+  // change. The ref still dispatches with the current draft/save state.
+  const openDocumentHandlerRef = useRef(openDocument);
+  openDocumentHandlerRef.current = openDocument;
+  const onOpenMessageDocument = useCallback((resource: string) => {
+    openDocumentHandlerRef.current(resource);
+  }, []);
+  const onOpenDocumentLibraryNode = useCallback((node: DocumentLibraryNode, parentPath: string) => {
+    documentLibraryNodeOpenRef.current(node, parentPath);
+  }, []);
+  const [documentLibraryMoving, setDocumentLibraryMoving] = useState(false);
+  const [documentLibraryRootDragOver, setDocumentLibraryRootDragOver] = useState(false);
+  const documentLibraryMovingRef = useRef(false);
+  const documentLibraryMoveRef = useRef(moveDocumentLibraryDocument);
+  documentLibraryMoveRef.current = moveDocumentLibraryDocument;
+  const onMoveDocumentLibraryNode = useCallback((path: string, parentPath: string, mtimeMs: number) => {
+    void documentLibraryMoveRef.current(path, parentPath, mtimeMs);
+  }, []);
+  const onExpandDocumentLibraryFolder = useCallback((path: string) => {
+    setDocumentLibraryExpandedPaths(current => current.has(path) ? current : new Set(current).add(path));
+  }, []);
   const [documentScopePickerThreadId, setDocumentScopePickerThreadId] = useState<string | null>(null);
-  useEffect(() => { setDocumentScopePickerThreadId(null); }, [activeThreadId]);
+  const [documentMention, setDocumentMention] = useState<(DocumentMention & { threadId: string }) | null>(null);
+  const [documentMentionIndex, setDocumentMentionIndex] = useState(0);
+  const composerComposingRef = useRef(false);
+  const dismissedDocumentMentionRef = useRef<{ text: string; caret: number; threadId: string } | null>(null);
+  const documentScopePickerMentionRef = useRef<(DocumentMention & { threadId: string }) | null>(null);
+  const documentMentionOpen = documentMention?.threadId === activeThreadId && workspaceView === 'conversation';
+  const mentionLibraryFiles = useMemo(() => mentionDocuments(documentLibrary?.nodes || []), [documentLibrary]);
+  const documentMentionMatches = useMemo(() => documentMentionOpen
+    ? matchMentionDocuments(mentionLibraryFiles, documentMention?.query || '') : [],
+  [mentionLibraryFiles, documentMentionOpen, documentMention?.query]);
+  const activeDocumentMentionIndex = Math.min(documentMentionIndex, Math.max(0, documentMentionMatches.length - 1));
+  useEffect(() => {
+    setDocumentScopePickerThreadId(null);
+    documentScopePickerMentionRef.current = null;
+    setDocumentMention(null);
+    dismissedDocumentMentionRef.current = null;
+    composerComposingRef.current = false;
+  }, [activeThreadId, workspaceView]);
+  useEffect(() => {
+    if (documentMentionOpen && !documentLibraryLoading) void refreshDocumentLibrary({ silent: Boolean(documentLibrary) });
+  }, [documentMentionOpen, activeThreadId]);
   // 订阅日报文档：domi 资料库 13.认知库/订阅日报/ 下的 Markdown 日报
   // （follow-builders 计划任务每日镜像进来，以及 domi 自己生成的订阅日报）。
   const subscriptionDigestDocuments = useMemo(() => {
@@ -1933,7 +1987,6 @@ function App() {
   const [documentLibraryCreateKind, setDocumentLibraryCreateKind] = useState<
     "folder" | "markdown" | null
   >(null);
-  const [documentLibraryCreateName, setDocumentLibraryCreateName] = useState("");
   const [documentLibraryCreating, setDocumentLibraryCreating] = useState(false);
   const [documentLibraryCreateError, setDocumentLibraryCreateError] = useState("");
   const [storageReady, setStorageReady] = useState(false);
@@ -8015,6 +8068,11 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
 
   function handleSubmit(event: FormEvent) {
     event.preventDefault();
+    if (documentMentionOpen) {
+      setAttachmentError('请先从 @ 候选中选择文档，或按 Esc 关闭候选后继续编辑问题。');
+      composerRef.current?.focus();
+      return;
+    }
     const sourceThread = activeThread;
     const sourceThreadId = sourceThread.id;
     const submittedInput = composeDocumentQuestion(input, documentQuotes, sourceScope);
@@ -8803,8 +8861,70 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
   }
 
   function openDocumentScopePicker() {
+    documentScopePickerMentionRef.current = documentMentionOpen ? documentMention : null;
+    setDocumentMention(null);
     setDocumentScopePickerThreadId(activeThreadId);
     if (!documentLibraryLoading) void refreshDocumentLibrary({ silent: Boolean(documentLibrary) });
+  }
+
+  function updateDocumentMention(element: HTMLTextAreaElement) {
+    if (composerComposingRef.current) return;
+    const dismissed = dismissedDocumentMentionRef.current;
+    if (dismissed?.threadId === activeThreadId && dismissed.text === element.value && dismissed.caret === element.selectionStart) return;
+    dismissedDocumentMentionRef.current = null;
+    const mention = documentMentionAt(element.value, element.selectionStart, element.selectionEnd);
+    setDocumentMention(current => {
+      if (mention && current?.threadId === activeThreadId && current.start === mention.start
+        && current.end === mention.end && current.query === mention.query) return current;
+      return mention ? { ...mention, threadId: activeThreadId } : null;
+    });
+    if (mention?.query !== documentMention?.query || mention?.start !== documentMention?.start) setDocumentMentionIndex(0);
+  }
+
+  function dismissDocumentMention() {
+    const element = composerRef.current;
+    dismissedDocumentMentionRef.current = element ? { text: element.value, caret: element.selectionStart, threadId: activeThreadId } : null;
+    setDocumentMention(null);
+  }
+
+  function pickDocumentMention(file: LocalAttachment) {
+    if (!documentMentionOpen || !documentMention || attachmentImportCount > 0) return;
+    const draft = composerDraftsByThreadRef.current[activeThreadId] || EMPTY_COMPOSER_DRAFT;
+    try {
+      const next = addMentionToDraft(draft, file, documentMention);
+      updateComposerDraft(activeThreadId, () => next);
+      const caret = documentMention.start;
+      setDocumentMention(null);
+      window.requestAnimationFrame(() => {
+        composerRef.current?.focus();
+        composerRef.current?.setSelectionRange(caret, caret);
+      });
+    } catch (error) {
+      setAttachmentError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function handleComposerKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    // IME confirmation must never select a document or send the question.
+    if (event.nativeEvent.isComposing || composerComposingRef.current || event.keyCode === 229) return;
+    if (documentMentionOpen) {
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); dismissDocumentMention(); return; }
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        event.stopPropagation();
+        const count = documentMentionMatches.length;
+        setDocumentMentionIndex(count ? (activeDocumentMentionIndex + (event.key === 'ArrowDown' ? 1 : count - 1)) % count : 0);
+        return;
+      }
+      if ((event.key === 'Enter' || event.key === 'Tab') && !event.shiftKey) {
+        event.preventDefault();
+        event.stopPropagation();
+        const file = documentMentionMatches[activeDocumentMentionIndex];
+        if (file) pickDocumentMention(file);
+        return;
+      }
+    }
+    if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); handleSubmit(event); }
   }
 
   async function addDocumentQuoteToComposer(value: DocumentQuote, threadId: string) {
@@ -8834,10 +8954,14 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
   function applyDocumentScope(files: LocalAttachment[]) {
     if (documentScopePickerThreadId !== activeThreadId) return;
     validateSourceSelection("selected", files);
+    const mention = documentScopePickerMentionRef.current;
+    const draftInput = composerDraftsByThreadRef.current[activeThreadId]?.input || '';
+    const nextInput = mention?.threadId === activeThreadId ? removeDocumentMention(draftInput, mention) : draftInput;
     const removed = attachments.filter((file) => !files.some((selected) => selected.path === file.path));
-    updateComposerDraft(activeThreadId, (draft) => ({ ...draft, sourceScope: draft.sourceScope === 'both' || draft.sourceScope === 'model' ? draft.sourceScope : 'selected', selectedWorkflowId: undefined,
+    updateComposerDraft(activeThreadId, (draft) => ({ ...draft, input: nextInput, sourceScope: !mention && (draft.sourceScope === 'both' || draft.sourceScope === 'model') ? draft.sourceScope : 'selected', selectedWorkflowId: undefined,
       attachments: files, documentQuotes: draft.documentQuotes?.filter(quote => files.some(file => documentPathKey(file.path) === documentPathKey(quote.path))), attachmentError: "" }));
     setDocumentScopePickerThreadId(null);
+    documentScopePickerMentionRef.current = null;
     void Promise.allSettled(removed.filter((file) => !attachmentPathInUse(file.path, activeThreadId))
       .map((file) => workbench.discardStagedAttachment(file.path)));
     window.requestAnimationFrame(() => composerRef.current?.focus());
@@ -8916,22 +9040,22 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
   }
 
   function beginDocumentLibraryCreate(kind: "folder" | "markdown") {
+    if (documentLibraryCreating) return;
     cancelPendingDomiEntityOpen();
     setDocumentLibraryCreateKind(kind);
-    setDocumentLibraryCreateName("");
+    documentLibraryCreateFormRef.current?.reset();
     setDocumentLibraryCreateError("");
   }
 
   function cancelDocumentLibraryCreate() {
     setDocumentLibraryCreateKind(null);
-    setDocumentLibraryCreateName("");
     setDocumentLibraryCreateError("");
   }
 
   async function submitDocumentLibraryCreate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!documentLibraryCreateKind || documentLibraryCreating || !documentLibrary) return;
-    const name = documentLibraryCreateName.trim();
+    const name = (event.currentTarget.elements.namedItem('entryName') as HTMLInputElement).value.trim();
     if (!name) {
       setDocumentLibraryCreateError(
         documentLibraryCreateKind === "folder" ? "请输入文件夹名称。" : "请输入文档名称。"
@@ -8939,6 +9063,10 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
       return;
     }
     const parentPath = documentLibrarySelectedFolder || documentLibrary.rootPath;
+    const rootPath = documentLibrary.rootPath;
+    // Ignore snapshots started before the write and responses for an old root.
+    documentLibraryRequestRef.current += 1;
+    setDocumentLibraryLoading(false);
     setDocumentLibraryCreating(true);
     setDocumentLibraryCreateError("");
     try {
@@ -8947,11 +9075,23 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
         kind: documentLibraryCreateKind,
         name
       });
+      if (documentLibraryRef.current?.rootPath !== rootPath) return;
       if (!result.ok || !result.path) {
         setDocumentLibraryCreateError(result.error || "新建失败。");
         return;
       }
-      if (result.snapshot) setDocumentLibrary(result.snapshot);
+      documentLibraryRequestRef.current += 1;
+      setDocumentLibraryLoading(false);
+      const current = documentLibraryRef.current;
+      const updated = result.node && current
+        ? insertDocumentLibraryNode(current, result.rootPath || rootPath, result.parentPath || parentPath, result.node)
+        : result.snapshot;
+      if (updated) {
+        documentLibraryRef.current = updated;
+        setDocumentLibrary(updated);
+      } else {
+        void refreshDocumentLibrary({ silent: true, force: true });
+      }
       setDocumentLibraryExpandedPaths((current) => new Set(current).add(parentPath));
       const createdKind = result.kind;
       cancelDocumentLibraryCreate();
@@ -8966,6 +9106,50 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
       setDocumentLibraryCreateError(describeOperationError(error, "新建失败。"));
     } finally {
       setDocumentLibraryCreating(false);
+    }
+  }
+
+  async function moveDocumentLibraryDocument(path: string, parentPath: string, mtimeMs: number) {
+    const library = documentLibraryRef.current;
+    if (!library?.ok || documentLibraryMovingRef.current || documentLibraryCreating || markdownRenameInFlightRef.current) return;
+    const rootPath = library.rootPath;
+    documentLibraryMovingRef.current = true;
+    setDocumentLibraryMoving(true);
+    setDocumentLibraryError(''); setDocumentLibraryNotice('正在移动文档…');
+    documentLibraryRequestRef.current += 1;
+    setDocumentLibraryLoading(false);
+    let locked = false;
+    try {
+      if (!await flushResearchDocuments()) throw new Error('研究笔记尚未保存，请先处理保存提示。');
+      if (documentPathKey(markdownDocumentRef.current?.path || '') === documentPathKey(path)) {
+        if (!await saveOpenMarkdown()) throw new Error('文档尚未保存，已取消移动，请先处理保存提示。');
+        mtimeMs = markdownDocumentRef.current?.mtimeMs || mtimeMs;
+        markdownRenameInFlightRef.current = true; locked = true;
+      }
+      const result = await workbench.moveDocumentLibraryEntry({ path, parentPath, expectedMtimeMs: mtimeMs });
+      if (documentLibraryRef.current?.rootPath !== rootPath) return;
+      if (!result.ok || !result.path || !result.node) throw new Error(result.error || '移动文档失败。');
+      documentLibraryRequestRef.current += 1;
+      setDocumentLibraryLoading(false);
+      const current = documentLibraryRef.current;
+      const updated = current && moveDocumentLibraryNode(current, rootPath, path, parentPath, result.node);
+      if (updated) { documentLibraryRef.current = updated; setDocumentLibrary(updated); }
+      else void refreshDocumentLibrary({ silent: true, force: true });
+      setDocumentLibraryExpandedPaths(current => new Set(current).add(parentPath));
+      setDocumentLibrarySelectedFolder(parentPath);
+      setDocumentLibrarySearchActivePath(current => current === path ? result.path as string : current);
+      if (documentPathKey(markdownDocumentRef.current?.path || '') === documentPathKey(path)) await openMarkdown(result.path);
+      else if (documentPathKey(pdfDocumentRef.current?.path || '') === documentPathKey(path)) await openPdf(result.path);
+      setDocumentLibraryNotice(result.unchanged ? '文档已在此文件夹中。' : `已将“${result.node.name}”移至“${parentPath === rootPath ? '全部文档' : parentPath.split(/[\\/]/).pop()}”。`);
+    } catch (error) {
+      if (documentLibraryRef.current?.rootPath === rootPath) {
+        setDocumentLibraryNotice('');
+        setDocumentLibraryError(describeOperationError(error, '移动文档失败。'));
+      }
+    } finally {
+      if (locked) markdownRenameInFlightRef.current = false;
+      documentLibraryMovingRef.current = false;
+      setDocumentLibraryMoving(false);
     }
   }
 
@@ -9556,7 +9740,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
           </div>
         </div>
 
-        <div className="markdown-panel-body">
+        <div className="markdown-panel-body" inert={documentLibraryMoving}>
           {markdownLoading ? (
             <div className="markdown-panel-state"><RefreshCw className="spinning" size={18} />正在载入</div>
           ) : !markdownDocument ? (
@@ -9657,79 +9841,13 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
     return pdfPanelActive ? renderPdfPanel() : renderMarkdownPanel();
   }
 
-  function renderDocumentLibraryNode(
-    node: DocumentLibraryNode,
-    parentPath: string,
-    depth = 0
-  ): ReactNode {
-    const isFolder = node.kind === "folder";
-    const expanded = isFolder && (
-      documentLibraryQuery.trim()
-        ? true
-        : documentLibraryExpandedPaths.has(node.path)
-    );
-    const selected = isFolder
-      ? documentLibrarySelectedFolder === node.path
-      : selectedDocumentLibraryPath === node.path;
-    const keyboardActive = Boolean(documentLibraryQuery.trim())
-      && documentLibrarySearchActivePath === node.path;
-    return (
-      <div className="document-library-node" key={node.path}>
-        <button
-          className={[
-            "document-library-node-row",
-            selected ? "selected" : "",
-            keyboardActive ? "keyboard-active" : ""
-          ].filter(Boolean).join(" ")}
-          type="button"
-          style={{ "--tree-indent": `${depth * 14}px` } as CSSProperties}
-          onClick={() => openDocumentLibraryNode(node, parentPath)}
-          title={node.path}
-          role="treeitem"
-          aria-expanded={isFolder ? expanded : undefined}
-          aria-selected={selected || keyboardActive}
-          data-document-library-path={node.path}
-        >
-          <span className="document-library-disclosure" aria-hidden="true">
-            {isFolder ? <ChevronRight className={expanded ? "open" : ""} size={13} /> : null}
-          </span>
-          <span className={`document-library-node-icon ${node.kind}`} aria-hidden="true">
-            {node.kind === "folder"
-              ? expanded ? <FolderOpen size={16} /> : <Folder size={16} />
-              : node.kind === "pdf" ? <FileType2 size={16} /> : <FileText size={16} />}
-          </span>
-          <span className="document-library-node-name">{node.displayName || node.name}</span>
-          {node.kind !== "folder" && (
-            <small>{formatFileSize(node.size)}</small>
-          )}
-        </button>
-        {expanded && node.children && (
-          <div className="document-library-children" role="group">
-            {node.children.length > 0
-              ? node.children.map((child) =>
-                  renderDocumentLibraryNode(child, node.path, depth + 1)
-                )
-              : (
-                <span
-                  className="document-library-empty-folder"
-                  style={{ "--tree-indent": `${(depth + 1) * 14}px` } as CSSProperties}
-                >
-                  空文件夹
-                </span>
-              )}
-          </div>
-        )}
-      </div>
-    );
-  }
-
   function renderDocumentLibrarySidebar() {
     const rootPath = documentLibrary?.rootPath || "";
     const selectedFolderName = documentLibrarySelectedFolder === rootPath
       ? "文档库根目录"
       : documentLibrarySelectedFolder.split(/[\\/]/).filter(Boolean).pop() || "文档库根目录";
     return (
-      <div className="sidebar-document-library" aria-label="本地文档库目录">
+      <div className="sidebar-document-library" aria-label="本地文档库目录" aria-busy={documentLibraryMoving}>
         <div className="sidebar-document-toolbar">
           <span title={documentLibrary?.rootName || "本地资料库"}>
             {documentLibrary?.rootName || "本地资料库"}
@@ -9813,7 +9931,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
         </label>
 
         {documentLibraryCreateKind && (
-          <form className="document-library-create" onSubmit={submitDocumentLibraryCreate}>
+          <form className="document-library-create" ref={documentLibraryCreateFormRef} onSubmit={submitDocumentLibraryCreate}>
             <span>
               {documentLibraryCreateKind === "folder"
                 ? <FolderPlus size={14} />
@@ -9821,18 +9939,19 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
             </span>
             <input
               autoFocus
-              value={documentLibraryCreateName}
-              onChange={(event) => setDocumentLibraryCreateName(event.target.value)}
+              name="entryName"
+              defaultValue=""
+              disabled={documentLibraryCreating}
               placeholder={documentLibraryCreateKind === "folder" ? "文件夹名称" : "文档名称"}
               aria-label={documentLibraryCreateKind === "folder" ? "文件夹名称" : "文档名称"}
               onKeyDown={(event) => {
-                if (event.key === "Escape") cancelDocumentLibraryCreate();
+                if (event.key === "Escape" && !documentLibraryCreating) cancelDocumentLibraryCreate();
               }}
             />
             <button type="submit" disabled={documentLibraryCreating} title="创建">
               {documentLibraryCreating ? <RefreshCw className="spinning" size={12} /> : <Check size={12} />}
             </button>
-            <button type="button" onClick={cancelDocumentLibraryCreate} title="取消">
+            <button type="button" disabled={documentLibraryCreating} onClick={cancelDocumentLibraryCreate} title="取消">
               <X size={12} />
             </button>
             {documentLibraryCreateError && <small>{documentLibraryCreateError}</small>}
@@ -9842,7 +9961,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
         <button
           className={`document-library-root-row ${
             documentLibrarySelectedFolder === rootPath ? "selected" : ""
-          }`}
+          } ${documentLibraryRootDragOver ? 'drop-target' : ''}`}
           type="button"
           onClick={() => {
             if (rootPath) {
@@ -9851,7 +9970,18 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
             }
           }}
           disabled={!rootPath}
-          title={rootPath}
+          title={`${rootPath}\n将文档拖到这里可移回文档库根目录`}
+          onDragOver={event => {
+            if (documentLibraryMoving || !hasDocumentLibraryDrag(event.dataTransfer)) return;
+            event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'move'; setDocumentLibraryRootDragOver(true);
+          }}
+          onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDocumentLibraryRootDragOver(false); }}
+          onDrop={event => {
+            if (!hasDocumentLibraryDrag(event.dataTransfer)) return;
+            event.preventDefault(); event.stopPropagation(); setDocumentLibraryRootDragOver(false);
+            const dragged = readDocumentLibraryDrag(event.dataTransfer, rootPath);
+            if (dragged) onMoveDocumentLibraryNode(dragged.path, rootPath, dragged.mtimeMs);
+          }}
         >
           <FolderOpen size={15} />
           <span>全部文档</span>
@@ -9877,9 +10007,13 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
               <button type="button" onClick={() => void refreshDocumentLibrary({ force: true })}>重试</button>
             </div>
           )}
-          {documentLibrary?.ok && filteredDocumentLibraryNodes.map((node) =>
-            renderDocumentLibraryNode(node, documentLibrary.rootPath)
-          )}
+          {documentLibrary?.ok && <DocumentLibraryTree
+            nodes={filteredDocumentLibraryNodes} rootPath={documentLibrary.rootPath}
+            expandedPaths={documentLibraryExpandedPaths} selectedFolder={documentLibrarySelectedFolder}
+            selectedDocument={selectedDocumentLibraryPath} searching={Boolean(documentLibraryQuery.trim())}
+            activePath={documentLibrarySearchActivePath} onOpen={onOpenDocumentLibraryNode} formatSize={formatFileSize}
+            moving={documentLibraryMoving} onMove={onMoveDocumentLibraryNode} onExpand={onExpandDocumentLibraryFolder}
+          />}
           {documentLibrary?.ok && filteredDocumentLibraryNodes.length === 0 && (
             <div className="document-library-state">
               <FileText size={15} />
@@ -12202,24 +12336,36 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
             <button type="button" aria-pressed={sourceScope === 'both'} title="依次展示资料回答与模型补充，模型补充标明未经资料核验"
               onClick={() => setSourceScope('both')}>Both · 两者结合</button>
           </div>
+          <div className="composer-mention-anchor">
+          {documentMentionOpen && <DocumentMentionMenu files={documentMentionMatches} selected={attachments} activeIndex={activeDocumentMentionIndex}
+            loading={documentLibraryLoading} error={documentLibraryError} truncated={Boolean(documentLibrary?.truncated)} query={documentMention?.query || ''}
+            onActiveIndex={setDocumentMentionIndex} onPick={pickDocumentMention} onClose={dismissDocumentMention}
+            onRefresh={() => void refreshDocumentLibrary({ force: true })} />}
           <textarea
             ref={composerRef}
             rows={variant === "home" ? 2 : 1}
             value={input}
-            onChange={(event) => setInput(event.target.value)}
-            placeholder={sourceScope === 'model' ? '直接向模型提问，也可以带上主动引用的选段…' : sourceScope === 'both' ? '提问后分别查看资料依据与模型补充…' : sourceScope === "selected" ? "询问选定文档中的内容，回答将附原文引用…" : selectedWorkflow
+            onChange={(event) => { setInput(event.target.value); updateDocumentMention(event.currentTarget); }}
+            onSelect={(event) => updateDocumentMention(event.currentTarget)}
+            onBlur={(event) => {
+              // Opening the full picker should consume the same @ query only
+              // after Apply. Other focus changes dismiss the suggestions.
+              if (!(event.relatedTarget as HTMLElement | null)?.closest('.composer-scope-picker, .send-button')) setDocumentMention(null);
+            }}
+            onCompositionStart={() => { composerComposingRef.current = true; setDocumentMention(null); }}
+            onCompositionEnd={(event) => { composerComposingRef.current = false; updateDocumentMention(event.currentTarget); }}
+            aria-autocomplete="list"
+            aria-controls={documentMentionOpen ? 'composer-document-mentions' : undefined}
+            aria-activedescendant={documentMentionOpen && documentMentionMatches.length ? `composer-document-mention-${activeDocumentMentionIndex}` : undefined}
+            placeholder={sourceScope === 'model' ? '直接向模型提问；输入 @ 选择文档并仅据其回答…' : sourceScope === 'both' ? '提问后查看资料与模型补充；输入 @ 切换为仅据文档回答…' : sourceScope === "selected" ? "输入 @ 添加资料库文档，仅依据选中文档回答并引用…" : selectedWorkflow
               ? `补充材料或目标，运行「${selectedWorkflow.title}」`
               : variant === "dock"
-                ? "随心输入"
-                : `例如：${COMPOSER_SUGGESTIONS[composerSuggestionIndex]}`}
+                ? "随心输入，或输入 @ 选择资料库文档…"
+                : `输入 @ 选择资料库文档；例如：${COMPOSER_SUGGESTIONS[composerSuggestionIndex]}`}
             aria-label="输入投资任务"
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                handleSubmit(event);
-              }
-            }}
+            onKeyDown={handleComposerKeyDown}
           />
+          </div>
 
           {selectedWorkflow?.id === "schedule" && commonCalendarRecipients.length > 0 && (
             <div className="schedule-recipient-picker" aria-label="选择常用参会人">
@@ -12304,8 +12450,8 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
                 </select>
               </label>}
               <button type="button" className={`composer-scope-picker ${isSelectedDocumentScope(sourceScope) ? "active" : ""}`}
-                onClick={openDocumentScopePicker} disabled={attachmentImportCount > 0} title={sourceScope === 'model' ? '文档可保留供切换模式使用；模型直答只使用主动引用选段' : '选择本轮资料范围，资料回答中的关键结论附原文引用'}>
-                <FileText size={14} />{(isSelectedDocumentScope(sourceScope) || sourceScope === 'model') && attachments.length ? `已选 ${attachments.length} 份文档` : "选择文档"}
+                onClick={openDocumentScopePicker} disabled={attachmentImportCount > 0} title={sourceScope === 'model' ? '文档可保留供切换模式使用；也可输入 @ 选择文档并切到仅据文档回答' : '选择本轮资料范围；也可直接在输入框输入 @ 搜索资料库文档'}>
+                <AtSign size={14} aria-hidden="true" />{(isSelectedDocumentScope(sourceScope) || sourceScope === 'model') && attachments.length ? `已选 ${attachments.length} 份文档` : "选择文档"}
               </button>
               {isRestrictedScope(sourceScope) ? <span className="composer-source-readonly">资料问答</span> : selectedWorkflow ? (
                 <button
@@ -13267,7 +13413,7 @@ className={`main-grid ${rightPanelOpen && workspaceView !== 'research' ? "right-
                                     description="任务仍在执行，后续内容到达后会自动恢复。"
                                   >
                                     <Suspense fallback={<div className="message-text">{message.content}</div>}>
-                                      <MessageContent message={message} onOpenDocument={openDocument} />
+                                      <MessageContent message={message} onOpenDocument={onOpenMessageDocument} />
                                     </Suspense>
                                   </SectionErrorBoundary>
                                 )}
@@ -13289,7 +13435,7 @@ className={`main-grid ${rightPanelOpen && workspaceView !== 'research' ? "right-
                                 description="消息原文仍保存在本地，可以重试渲染。"
                               >
                                 <Suspense fallback={<div className="message-text">{message.content}</div>}>
-                                  <MessageContent message={message} onOpenDocument={openDocument} />
+                                  <MessageContent message={message} onOpenDocument={onOpenMessageDocument} />
                                 </Suspense>
                               </SectionErrorBoundary>
                             )}
@@ -13378,7 +13524,7 @@ className={`main-grid ${rightPanelOpen && workspaceView !== 'research' ? "right-
     )}
     {documentScopePickerThreadId === activeThreadId && (
       <Suspense fallback={<div className="lazy-overlay">正在打开文档选择…</div>}>
-        <DocumentScopePicker library={documentLibrary} loading={documentLibraryLoading} error={documentLibraryError} sourceScope={sourceScope}
+        <DocumentScopePicker library={documentLibrary} loading={documentLibraryLoading} error={documentLibraryError} sourceScope={documentScopePickerMentionRef.current ? 'selected' : sourceScope}
           initialSelection={attachments} onRefresh={() => void refreshDocumentLibrary({ force: true })}
           onApply={applyDocumentScope} onClose={() => setDocumentScopePickerThreadId(null)} />
       </Suspense>

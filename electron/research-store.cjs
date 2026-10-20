@@ -4,6 +4,20 @@ const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { segments, industry, industryFromPath, isWithin, rebaseTopicContent } = require('./research-layout.cjs');
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
+function hashFile(file) {
+  const descriptor = fs.openSync(file, 'r');
+  try {
+    const before = fs.fstatSync(descriptor), digest = crypto.createHash('sha256');
+    const buffer = Buffer.allocUnsafe(256 * 1024);
+    let count;
+    while ((count = fs.readSync(descriptor, buffer, 0, buffer.length, null))) digest.update(buffer.subarray(0, count));
+    const after = fs.fstatSync(descriptor);
+    if (after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) {
+      throw new Error('读取期间材料已变化，请重新载入。');
+    }
+    return digest.digest('hex');
+  } finally { fs.closeSync(descriptor); }
+}
 const id = value => {
   if (!/^[a-zA-Z0-9-]{8,80}$/.test(String(value || ''))) throw new Error('研究记录 ID 无效。');
   return value;
@@ -25,6 +39,11 @@ function atomicWrite(file, content) {
   } finally { fs.rmSync(temporary, { force: true }); }
 }
 class ResearchStore {
+  relocateSource(sourcePath, targetPath) {
+    const source = this.safe(sourcePath), target = this.safe(targetPath);
+    this.db.prepare('UPDATE reading_sources SET path=?, version=? WHERE path=?')
+      .run(path.relative(this.root, target), hashFile(target), path.relative(this.root, source));
+  }
   constructor({ rootPath, onFileChanged = () => {}, allowedPaths = new Set() }) {
     this.root = fs.realpathSync(rootPath);
     this.onFileChanged = onFileChanged;
@@ -110,7 +129,7 @@ class ResearchStore {
   registerSource(requestPath) {
     const resolved = this.safe(requestPath, true);
     if (!/\.(md|markdown|pdf|docx|doc)$/i.test(resolved) || !fs.statSync(resolved).isFile()) throw new Error('仅支持 Markdown、PDF 和 Word 材料。');
-    const version = hash(fs.readFileSync(resolved));
+    const version = hashFile(resolved);
     const storedPath = inside(this.root, resolved) ? path.relative(this.root, resolved) : resolved;
     let row = this.db.prepare('SELECT * FROM reading_sources WHERE path=?').get(storedPath);
     // Relink a uniquely moved file; do not merge two extant copies just because
@@ -249,7 +268,7 @@ class ResearchStore {
           if (entry.name.startsWith('.') || entry.isSymbolicLink()) continue;
           const file = path.join(directory, entry.name);
           if (entry.isDirectory()) visit(file);
-          else if (entry.isFile() && /\.(md|markdown|pdf|docx|doc)$/i.test(entry.name) && hash(fs.readFileSync(file)) === annotation.sourceVersion) matches.push(file);
+          else if (entry.isFile() && /\.(md|markdown|pdf|docx|doc)$/i.test(entry.name) && hashFile(file) === annotation.sourceVersion) matches.push(file);
         }
       };
       visit(this.root);
@@ -257,7 +276,7 @@ class ResearchStore {
       source = this.registerSource(matches[0]);
     }
     this.safe(source.path, true);
-    const currentVersion = hash(fs.readFileSync(source.path));
+    const currentVersion = hashFile(source.path);
     return { annotation, source: { ...source, version: currentVersion }, status: currentVersion === annotation.sourceVersion ? 'exact' : 'changed' };
   }
   async handle(request) {
@@ -307,7 +326,7 @@ class ResearchStore {
         case 'annotate': {
           const annotationId = id(request.id), source = this.sourceInfo(this.sourceRow(request.sourceId));
           this.safe(source.path, true);
-          if (hash(fs.readFileSync(source.path)) !== request.sourceVersion) throw new Error('材料已变化，请重新载入后再批注。');
+          if (hashFile(source.path) !== request.sourceVersion) throw new Error('材料已变化，请重新载入后再批注。');
           if (!['text','region','document'].includes(request.kind) || typeof request.quote !== 'string' || typeof request.comment !== 'string' || request.quote.length > 100_000 || request.comment.length > 100_000) throw new Error('批注内容无效或过长。');
           if (request.kind === 'document' && (!request.comment.trim() || request.quote !== '')) throw new Error('整篇文档评论需要非空评论，不能包含伪造的原文选段。');
           const anchor = request.anchor;
@@ -375,4 +394,4 @@ class ResearchStore {
   }
   close() { this.db.close(); }
 }
-module.exports = { ResearchStore, hash };
+module.exports = { ResearchStore, hash, hashFile };

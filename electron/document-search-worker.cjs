@@ -6,6 +6,7 @@ const {
   openDocumentSearchIndex,
   pathInsideRoot,
   removeStaleDocuments,
+  removeIndexedDocument,
   searchIndexedDocuments,
   shouldIndexFile,
   upsertIndexedDocument
@@ -36,6 +37,7 @@ if (workerData.semanticCacheDir) {
   configureSemanticEmbedder({ cacheDir: workerData.semanticCacheDir });
 }
 let activeRoot = "";
+let rootEpoch = 0;
 let indexing = false;
 let indexedCount = 0;
 let lastIndexedAt = 0;
@@ -114,7 +116,9 @@ function scheduleEmbeddingPump() {
       }
       const batch = loadPendingChunkBatch(database, EMBED_BATCH_SIZE);
       if (!batch.length) continue;
+      const epoch = rootEpoch;
       const vectors = await embedTexts(batch.map((item) => item.text), "passage");
+      if (epoch !== rootEpoch) continue;
       if (!vectors) {
         // Embedding failed for this batch; back off instead of hot-looping.
         await new Promise((resolve) => setTimeout(resolve, 5_000));
@@ -130,7 +134,7 @@ function scheduleEmbeddingPump() {
   void pump();
 }
 
-async function semanticSearch(message) {
+async function semanticSearch(message, context) {
   const query = String(message.request?.query || "").trim();
   if (!query) {
     return { ok: true, available: true, results: [], degraded: false };
@@ -143,10 +147,11 @@ async function semanticSearch(message) {
   }
   const limit = Math.max(1, Math.min(Number(message.request?.limit) || 8, 60));
   const vectors = await embedTexts([query], "query");
+  if (!context.isCurrent()) return staleResult();
   if (!vectors?.length) {
     return { ok: false, available: true, results: [], degraded: false };
   }
-  const scan = semanticScan(database, vectors[0], limit);
+  const scan = semanticScan(database, vectors[0], limit, null, context.rootPath);
   const texts = fetchChunkTexts(database, scan.results.map((result) => result.id));
   return {
     ok: true,
@@ -208,11 +213,13 @@ async function indexRoot(rootPath) {
   let scanned = 0;
   let changed = 0;
   let scanRoot = "";
+  const epoch = rootEpoch;
+  const isCurrent = () => rootEpoch === epoch && activeRoot === scanRoot;
   try {
     scanRoot = configureRoot(database, rootPath);
     activeRoot = scanRoot;
     for await (const filePath of walk(scanRoot, scanState)) {
-      if (activeRoot !== scanRoot) break;
+      if (!isCurrent()) break;
       let stat;
       try {
         stat = await fs.promises.stat(filePath);
@@ -220,16 +227,19 @@ async function indexRoot(rootPath) {
         scanState.complete = false;
         continue;
       }
+      if (!isCurrent()) break;
       if (!stat.isFile()) continue;
       try {
-        if (await upsertIndexedDocument(database, scanRoot, filePath, stat, generation, { skipContent, ocrPage: ocrPageExecutor || null })) {
+        if (await upsertIndexedDocument(database, scanRoot, filePath, stat, generation, { skipContent, ocrPage: ocrPageExecutor || null, isCurrent })) {
           changed += 1;
         }
       } catch (error) {
+        if (!isCurrent()) break;
         // Retain existing index rows when a file is temporarily unreadable.
         scanState.complete = false;
         lastError = `Index failed: ${filePath}: ${error instanceof Error ? error.message : String(error)}`;
       }
+      if (!isCurrent()) break;
       scanned += 1;
       if (scanned % 20 === 0) {
         indexedCount = scanned;
@@ -237,7 +247,7 @@ async function indexRoot(rootPath) {
         await yieldToMessages();
       }
     }
-    if (activeRoot === scanRoot) {
+    if (isCurrent()) {
       if (scanState.complete) {
         removeStaleDocuments(database, generation);
         lastScanComplete = true;
@@ -251,10 +261,12 @@ async function indexRoot(rootPath) {
     }
     parentPort.postMessage({ type: "indexed", status: status(), changed });
   } catch (error) {
-    lastError = error instanceof Error ? error.message : String(error);
-    lastScanComplete = false;
-    lastIndexedAt = Date.now();
-    parentPort.postMessage({ type: "status", status: status() });
+    if (isCurrent()) {
+      lastError = error instanceof Error ? error.message : String(error);
+      lastScanComplete = false;
+      lastIndexedAt = Date.now();
+      parentPort.postMessage({ type: "status", status: status() });
+    }
   } finally {
     if (activeGeneration === generation) activeGeneration = "";
     indexing = false;
@@ -269,13 +281,25 @@ async function indexRoot(rootPath) {
 function adoptRoot(rootPath) {
   const resolvedRoot = path.resolve(rootPath);
   if (activeRoot !== resolvedRoot) {
+    rootEpoch++;
     activeRoot = configureRoot(database, resolvedRoot);
     lastIndexedAt = 0;
     indexedCount = 0;
     lastScanComplete = false;
+    lastError = '';
     if (indexing) rerunRequested = true;
   }
   return activeRoot;
+}
+
+function rootContext(rootPath) {
+  adoptRoot(rootPath);
+  const epoch = rootEpoch;
+  return { rootPath: activeRoot, isCurrent: () => epoch === rootEpoch && activeRoot === rootPath };
+}
+
+function staleResult() {
+  return { ok: false, stale: true, available: false, results: [], degraded: false, error: '资料库已切换，请重新搜索。' };
 }
 
 function adoptOcrCommand(message) {
@@ -289,24 +313,28 @@ parentPort.on("message", (message) => {
   if (!message || typeof message !== "object") return;
   adoptSemanticSettings(message);
   adoptOcrCommand(message);
-  if (message.type === "index-file") {
+  if (message.type === "index-file" || message.type === 'move-file') {
     cloudContentAllowed = message.cloudContentAllowed === true;
     const rootPath = path.resolve(message.rootPath);
     const filePath = path.resolve(message.filePath);
-    if (adoptRoot(rootPath) === rootPath
+    const context = rootContext(rootPath);
+    if (context.isCurrent()
       && pathInsideRoot(rootPath, filePath)
       && shouldIndexFile(filePath)) {
       enqueue(async () => {
         try {
+          if (!context.isCurrent()) return;
+          if (message.type === 'move-file' && pathInsideRoot(rootPath, message.previousPath)
+            && !fs.existsSync(message.previousPath)) removeIndexedDocument(database, message.previousPath);
           const stat = await fs.promises.stat(filePath);
-          if (!stat.isFile()) return;
+          if (!context.isCurrent() || !stat.isFile()) return;
           await upsertIndexedDocument(
             database,
             rootPath,
             filePath,
             stat,
             activeGeneration || `direct-${Date.now()}`,
-            { skipContent: skipContentFor(rootPath), ocrPage: ocrPageExecutor || null }
+            { skipContent: skipContentFor(rootPath), ocrPage: ocrPageExecutor || null, isCurrent: context.isCurrent }
           );
         } catch {
           // Transient races (file removed between messages) are fine.
@@ -329,16 +357,16 @@ parentPort.on("message", (message) => {
   if (message.type !== "search" && message.type !== "semantic-search") return;
   cloudContentAllowed = message.cloudContentAllowed === true;
   const rootPath = path.resolve(message.rootPath);
-  adoptRoot(rootPath);
+  const context = rootContext(rootPath);
   if (!indexing && Date.now() - lastIndexedAt >= INDEX_FRESHNESS_MS) {
     void indexRoot(rootPath);
   }
   if (message.type === "semantic-search") {
-    void semanticSearch(message).then((result) => {
+    void semanticSearch(message, context).then((result) => {
       parentPort.postMessage({
         type: "response",
         id: message.id,
-        result
+        result: context.isCurrent() ? result : staleResult()
       });
     }).catch((error) => {
       parentPort.postMessage({
@@ -357,7 +385,10 @@ parentPort.on("message", (message) => {
   }
   enqueue(() => {
     try {
-      const search = searchIndexedDocuments(database, message.request);
+      if (!context.isCurrent()) {
+        parentPort.postMessage({ type: 'response', id: message.id, result: staleResult() }); return;
+      }
+      const search = searchIndexedDocuments(database, { ...message.request, rootPath });
       parentPort.postMessage({
         type: "response",
         id: message.id,

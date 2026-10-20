@@ -34,10 +34,10 @@ function trackRepository(root, repository) {
   else repositoriesByRoot.set(root, [repository]);
 }
 
-function removeRootWithRepositories(root) {
+async function removeRootWithRepositories(root) {
   for (const repository of repositoriesByRoot.get(root) || []) {
     try {
-      repository.close();
+      await repository.close();
     } catch {
       // 已被测试体手动关闭，或从未真正打开。
     }
@@ -3202,6 +3202,7 @@ test("integration returns a field patch before queued Markdown materialization f
     }),
     sleep: () => Promise.resolve()
   });
+  trackRepository(root, { close: () => integration.closeLocalRepository() });
   const result = await integration.updateDatabaseRecordPatch({
     entityType: "project",
     recordId: "prj_async_patch",
@@ -3453,6 +3454,7 @@ test("local repository mode syncs projects, people and news without Feishu", asy
     plaud: { ok: true, queueCount: 0, queueStages: {} }
   });
 
+  trackRepository(root, { close: () => integration.closeLocalRepository() });
   const syncResult = await integration.sync();
   assert.equal(syncResult.snapshot.backend, "local");
   assert.equal(syncResult.snapshot.projects[0].name, "示例科技");
@@ -3524,11 +3526,12 @@ test("local materials use the exact entity directory and database edits avoid a 
   integration.buildMaterialIndex = async () => {
     throw new Error("local material lookup must not build a workspace-wide index");
   };
+  trackRepository(root, { close: () => integration.closeLocalRepository() });
   const materials = await integration.entityMaterials({
     entityType: "project",
     recordId: "prj_fast"
   });
-  assert.equal(integration.entityWorkspace({
+  assert.equal(await integration.entityWorkspace({
     entityType: "project",
     recordId: "prj_fast"
   }), projectDirectory);
@@ -3562,14 +3565,14 @@ test("local materials use the exact entity directory and database edits avoid a 
   assert.equal(updated.snapshot.projects[0].notes, "快速保存");
   assert.equal(cache.get("snapshot-v1").value.projects[0].notes, "快速保存");
 
-  const preview = integration.previewDatabaseRecord({
+  const preview = await integration.previewDatabaseRecord({
     entityType: "project",
     recordId: "prj_fast"
   });
   assert.equal(preview.ok, true);
   assert.match(decodeURIComponent(preview.resource), /BP\.pdf$/);
 
-  const deleted = integration.deleteDatabaseRecord({
+  const deleted = await integration.deleteDatabaseRecord({
     entityType: "project",
     recordId: "prj_fast",
     expectedUpdatedAt: updated.record.updatedAt

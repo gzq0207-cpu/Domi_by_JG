@@ -2,6 +2,39 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const { ServiceCoordinator, TaskQueue } = require("../electron/service-coordinator.cjs");
 
+test("invalidated reads cannot overwrite newer values or clear their in-flight request", async () => {
+  const coordinator = new ServiceCoordinator();
+  let releaseOld, releaseNew;
+  const old = coordinator.run('records', () => new Promise(resolve => { releaseOld = resolve; }), { ttlMs: 5000 });
+  coordinator.invalidate('records');
+  let calls = 0;
+  const fresh = coordinator.run('records', () => {
+    calls++;
+    return new Promise(resolve => { releaseNew = resolve; });
+  }, { force: true, ttlMs: 5000 });
+  releaseOld({ revision: 'old' });
+  await old;
+  const joined = coordinator.run('records', () => { throw new Error('must share current generation'); });
+  releaseNew({ revision: 'new' });
+  assert.deepEqual(await fresh, { revision: 'new' });
+  assert.deepEqual(await joined, { revision: 'new' });
+  assert.equal(calls, 1);
+  assert.deepEqual(await coordinator.run('records', () => { throw new Error('must use new cache'); }), { revision: 'new' });
+});
+
+test("an invalidated failure cannot open a circuit for newer data", async () => {
+  const coordinator = new ServiceCoordinator();
+  let rejectOld;
+  const old = coordinator.run('records', () => new Promise((_, reject) => { rejectOld = reject; }), { failureThreshold: 1 });
+  const settled = old.catch(error => error);
+  coordinator.invalidate('records');
+  await coordinator.run('records', async () => ({ revision: 'new' }), { ttlMs: 5000 });
+  rejectOld(new Error('old connection failed'));
+  await settled;
+  assert.equal(coordinator.snapshot()[0].failures, 0);
+  assert.equal(coordinator.snapshot()[0].circuitOpen, false);
+});
+
 test("service coordinator merges requests, retries and serves stale data", async () => {
   let now = 1000;
   const coordinator = new ServiceCoordinator({ now: () => now, sleep: async () => undefined });

@@ -54,7 +54,7 @@ const { isSelectedCodexConnectionReady } = require("./codex-protocol.cjs");
 const { startIntakeServer, DEFAULT_PORT: INTAKE_DEFAULT_PORT } = require("./intake-server.cjs");
 const { FeishuIntakePoller, buildInboxQuestionReply, buildInboxContinueReply } = require("./intake-feishu.cjs");
 const { InboxAnswerGenerator, composeAnswerReply } = require("./inbox-answer.cjs");
-const { FeishuWikiMirror } = require("./feishu-wiki-mirror.cjs");
+const { FeishuWikiMirror, isMirrorWatchTarget } = require("./feishu-wiki-mirror.cjs");
 const { KnowledgeTranslationService } = require("./knowledge-translation.cjs");
 const { ChineseTranslator } = require("./chinese-translation.cjs");
 const { finalizeSubscriptionDigest, digestDisplayTitle } = require("./subscription-digest.cjs");
@@ -87,13 +87,12 @@ const {
   savePastedMarkdownImage
 } = require("./markdown-assets.cjs");
 const {
-  createDocumentLibraryEntry,
   documentLibraryLocation,
-  ensureDocumentLibraryStructure,
-  listDocumentLibrary
+  ensureDocumentLibraryStructure
 } = require("./document-library.cjs");
+const { DocumentLibraryService } = require("./document-library-service.cjs");
 const { DocumentSearchService } = require("./document-search-service.cjs");
-const { ResearchStore } = require("./research-store.cjs");
+const { ResearchService } = require("./research-service.cjs");
 const {createDocumentAnnotationService}=require('./document-annotations.cjs');
 const { createPdfPreviewRegistry } = require('./pdf-preview.cjs');
 const pdfPreviewRegistry = createPdfPreviewRegistry({ net });
@@ -102,10 +101,14 @@ let researchStore = null;
 function getResearchStore() {
   const location = currentDocumentLibraryLocation();
   const rootPath = fs.realpathSync(location.rootPath);
-  if (researchStore?.root !== rootPath) {
-    researchStore?.close();
-    researchStore = new ResearchStore({ rootPath, allowedPaths: researchAllowedPaths,
-      onFileChanged: (file) => { invalidateDocumentLibraryCache(); getDocumentSearchService().updateFile(rootPath, file); }
+  if (researchStore?.root !== rootPath || researchStore?.libraryRoot !== location.rootPath) {
+    void researchStore?.close().catch(error => appendRuntimeLog('research-close-failed', { error: error.message }));
+    researchStore = new ResearchService({ rootPath, libraryRoot: location.rootPath, allowedPaths: researchAllowedPaths,
+      onFileChanged: (file) => {
+        if (researchStore?.libraryRoot !== location.rootPath
+          || documentLibraryLocation(getAppSettings().load().settings).rootPath !== location.rootPath) return;
+        invalidateDocumentLibraryCache(); getDocumentSearchService().updateFile(rootPath, file);
+      }
     });
   }
   return researchStore;
@@ -215,12 +218,7 @@ const CODEX_VERSION_CHECK_TIMEOUT_MS = 10_000;
 const CODEX_HEALTH_REQUEST_TIMEOUT_MS = 20_000;
 const codexConnectionTests = new CodexConnectionTestController();
 const LARK_STATUS_CACHE_TTL_MS = 5 * 60 * 1000;
-const DOCUMENT_LIBRARY_CACHE_TTL_MS = 60 * 1000;
-let documentLibraryCache = {
-  key: "",
-  expiresAt: 0,
-  snapshot: null
-};
+const documentLibraryService = new DocumentLibraryService();
 let documentSearchService = null;
 const externalDomiWorkflows = new Map([
   ["domi-analyst", "使用 domi-AI分析师，并可能读取当前 domi 资料库"],
@@ -560,12 +558,18 @@ function isEntityWorkspace(workspacePath) {
   });
 }
 
-function projectResearchCacheScope(payload, workspacePath) {
+async function projectResearchCacheScope(payload, workspacePath) {
+  const settings = getAppSettings().load().settings;
+  let canonical = '';
+  if (settings.storageBackend === 'local' && ['project', 'person'].includes(payload?.externalType) && payload?.externalRecordId) {
+    try { canonical = await getDomiIntegration().entityWorkspace({ entityType: payload.externalType, recordId: payload.externalRecordId }); }
+    catch { return { allowed: false, workspacePath: '' }; }
+  }
   return resolveProjectResearchCacheScope({
     payload,
     workspacePath,
-    settings: getAppSettings().load().settings,
-    resolveEntityWorkspace: (request) => getDomiIntegration().entityWorkspace(request)
+    settings,
+    resolveEntityWorkspace: () => canonical
   });
 }
 
@@ -591,8 +595,8 @@ function sameDirectoryIdentity(left, right) {
     && left.inode === right.inode;
 }
 
-function researchCacheWorkspaceIsCurrent(run) {
-  const scope = projectResearchCacheScope({
+async function researchCacheWorkspaceIsCurrent(run) {
+  const scope = await projectResearchCacheScope({
     externalType: run.externalType,
     externalRecordId: run.externalRecordId
   }, run.workspacePath);
@@ -639,14 +643,14 @@ function attachmentDirectory(workspacePath) {
   );
 }
 
-function validAttachmentWorkspace(requestedWorkspacePath, entityRequest) {
+async function validAttachmentWorkspace(requestedWorkspacePath, entityRequest) {
   const entityType = ["project", "person"].includes(entityRequest?.entityType)
     ? entityRequest.entityType
     : "";
   const recordId = String(entityRequest?.recordId || "").trim();
   if (entityType && recordId) {
     if (getAppSettings().load().settings.storageBackend !== "local") return "";
-    return validCodexWorkspace(getDomiIntegration().entityWorkspace({ entityType, recordId })) || "";
+    return validCodexWorkspace(await getDomiIntegration().entityWorkspace({ entityType, recordId })) || "";
   }
   const candidate = validCodexWorkspace(requestedWorkspacePath);
   return candidate && !isEntityWorkspace(candidate) ? candidate : demoWorkspace;
@@ -709,7 +713,7 @@ async function cleanupImportedStagingSources(sourcePaths) {
 
 async function importLocalFiles(requestedWorkspacePath, requestedPaths, entityRequest) {
   ensureDemoWorkspace();
-  const workspacePath = validAttachmentWorkspace(requestedWorkspacePath, entityRequest);
+  const workspacePath = await validAttachmentWorkspace(requestedWorkspacePath, entityRequest);
   if (!workspacePath) {
     return { ok: false, canceled: false, files: [], error: "没有找到该项目或人物的固定资料目录。" };
   }
@@ -774,7 +778,7 @@ function sanitizedAttachmentName(candidate, index) {
 
 async function importLocalFileData(requestedWorkspacePath, requestedFiles, entityRequest) {
   ensureDemoWorkspace();
-  const workspacePath = validAttachmentWorkspace(requestedWorkspacePath, entityRequest);
+  const workspacePath = await validAttachmentWorkspace(requestedWorkspacePath, entityRequest);
   if (!workspacePath) {
     return { ok: false, canceled: false, files: [], error: "没有找到该项目或人物的固定资料目录。" };
   }
@@ -1006,35 +1010,17 @@ async function handleLibraryToolCall(params) {
 }
 
 function invalidateDocumentLibraryCache() {
-  documentLibraryCache = {
-    key: "",
-    expiresAt: 0,
-    snapshot: null
-  };
+  documentLibraryService.invalidate();
 }
 
-function readDocumentLibrary(request = {}) {
+async function readDocumentLibrary(request = {}) {
   try {
-    const location = currentDocumentLibraryLocation();
-    const cacheKey = `${path.resolve(location.rootPath)}\0${location.initializeStructure ? "1" : "0"}`;
-    if (
-      request?.force !== true
-      && documentLibraryCache.key === cacheKey
-      && documentLibraryCache.expiresAt > Date.now()
-      && documentLibraryCache.snapshot
-    ) {
-      return documentLibraryCache.snapshot;
+    const location = documentLibraryLocation(getAppSettings().load().settings);
+    const snapshot = await documentLibraryService.list(location, request);
+    if (!snapshot.ok) throw new Error(snapshot.error);
+    if (documentLibraryLocation(getAppSettings().load().settings).rootPath === location.rootPath) {
+      getDocumentSearchService().scheduleIndex(location.rootPath, request?.force === true);
     }
-    const snapshot = {
-      ...listDocumentLibrary(location.rootPath),
-      structured: location.initializeStructure
-    };
-    getDocumentSearchService().scheduleIndex(location.rootPath, request?.force === true);
-    documentLibraryCache = {
-      key: cacheKey,
-      expiresAt: Date.now() + DOCUMENT_LIBRARY_CACHE_TTL_MS,
-      snapshot
-    };
     return snapshot;
   } catch (error) {
     return {
@@ -1051,21 +1037,43 @@ function readDocumentLibrary(request = {}) {
   }
 }
 
-function createDocumentLibraryItem(request) {
+async function createDocumentLibraryItem(request) {
   try {
-    const location = currentDocumentLibraryLocation();
-    const created = createDocumentLibraryEntry(location.rootPath, request);
-    invalidateDocumentLibraryCache();
-    return {
-      ...created,
-      snapshot: readDocumentLibrary({ force: true })
-    };
+    const location = documentLibraryLocation(getAppSettings().load().settings);
+    const created = await documentLibraryService.create(location, request);
+    if (created.ok && created.kind === "markdown"
+      && documentLibraryLocation(getAppSettings().load().settings).rootPath === location.rootPath) {
+      // Index only the new file; creating an empty folder needs no index work.
+      // Indexing is best effort and must not turn a successful write into an error.
+      try { getDocumentSearchService().updateFile(location.rootPath, created.path); }
+      catch (error) { appendRuntimeLog("document-create-index-failed", { error: error.message || String(error) }); }
+    }
+    return created;
   } catch (error) {
     return {
       ok: false,
       error: error instanceof Error ? error.message : String(error)
     };
   }
+}
+
+async function moveDocumentLibraryItem(request) {
+  try {
+    const settings = getAppSettings().load().settings;
+    const location = { ...documentLibraryLocation(settings), databasePath: settings.storageBackend === 'local' ? settings.localDatabasePath : '' };
+    const result = await documentLibraryService.move(location, request);
+    if (result.ok && !result.unchanged) {
+      researchAllowedPaths.delete(result.previousPath);
+      researchAllowedPaths.add(result.path);
+      try {
+        if (documentLibraryLocation(getAppSettings().load().settings).rootPath === location.rootPath) {
+          getDocumentSearchService().moveFile(location.rootPath, result.previousPath, result.path);
+        }
+      }
+      catch (error) { appendRuntimeLog('document-move-index-failed', { error: error.message || String(error) }); }
+    }
+    return result;
+  } catch (error) { return { ok: false, error: error.message || String(error) }; }
 }
 
 async function openResource(resource) {
@@ -1221,10 +1229,10 @@ async function readPdfDocument(request) {
     if (signature.toString("ascii") !== "%PDF-") {
       return { ok: false, error: "文件扩展名为 PDF，但内容不是有效的 PDF 文件。" };
     }
-    const version=crypto.createHash('sha256').update(await fs.promises.readFile(resolved)).digest('hex');
+    researchAllowedPaths.add(fs.realpathSync(resolved));
+    const version = await getResearchStore().fingerprint(resolved);
     const after=await fs.promises.stat(resolved);if(after.size!==stat.size||after.mtimeMs!==stat.mtimeMs)return {ok:false,error:'读取期间 PDF 已变化，请重试。'};
 
-    researchAllowedPaths.add(fs.realpathSync(resolved));
     return {
       ok: true,
       document: {
@@ -1575,7 +1583,8 @@ function criticalUpdateActivity() {
     codex: activeRuns.size,
     postProcessing: pendingRunPostProcessing.size,
     coordinated: coordinatedOperations,
-    domi: Number(domiOperations.total || 0)
+    domi: Number(domiOperations.total || 0),
+    research: researchStore?.activeCount || 0
   };
   return {
     counts,
@@ -2243,7 +2252,7 @@ function queueRunPostProcessing(run, type, completedAt) {
           return true;
         })()
       : Promise.resolve(false);
-    const cacheWorkspaceValid = updateResearchCache && researchCacheWorkspaceIsCurrent(run);
+    const cacheWorkspaceValid = updateResearchCache && await researchCacheWorkspaceIsCurrent(run);
     const cacheTask = cacheWorkspaceValid
       ? enqueueResearchCacheWrite(() => updateProjectResearchCache({
             stateStore: getStateStore(),
@@ -2879,10 +2888,17 @@ async function saveRuntimeSettings(request) {
     "wikiSpaceId",
     "taskDocumentUrl",
     "localLibraryDir",
+    "localDatabasePath",
     "localRepositoryDir"
   ].some((key) => Object.prototype.hasOwnProperty.call(settingsRequest, key)
     && settingsRequest[key] !== current[key]);
   const connectionChanged = codexConnectionChanged || dataConnectionChanged;
+  if (dataConnectionChanged && ((domiIntegration?.localRepositoryService.activeCount || 0)
+    + (domiIntegration?.databaseMaterializationQueues.size || 0)
+    + (domiIntegration?.localSyncPromises.size || 0)
+    + (researchStore?.activeCount || 0) > 0)) {
+    return { ok: false, error: '资料读取或保存正在完成，请稍后修改资料库连接。' };
+  }
   if (connectionChanged) {
     const maintenance = prepareCodexConnectionMaintenance(
       "请先停止正在执行的用户任务，再修改 Codex 或资料库连接。"
@@ -2906,6 +2922,8 @@ async function saveRuntimeSettings(request) {
     )) {
       allowedMarkdownAssetPaths.clear();
       pdfPreviewRegistry.clear();
+      researchAllowedPaths.clear();
+      documentSearchService?.adoptRoot(documentLibraryLocation(result.settings).rootPath);
       // 资料库根目录变化时重建自动镜像监听；镜像账本在下次同步时重新对账。
       startLibraryMirrorWatcher();
     }
@@ -3473,7 +3491,7 @@ async function runCodex(sender, payload) {
     libraryAccess = !restricted && (payload?.workflowId === "connection-guidance" || payload?.privateOutput === true)
       ? null : await prepareLibraryAccess(settings, sender, runId, payload);
     if (restricted && questionNeedsLibrary(payload) && !libraryAccess) throw new Error("未能建立本轮受限资料会话，本轮未运行。");
-    const researchCacheScope = restricted ? { allowed: false, workspacePath: "" } : projectResearchCacheScope(payload, workspacePath);
+    const researchCacheScope = restricted ? { allowed: false, workspacePath: "" } : await projectResearchCacheScope(payload, workspacePath);
     const researchCachePromise = restricted ? Promise.resolve({ context: "", cacheHit: false, identity: null, inventory: null, previous: null }) : prepareProjectResearchCache({
       stateStore: getStateStore(),
       payload: {
@@ -3676,7 +3694,7 @@ async function runAgentCli(sender, payload, {
     };
   }
   const args = buildAgentCliArgs(engine, settings, payload);
-  const researchCacheScope = projectResearchCacheScope(payload, workspacePath);
+  const researchCacheScope = await projectResearchCacheScope(payload, workspacePath);
   const researchCachePromise = prepareProjectResearchCache({
     stateStore: getStateStore(),
     payload: {
@@ -4194,9 +4212,7 @@ function startLibraryMirrorWatcher() {
   stopLibraryMirrorWatcher();
   try {
     libraryMirrorWatcher = fs.watch(root, { recursive: true }, (_event, fileName) => {
-      const segments = String(fileName || "").split(/[\\/]/);
-      const base = segments[segments.length - 1] || "";
-      if (!/\.(md|markdown)$/i.test(base)) return;
+      if (!isMirrorWatchTarget(fileName)) return;
       scheduleMirrorFileSync("file-change");
     });
     libraryMirrorWatcherRoot = root;
@@ -4969,7 +4985,10 @@ app.on("before-quit", (event) => {
     const remaining = await drainRunPostProcessing();
     appendRuntimeLog("app-postprocess-drained", { remaining });
     await domiIntegration?.shutdownAllPlaudOperations("app-quit");
+    await domiIntegration?.closeLocalRepository();
+    await researchStore?.close();
     await documentSearchService?.close();
+    await documentLibraryService.close();
     await libraryToolGateway.close();
     updateService?.stop();
     clearInterval(knowledgeTranslationTimer);
@@ -4980,7 +4999,13 @@ app.on("before-quit", (event) => {
     if (remaining === 0) stateStore?.close();
     applicationQuitFlushComplete = true;
     app.quit();
-  })();
+  })().catch(async error => {
+    applicationQuitFlushStarted = false;
+    appendRuntimeLog('app-quit-failed', { error: error.message || String(error) });
+    const win = BrowserWindow.getAllWindows().find(candidate => !candidate.isDestroyed());
+    if (win) await dialog.showMessageBox(win, { type: 'warning', title: '后台操作尚未安全结束',
+      message: '窗口已保留，请稍后再退出 domi。', detail: error.message || String(error), buttons: ['返回等待'], noLink: true });
+  });
 });
 
 app.on("window-all-closed", () => {
@@ -5126,6 +5151,7 @@ ipcMain.handle("document-library:search", (_event, request) => searchDocumentLib
 ipcMain.handle("document-library:create", (_event, request) =>
   createDocumentLibraryItem(request)
 );
+ipcMain.handle('document-library:move', (_event, request) => moveDocumentLibraryItem(request));
 ipcMain.handle("domi:subscription-digest-finalize", async (_event, request) => {
   const settings = getAppSettings().load().settings;
   if (settings.storageBackend !== "local" || !settings.localRepositoryDir) return { ok: false, error: "订阅日报需要本地资料库。" };
@@ -5279,7 +5305,7 @@ ipcMain.handle("domi:database-delete", async (_event, request) => {
 });
 ipcMain.handle("domi:database-classify", async (_event, request) => {
   try {
-    const result = getDomiIntegration().classifyDatabaseProject(request);
+    const result = await getDomiIntegration().classifyDatabaseProject(request);
     if (result.ok) {
       serviceCoordinator.invalidate("domi:database-list");
       serviceCoordinator.invalidate("domi:weekly-news:");

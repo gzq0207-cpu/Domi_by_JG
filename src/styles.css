@@ -2192,6 +2192,14 @@ body.panel-resizing .main-grid {
   height: 24px;
 }
 
+.document-library-node-row.drop-target,
+.document-library-root-row.drop-target {
+  background: var(--selected);
+  box-shadow: inset 0 0 0 2px var(--accent, #557969);
+}
+.document-library-node-row[draggable="true"] { cursor: grab; }
+.document-library-node-row[draggable="true"]:active { cursor: grabbing; }
+
 .document-library-create {
   position: relative;
   display: grid;

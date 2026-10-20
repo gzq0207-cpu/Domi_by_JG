@@ -10,6 +10,7 @@ const {
 } = require("./document-library.cjs");
 const { LocalDomiRepository, resolveHomePath } = require("./local-domi-repository.cjs");
 const { runLocalDomiSync } = require("./local-domi-sync-runner.cjs");
+const { LocalRepositoryService } = require('./local-repository-service.cjs');
 const { LocalToFeishuMigration } = require("./local-to-feishu-migration.cjs");
 const { FeishuMarkdownPublisher } = require("./feishu-markdown-publisher.cjs");
 const { resolveBundledLarkRuntime } = require("./lark-runtime.cjs");
@@ -1176,6 +1177,7 @@ class DomiIntegration {
     podcastCacheDir,
     radarSourceService,
     localSyncRunner,
+    localRepositoryService,
     execFileFactory,
     sleep
   }) {
@@ -1201,6 +1203,7 @@ class DomiIntegration {
     this.databaseMaterializationQueues = new Map();
     this.localSyncPromises = new Map();
     this.localSyncRunner = localSyncRunner || runLocalDomiSync;
+    this.localRepositoryService = localRepositoryService || new LocalRepositoryService();
     this.larkCommandQueue = new TaskQueue(2);
     this.larkStatusCache = {
       value: null,
@@ -1402,16 +1405,13 @@ class DomiIntegration {
     }));
   }
 
-  entityWorkspace(request) {
+  async entityWorkspace(request) {
     const entityType = request?.entityType === "person" ? "person" : "project";
     const recordId = String(request?.recordId || "").trim();
     if (!recordId) return "";
     const projectConfig = this.readProjectConfig();
     if (projectConfig.backend !== "local") return "";
-    return this.withLocalRepository(
-      projectConfig,
-      (repository) => repository.recordDirectory(entityType, recordId)
-    ) || "";
+    return await this.localRepositoryService.call(projectConfig, 'recordDirectory', [entityType, recordId]) || "";
   }
 
   async entityMaterials(request) {
@@ -1425,7 +1425,7 @@ class DomiIntegration {
 
     const projectConfig = this.readProjectConfig();
     if (projectConfig.backend === "local") {
-      const entityRoot = this.entityWorkspace({ entityType, recordId });
+      const entityRoot = await this.entityWorkspace({ entityType, recordId });
       const files = entityRoot
         ? await this.listEntityDirectoryFiles(entityRoot)
         : [];
@@ -1603,6 +1603,11 @@ class DomiIntegration {
       repository.close();
       throw error;
     }
+  }
+
+  async closeLocalRepository() {
+    await Promise.allSettled([...this.databaseMaterializationQueues.values()]);
+    await this.localRepositoryService.close();
   }
 
   async syncLocalRepository(source) {
@@ -1891,7 +1896,7 @@ class DomiIntegration {
         + larkQueue.pendingCount
         + (this.feishuAppConfiguration && !this.feishuAppConfiguration.settled ? 1 : 0),
       podcasts: this.podcastProcessPromises.size,
-      databaseWrites: this.databaseMaterializationQueues.size
+      databaseWrites: this.databaseMaterializationQueues.size + this.localRepositoryService.activeCount
     };
     return {
       ...snapshot,
@@ -3273,17 +3278,17 @@ class DomiIntegration {
     try {
       source = this.readRadarConfig();
       if (source.backend === "local") {
-        const items = this.withLocalRepository(source, (repository) => repository.listNews({
+        const items = await this.localRepositoryService.call(source, 'listNews', [{
           rangeStart: rangeStart.getTime(),
           rangeEnd: rangeEnd.getTime(),
           limit: 500
-        }));
+        }]);
         this.stateStore.upsertNews(items);
-        const olderItems = this.withLocalRepository(source, (repository) => repository.listNews({
+        const olderItems = await this.localRepositoryService.call(source, 'listNews', [{
           rangeStart: 0,
           rangeEnd: rangeStart.getTime(),
           limit: 1
-        }));
+        }]);
         const timestamps = resolveWeeklyNewsTimestamps(cachedPage, items);
         const snapshot = {
           ok: true,
@@ -4208,7 +4213,7 @@ class DomiIntegration {
     });
   }
 
-  databaseSnapshot() {
+  async databaseSnapshot() {
     const source = this.readProjectConfig();
     if (source.backend !== "local") {
       return {
@@ -4224,30 +4229,14 @@ class DomiIntegration {
         error: "客户端内直接编辑数据库目前仅支持本地资料库；飞书资料库请继续通过同步工作流维护。"
       };
     }
-    const snapshot = this.withLocalRepository(source, (repository) => {
-      repository.cleanupStructuralGhostProjects();
-      return {
-        ok: true,
-        backend: "local",
-        editable: true,
-        loadedAt: Date.now(),
-        projects: repository.listProjects(),
-        people: repository.listPeople(),
-        news: repository.listAllNews(),
-        taxonomy: repository.listTaxonomy(),
-        classificationReviews: repository.listClassificationReviews()
-      };
-    });
-    const pending = this.withLocalRepository(source, (repository) =>
-      repository.listPendingMaterializations()
-    );
+    const { snapshot, pending } = await this.localRepositoryService.call(source, 'snapshot');
     for (const item of pending) {
       this.scheduleDatabaseMaterialization(source, item.entityType, item.recordId);
     }
     return snapshot;
   }
 
-  previewDatabaseRecord(request = {}) {
+  async previewDatabaseRecord(request = {}) {
     const source = this.readProjectConfig();
     if (source.backend !== "local") {
       return {
@@ -4255,12 +4244,10 @@ class DomiIntegration {
         error: "客户端内文档预览目前仅支持本地资料库。"
       };
     }
-    return this.withLocalRepository(source, (repository) =>
-      repository.resolvePreviewDocument(request.entityType, request.recordId)
-    );
+    return this.localRepositoryService.call(source, 'resolvePreviewDocument', [request.entityType, request.recordId]);
   }
 
-  deleteDatabaseRecord(request = {}) {
+  async deleteDatabaseRecord(request = {}) {
     const source = this.readProjectConfig();
     if (source.backend !== "local") {
       return {
@@ -4268,9 +4255,7 @@ class DomiIntegration {
         error: "客户端内删除目前仅支持本地资料库。"
       };
     }
-    const result = this.withLocalRepository(source, (repository) =>
-      repository.deleteDatabaseRecord(request)
-    );
+    const result = await this.localRepositoryService.call(source, 'deleteDatabaseRecord', [request]);
     this.materialIndexCache.clear();
     let snapshot;
     if (result.entityType === "project" || result.entityType === "person") {
@@ -4310,12 +4295,9 @@ class DomiIntegration {
       };
     }
     const entityType = String(request.entityType || "");
-    const record = this.withLocalRepository(source, (repository) => {
-      if (entityType === "project") return repository.updateProject(request.record);
-      if (entityType === "person") return repository.updatePerson(request.record);
-      if (entityType === "news") return repository.updateNews(request.record);
-      throw new Error("不支持的资料库记录类型。");
-    });
+    const method = { project: 'updateProject', person: 'updatePerson', news: 'updateNews' }[entityType];
+    if (!method) throw new Error("不支持的资料库记录类型。");
+    const record = await this.localRepositoryService.call(source, method, [request.record]);
     this.materialIndexCache.clear();
     let snapshot;
     if (entityType === "project" || entityType === "person") {
@@ -4361,9 +4343,7 @@ class DomiIntegration {
         let lastError;
         for (let attempt = 0; attempt < 3; attempt += 1) {
           try {
-            return this.withLocalRepository(source, (repository) =>
-              repository.materializeDatabaseRecord(entityType, recordId)
-            );
+            return await this.localRepositoryService.call(source, 'materializeDatabaseRecord', [entityType, recordId]);
           } catch (error) {
             lastError = error;
             if (attempt < 2) await this.sleep(25 * (attempt + 1));
@@ -4390,9 +4370,7 @@ class DomiIntegration {
       };
     }
     const entityType = String(request.entityType || "");
-    const result = this.withLocalRepository(source, (repository) =>
-      repository.updateDatabaseRecordPatch(request)
-    );
+    const result = await this.localRepositoryService.call(source, 'updateDatabaseRecordPatch', [request]);
     const record = result.record;
     this.materialIndexCache.clear();
     let snapshot;
@@ -4434,7 +4412,7 @@ class DomiIntegration {
     };
   }
 
-  classifyDatabaseProject(request = {}) {
+  async classifyDatabaseProject(request = {}) {
     const source = this.readProjectConfig();
     if (source.backend !== "local") {
       return {
@@ -4442,9 +4420,7 @@ class DomiIntegration {
         error: "分类审核目前仅支持本地资料库。"
       };
     }
-    const result = this.withLocalRepository(source, (repository) =>
-      repository.applyProjectClassification(request)
-    );
+    const result = await this.localRepositoryService.call(source, 'applyProjectClassification', [request]);
     this.materialIndexCache.clear();
     if (result.record) {
       const cached = this.stateStore.loadCache(CACHE_KEY)?.value;

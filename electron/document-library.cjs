@@ -334,13 +334,13 @@ function documentNode(rootPath, filePath, name, stat, kind, children) {
   };
 }
 
+// Reuse ICU's collator: localeCompare with options constructs one on every
+// comparison, which becomes expensive when sorting a large directory.
+const documentNameCollator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
 function compareNodes(left, right) {
   if (left.kind === "folder" && right.kind !== "folder") return -1;
   if (right.kind === "folder" && left.kind !== "folder") return 1;
-  return left.name.localeCompare(right.name, "zh-CN", {
-    numeric: true,
-    sensitivity: "base"
-  });
+  return documentNameCollator.compare(left.name, right.name);
 }
 
 function listDocumentLibrary(rootPath, options = {}) {
@@ -357,7 +357,16 @@ function listDocumentLibrary(rootPath, options = {}) {
       truncated = true;
       return [];
     }
-    const entries = fs.readdirSync(directoryPath, { withFileTypes: true });
+    let entries;
+    try {
+      entries = fs.readdirSync(directoryPath, { withFileTypes: true });
+    } catch (error) {
+      // A directory can disappear during a refresh, or be temporarily locked.
+      // Preserve the rest of the tree and disclose that this scan is partial.
+      if (directoryPath === resolvedRoot) throw error;
+      truncated = true;
+      return [];
+    }
     const nodes = [];
     for (const entry of entries) {
       if (nodeCount >= maximumNodes) {
@@ -439,6 +448,8 @@ function createDocumentLibraryEntry(rootPath, request = {}) {
     request.parentPath ? request.parentPath : resolvedRoot
   );
   const parentStat = fs.statSync(parentPath);
+  // Reject junctions/symlinks that would write outside the library.
+  assertInsideRoot(fs.realpathSync(resolvedRoot), fs.realpathSync(parentPath));
   if (!parentStat.isDirectory()) {
     throw new Error("请选择一个文件夹作为新内容的位置。");
   }
@@ -457,7 +468,11 @@ function createDocumentLibraryEntry(rootPath, request = {}) {
     ok: true,
     kind,
     path: targetPath,
-    name
+    name,
+    rootPath: resolvedRoot,
+    parentPath,
+    node: documentNode(resolvedRoot, targetPath, name, fs.statSync(targetPath), kind,
+      kind === "folder" ? [] : undefined)
   };
 }
 
@@ -469,6 +484,7 @@ module.exports = {
   assertInsideRoot,
   createDocumentLibraryEntry,
   documentLibraryLocation,
+  documentNode,
   domiWorkspaceRoot,
   ensureDocumentLibraryStructure,
   ensureLocalTodoDocument,

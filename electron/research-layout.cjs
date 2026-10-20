@@ -7,19 +7,20 @@ function industry(value = '其他行业') {
 }
 function industryFromPath(relative) { return segments.find(item => item.directory === relative.split(/[\\/]/)[0]); }
 function isWithin(root, file) { const relative = path.relative(root,file); return relative === '' || (relative !== '..' && !relative.startsWith('..'+path.sep) && !path.isAbsolute(relative)); }
-function rebaseLink(value, from, to) {
+function rebaseLink(value, from, to, moveContents = true) {
   if (!value || value.startsWith('#') || (/^[a-z][a-z\d+.-]*:/i.test(value) && !/^[a-z]:[\\/]/i.test(value)) || value.startsWith('//')) return value;
   const split = value.search(/[?#]/), local = split < 0 ? value : value.slice(0,split), suffix = split < 0 ? '' : value.slice(split);
   let decoded; try { decoded = decodeURIComponent(local); } catch { decoded = local; }
-  const original = path.resolve(from,decoded), target = isWithin(from,original) ? path.join(to,path.relative(from,original)) : original;
-  return (path.relative(to,target) || '.').split(path.sep).join('/') + suffix;
+  const original = path.resolve(from,decoded), target = moveContents && isWithin(from,original) ? path.join(to,path.relative(from,original)) : original;
+  const relative = (path.relative(to,target) || '.').split(path.sep).join('/');
+  return (!moveContents ? relative.replace(/%/g, '%25').replace(/#/g, '%23').replace(/\?/g, '%3F').replace(/ /g, '%20').replace(/\(/g, '%28').replace(/\)/g, '%29') : relative) + suffix;
 }
-function rebaseFreeMarkdown(content, from, to) {
+function rebaseFreeMarkdown(content, from, to, moveContents = true) {
   const transform = text => text.replace(/(!?\[[^\]\n]*\]\()(<[^>\n]*>|[^\s)\n]+)([^)\n]*\))/g,(_all,start,destination,end) => {
     const angle = destination.startsWith('<'), raw = angle ? destination.slice(1,-1) : destination;
-    const updated = rebaseLink(raw,from,to); return `${start}${angle ? '<'+updated+'>' : updated}${end}`;
+    const updated = rebaseLink(raw,from,to,moveContents); return `${start}${angle ? '<'+updated+'>' : updated}${end}`;
   }).replace(/^(\s{0,3}\[[^\]]+\]:\s*)(<[^>\n]*>|[^\s]+)/,(_all,start,destination) => {
-    const angle = destination.startsWith('<'), updated = rebaseLink(angle ? destination.slice(1,-1) : destination,from,to);
+    const angle = destination.startsWith('<'), updated = rebaseLink(angle ? destination.slice(1,-1) : destination,from,to,moveContents);
     return start+(angle ? '<'+updated+'>' : updated);
   });
   let fence = '';
@@ -50,4 +51,5 @@ function rebaseTopicContent(content, from, to, name, markdown) {
   else result=result.replace(/^(domiResearchId: .+)$/m,`$1\ndomiResearchIndustry: ${name}`);
   return result;
 }
-module.exports={ segments, industry, industryFromPath, isWithin, rebaseTopicContent };
+module.exports={ segments, industry, industryFromPath, isWithin, rebaseTopicContent,
+  rebaseDocumentContent: (content, fromFile, toFile) => rebaseFreeMarkdown(content, path.dirname(fromFile), path.dirname(toFile), false) };

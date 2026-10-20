@@ -8,8 +8,11 @@ const {
   MIRROR_SPACE_NAME,
   directoryChainOf,
   isMirrorTarget,
+  isMirrorWatchTarget,
   mirrorTargetFiles,
+  mirrorTargetFilesAsync,
   sha256File,
+  sha256FileAsync,
   verifyMirrorText
 } = require("../electron/feishu-wiki-mirror.cjs");
 
@@ -23,6 +26,30 @@ function makeLibrary() {
   };
   return { root, write };
 }
+
+test("background mirror traversal and streaming hashes match their synchronous results", async () => {
+  const { root, write } = makeLibrary();
+  try {
+    const file = write('07.模型层/_行业认知/动态/2026/10/正文.md', '# 正文\n' + '研究内容。'.repeat(100_000));
+    write('13.认知库/订阅日报/日报.md');
+    write('13.认知库/订阅日报/.sources/内部.md');
+    write('03.算力芯片/普通笔记.md');
+    assert.deepEqual(await mirrorTargetFilesAsync(root), mirrorTargetFiles(root));
+    const pending = sha256FileAsync(file);
+    let yielded = false;
+    setImmediate(() => { yielded = true; });
+    assert.equal(await pending, sha256File(file));
+    assert.equal(yielded, true, 'hashing must yield to IPC/window events between reads');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("mirror watcher ignores ordinary notes and hidden backups", () => {
+  assert.equal(isMirrorWatchTarget('03.算力芯片/普通笔记.md'), false);
+  assert.equal(isMirrorWatchTarget('13.认知库/订阅日报/.sources/内部.md'), false);
+  assert.equal(isMirrorWatchTarget('07.模型层/_行业认知/动态/2026/10/正文.md'), true);
+  assert.equal(isMirrorWatchTarget('12.人脉\\某人\\人物主页.md'), true);
+  assert.equal(isMirrorWatchTarget('07.模型层/公司/项目主页.md'), true);
+});
 
 test("mirrorTargetFiles selects news, digests and entity homepages only", () => {
   const { root, write } = makeLibrary();
@@ -246,7 +273,7 @@ test("sync tolerates remote images and rewrites relative links (lenient mirror m
     "[阅读原文](art_x-原文.md)",
     "07.模型层/_行业认知/动态/2026/09"
   );
-  assert.ok(/^\[阅读原文\]\(https:\/\/example\.feishu\.cn\/wiki\/nt_doc_1\)$/.test(rewritten), rewritten);
+  assert.equal(rewritten, `[阅读原文](${ledger.documents["07.模型层/_行业认知/动态/2026/09/art_x-原文.md"].url})`);
   const fallback = mirrorInstance.rewriteRelativeMarkdownLinks(
     "[未知](不存在.md)",
     "07.模型层/_行业认知/动态/2026/09"

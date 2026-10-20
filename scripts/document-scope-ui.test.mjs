@@ -8,7 +8,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { chromium } from "playwright";
-import { createServer } from "vite";
+import { createServer, preview } from "vite";
 
 const { LibrarySession, verifyCitationOriginal } = createRequire(import.meta.url)("../electron/library-tools.cjs");
 const { ResearchStore } = createRequire(import.meta.url)('../electron/research-store.cjs');
@@ -42,8 +42,12 @@ const errors = [];
 const savedMarkdown = [];
 let releaseHeldQuestion;
 try {
-  server = await createServer({ root, cacheDir: path.join(directory, "vite"), logLevel: "error", server: { host: "127.0.0.1", port: 0, strictPort: false, hmr: false } });
-  await server.listen();
+  if (process.argv.includes('--production')) {
+    server = await preview({ root, configFile: false, logLevel: 'error', preview: { host: '127.0.0.1', port: 0 }, build: { outDir: path.join(root, 'dist') } });
+  } else {
+    server = await createServer({ root, cacheDir: path.join(directory, "vite"), logLevel: "error", server: { host: "127.0.0.1", port: 0, strictPort: false, hmr: false } });
+    await server.listen();
+  }
   const origin = `http://127.0.0.1:${server.httpServer.address().port}`;
   browser = await chromium.launch({ headless: true });
   page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
@@ -122,14 +126,88 @@ try {
     };` });
   await page.route("**/*", (route) => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
   await page.goto(origin, { waitUntil: "networkidle" });
+  const input = page.getByRole("textbox", { name: "输入投资任务" });
   await page.getByRole("button", { name: "选择文档", exact: true }).click();
   let picker = page.getByRole("dialog", { name: "选择提问文档" });
+  await picker.getByRole('button', { name: '取消', exact: true }).click();
+  await page.getByRole('button', { name: '模型直答', exact: true }).click();
+  await input.fill('联系 analyst@example.com');
+  assert.equal(await page.getByRole('listbox', { name: '资料库文档候选' }).count(), 0, 'emails do not open mentions');
+  await input.fill('@没有这份文档');
+  await page.getByText('没有匹配的文档，请修改 @ 后的名称或文件夹。', { exact: true }).waitFor();
+  await input.press('Enter');
+  await page.locator('.send-button[type=submit]').click();
+  assert.equal(requests.length, 0, 'a pending mention cannot send an unrestricted/model question');
+  await input.press('Escape');
+  assert.equal(await page.getByRole('listbox', { name: '资料库文档候选' }).count(), 0);
+  await input.fill('请分析 @说明');
+  let mentions = page.getByRole('listbox', { name: '资料库文档候选' });
+  await mentions.getByRole('option').first().waitFor();
+  assert.equal(await mentions.getByRole('option').count(), 2);
+  assert.match(await mentions.innerText(), /公司研究\/收入说明.md/);
+  // Confirming Chinese input must neither select a document nor submit.
+  await input.dispatchEvent('compositionstart');
+  await input.dispatchEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 229, isComposing: true });
+  assert.equal(requests.length, 0);
+  assert.equal(await page.locator('.attachment-chip').count(), 0);
+  await input.dispatchEvent('compositionend');
+  await mentions.waitFor();
+  await input.press('ArrowDown');
+  assert.equal(await input.getAttribute('aria-activedescendant'), 'composer-document-mention-1');
+  await input.press('ArrowUp');
+  assert.equal(await input.getAttribute('aria-activedescendant'), 'composer-document-mention-0');
+  await mentions.getByRole('option', { name: /收入说明.md/ }).click();
+  assert.equal(await page.getByLabel('资料来源范围').inputValue(), 'selected', '@ overrides model mode');
+  assert.equal(await input.inputValue(), '请分析 ');
+  assert.equal(await page.locator('.attachment-chip').count(), 1);
+  assert.equal(requests.length, 0, 'clicking a candidate adds a document without sending');
+  await input.fill('@收入');
+  await mentions.getByRole('option', { name: /收入说明.md/ }).waitFor();
+  if (process.env.DOMI_MENTION_SCREENSHOT) await page.screenshot({ path: process.env.DOMI_MENTION_SCREENSHOT });
+  await input.press('Enter');
+  assert.equal(await page.locator('.attachment-chip').count(), 1, 'repeated mentions do not duplicate the file');
+  await page.getByRole('button', { name: 'Both · 两者结合', exact: true }).click();
+  await input.fill('收入来自哪里？ ＠风险');
+  await mentions.getByRole('option', { name: /风险说明.md/ }).waitFor();
+  await input.press('Tab');
+  assert.equal(await page.getByLabel('资料来源范围').inputValue(), 'selected', '@ overrides Both mode');
+  assert.equal(await page.locator('.attachment-chip').count(), 2);
+  assert.equal(await input.inputValue(), '收入来自哪里？ ');
+  assert.equal(requests.length, 0, 'Tab selects rather than sending');
+  // A query in the middle of the question preserves the suffix and caret.
+  await input.fill('比较 @收入 和风险');
+  await input.press('Home');
+  for (let index = 0; index < 6; index++) await input.press('ArrowRight');
+  await mentions.getByRole('option', { name: /收入说明.md/ }).click();
+  assert.equal(await input.inputValue(), '比较  和风险');
+  // The full batch picker can take over an unfinished @ without leaving a
+  // stale token or retaining model mode. Cancel must preserve the draft.
+  await page.getByRole('button', { name: '模型直答', exact: true }).click();
+  await input.fill('继续比较 @收入');
+  await mentions.waitFor();
+  await page.locator('.composer-scope-picker').click();
+  picker = page.getByRole('dialog', { name: '选择提问文档' });
+  await picker.getByRole('button', { name: '取消', exact: true }).click();
+  assert.equal(await input.inputValue(), '继续比较 @收入');
+  assert.equal(await page.getByRole('button', { name: '模型直答', exact: true }).getAttribute('aria-pressed'), 'true');
+  await input.fill('收入来自哪里？ @风险');
+  await mentions.waitFor();
+  await page.locator('.composer-scope-picker').click();
+  picker = page.getByRole('dialog', { name: '选择提问文档' });
+  await picker.getByRole('button', { name: '仅用这 2 份文档', exact: true }).click();
+  assert.equal(await input.inputValue(), '收入来自哪里？ ');
+  assert.equal(await page.getByLabel('资料来源范围').inputValue(), 'selected');
+  await page.waitForFunction(() => JSON.parse(localStorage.getItem('domi.composerDrafts.v1') || '{}').qa?.attachments.length === 2);
+  await page.reload({ waitUntil: 'networkidle' });
+  assert.equal(await page.locator('.attachment-chip').count(), 2, '@ scope survives reload');
+  assert.equal(await page.getByLabel('资料来源范围').inputValue(), 'selected');
+  await page.locator('.composer-scope-picker').click();
+  picker = page.getByRole("dialog", { name: "选择提问文档" });
   await picker.getByRole("button", { name: "展开 公司研究" }).click();
   await picker.getByRole("checkbox", { name: "选中 收入说明.md", exact: true }).check();
   await picker.getByRole("checkbox", { name: "选中 风险说明.md", exact: true }).check();
   await picker.getByRole("button", { name: "仅用这 2 份文档" }).click();
   assert.equal(await page.getByLabel("资料来源范围").inputValue(), "selected");
-  const input = page.getByRole("textbox", { name: "输入投资任务" });
   await input.fill("收入来自哪里？");
   await page.locator(".send-button[type=submit]").click();
   await page.getByRole("button", { name: /查看引用 1/ }).first().waitFor();
@@ -319,13 +397,16 @@ try {
   const screenshot = process.env.DOMI_SCOPE_SCREENSHOT || path.join(directory, "scope-preview.png");
   await page.screenshot({ path: screenshot });
   assert.deepEqual(errors, []);
-  process.stdout.write(JSON.stringify({ ok: true, checks: ["multi-selection", "exact paths forwarded", "no history resume", "global retrieval denied", "out-of-scope reads denied", "verified citation click and original line", "follow-up scope", "cancel selection", "source retention", "scope persistence after reload", "changed scope on later turn", "quote selection and repeat deduplication", "quote preserves question draft", "quote does not auto-send", "quote remove and reload recovery", "quoted request carries original text", "sent quote clears and source persists", "model mode sends quote without files", "both sections and verified source", "mode survives reload", "queued mode snapshot survives later switches", "no page errors"], screenshot: process.env.DOMI_MODE_SCREENSHOT || process.env.DOMI_QUESTION_SCREENSHOT || process.env.DOMI_SCOPE_SCREENSHOT || undefined }) + "\n");
+  process.stdout.write(JSON.stringify({ ok: true, checks: ["@ filename and folder search", "@ keyboard and mouse selection without sending", "@ excludes emails", "@ respects Chinese composition", "@ no-match send guard", "@ forces selected scope from model and Both", "@ deduplication and fullwidth input", "@ caret and suffix preservation", "@ full picker handoff and cancellation", "@ scope survives reload", "multi-selection", "exact paths forwarded", "no history resume", "global retrieval denied", "out-of-scope reads denied", "verified citation click and original line", "follow-up scope", "cancel selection", "source retention", "scope persistence after reload", "changed scope on later turn", "quote selection and repeat deduplication", "quote preserves question draft", "quote does not auto-send", "quote remove and reload recovery", "quoted request carries original text", "sent quote clears and source persists", "model mode sends quote without files", "both sections and verified source", "mode survives reload", "queued mode snapshot survives later switches", "no page errors"], screenshot: process.env.DOMI_MENTION_SCREENSHOT || process.env.DOMI_MODE_SCREENSHOT || process.env.DOMI_QUESTION_SCREENSHOT || process.env.DOMI_SCOPE_SCREENSHOT || undefined }) + "\n");
 } catch (error) {
   process.stderr.write(JSON.stringify({ errors, verifications, savedMarkdown:savedMarkdown.map(item=>({path:item.path,newText:item.content.includes('及时批注的新句子')})), annotations:(await research.handle({action:'source',path:notebook.topic.path})).annotations, editorHtml:page ? await page.locator('.right-panel .ProseMirror').evaluateAll(items=>items.map(item=>item.outerHTML)) : [], body: page ? (await page.locator("body").innerText()).slice(-2800) : "" }) + "\n");
   throw error;
 } finally {
   if (browser) await browser.close();
-  if (server) await server.close();
+  if (server) {
+    if (process.argv.includes('--production')) await new Promise(resolve => server.httpServer.close(resolve));
+    else await server.close();
+  }
   research.close();
   assert.ok(directory.startsWith(path.join(os.tmpdir(), "domi-document-scope-ui-")));
   fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });

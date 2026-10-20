@@ -1,0 +1,18 @@
+.composer-mention-anchor { position: relative; }
+.document-mention-menu { position: absolute; bottom: calc(100% + 8px); left: 0; right: 0; z-index: 35; max-height: min(440px, 48vh); overflow-y: auto; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--canvas, #fff); color: var(--text); box-shadow: 0 8px 30px #1d1d1826; font-size: 12px; }
+.document-mention-menu header { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+.document-mention-menu header > span { flex: 1; color: var(--muted); font-size: 11px; }
+.document-mention-menu header > button { margin-left: auto; border: 0; background: transparent; color: var(--muted); padding: 3px; display: flex; cursor: pointer; }
+.document-mention-menu [role=listbox] { padding: 4px; }
+.document-mention-menu [role=option] { display: flex; align-items: center; gap: 9px; width: 100%; border: 0; border-radius: 6px; padding: 7px 8px; background: transparent; color: inherit; text-align: left; cursor: pointer; font: inherit; }
+.document-mention-menu [role=option][aria-selected=true] { background: var(--selected, #edf2ee); }
+.document-mention-menu [role=option] > svg { flex-shrink: 0; color: var(--muted); }
+.document-mention-menu [role=option] > span { flex: 1; min-width: 0; }
+.document-mention-menu [role=option] strong, .document-mention-menu [role=option] small { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.document-mention-menu [role=option] strong { font-weight: 500; }
+.document-mention-menu [role=option] small { margin-top: 3px; color: var(--muted); font-size: 10px; }
+.document-mention-menu [role=option] .document-mention-selected { display: flex; align-items: center; gap: 3px; flex-shrink: 0; color: var(--accent-strong); }
+.document-mention-menu p { margin: 8px 12px; line-height: 1.6; color: var(--muted); }
+.document-mention-menu p button { display: inline-flex; align-items: center; gap: 4px; margin-left: 8px; border: 0; background: transparent; color: var(--accent-strong); cursor: pointer; }
+.document-mention-menu footer { padding: 8px 12px; border-top: 1px solid var(--line); color: var(--muted); font-size: 10px; line-height: 1.7; }
+@media (max-width: 640px) { .document-mention-menu header { gap: 6px; flex-wrap: wrap; } }

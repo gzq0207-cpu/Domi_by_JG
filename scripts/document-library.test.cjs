@@ -136,6 +136,28 @@ test("document library prefers the configured repository root", () => {
   );
 });
 
+test("a disappearing or unreadable subfolder does not blank the entire library", () => {
+  const rootPath = fs.mkdtempSync(path.join(os.tmpdir(), 'domi-library-race-'));
+  const original = fs.readdirSync;
+  try {
+    const unavailable = path.join(rootPath, '正在移动');
+    fs.mkdirSync(unavailable);
+    fs.writeFileSync(path.join(rootPath, '保留.md'), '# 保留\n');
+    fs.readdirSync = (directory, ...args) => {
+      if (directory === unavailable) throw Object.assign(new Error('directory moved'), { code: 'ENOENT' });
+      return original(directory, ...args);
+    };
+    const snapshot = listDocumentLibrary(rootPath);
+    assert.equal(snapshot.ok, true);
+    assert.equal(snapshot.truncated, true);
+    assert.equal(snapshot.documentCount, 1);
+    assert.ok(snapshot.nodes.some(node => node.name === '保留.md'));
+  } finally {
+    fs.readdirSync = original;
+    fs.rmSync(rootPath, { recursive: true, force: true });
+  }
+});
+
 test("legacy project-material folder opens from its containing library root", () => {
   assert.deepEqual(
     documentLibraryLocation({

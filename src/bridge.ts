@@ -341,6 +341,7 @@ const browserFallback: Window["workbench"] = {
     ok: false,
     error: "请在 Electron 窗口中新建本地文档。"
   }),
+  moveDocumentLibraryEntry: async () => ({ ok: false, error: '请在 Domi 桌面应用中移动文档。' }),
   finalizeSubscriptionDigest: async () => ({
     ok: false,
     error: "请在 Electron 窗口中翻译并发布订阅日报。"

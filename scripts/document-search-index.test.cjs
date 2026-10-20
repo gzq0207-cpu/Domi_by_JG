@@ -335,3 +335,25 @@ test("applyOcrToEmptyPages fills only empty pages within the page cap and report
   assert.deepEqual(untouched.pages, ["", "x"]);
   assert.deepEqual(untouched.applied, []);
 });
+
+test('a moved document is searchable at the new path without stale duplicate results', async () => {
+  const sample = fixture();
+  const service = new DocumentSearchService({ databasePath: sample.databasePath });
+  try {
+    const previousPath = path.join(sample.rootPath, '移动测试.md'), filePath = path.join(sample.rootPath, '3.项目库', '移动测试.md');
+    fs.writeFileSync(previousPath, '# 移动检索\n这是唯一移动测试内容。');
+    service.scheduleIndex(sample.rootPath, true);
+    let result;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+      result = await service.search(sample.rootPath, { query: '唯一移动测试' });
+      if (!result.indexing && result.results.length === 1) break;
+    }
+    assert.equal(result.results.length, 1);
+    fs.renameSync(previousPath, filePath);
+    service.moveFile(sample.rootPath, previousPath, filePath);
+    const next = await service.search(sample.rootPath, { query: '唯一移动测试' });
+    assert.equal(next.results.length, 1);
+    assert.equal(next.results[0].path, filePath);
+  } finally { await service.close(); sample.close(); }
+});

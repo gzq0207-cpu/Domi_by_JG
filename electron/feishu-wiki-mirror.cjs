@@ -97,6 +97,12 @@ function sha256File(filePath) {
   return hash.digest("hex");
 }
 
+async function sha256FileAsync(filePath) {
+  const hash = crypto.createHash("sha256");
+  for await (const chunk of fs.createReadStream(filePath)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
 function walkFiles(rootPath, predicate, collector = [], depth = 0) {
   if (depth > 12 || collector.length >= MAX_MIRROR_FILES) return collector;
   let entries;
@@ -145,6 +151,38 @@ function mirrorTargetFiles(libraryRoot) {
   return files
     .map((filePath) => ({ path: filePath, relativePath: path.relative(root, filePath).split(path.sep).join("/") }))
     .sort((left, right) => left.relativePath.localeCompare(right.relativePath, "zh-CN"));
+}
+
+// Runtime scans yield between directory reads. The synchronous helper above
+// remains available for callers that explicitly need a synchronous listing.
+async function mirrorTargetFilesAsync(libraryRoot) {
+  const root = path.resolve(libraryRoot);
+  const files = [];
+  async function visit(directory, depth) {
+    if (depth > 12 || files.length >= MAX_MIRROR_FILES) return;
+    let entries;
+    try { entries = await fs.promises.readdir(directory, { withFileTypes: true }); }
+    catch { return; }
+    for (const entry of entries) {
+      if (files.length >= MAX_MIRROR_FILES) break;
+      if (!entry.name || entry.name.startsWith(".")) continue;
+      const filePath = path.join(directory, entry.name);
+      if (entry.isDirectory()) await visit(filePath, depth + 1);
+      else if (entry.isFile()) {
+        const parts = path.relative(root, filePath).split(path.sep);
+        const name = parts.pop();
+        if (isMirrorTarget(parts, name)) files.push({ path: filePath, relativePath: parts.concat(name).join("/") });
+      }
+    }
+  }
+  await visit(root, 0);
+  return files.sort((left, right) => left.relativePath.localeCompare(right.relativePath, "zh-CN"));
+}
+
+function isMirrorWatchTarget(fileName) {
+  const segments = String(fileName || "").split(/[\\/]/);
+  const base = segments.pop() || "";
+  return isMirrorTarget(segments, base);
 }
 
 // Directory chain for a relative path, e.g. "07.模型层/_行业认知/动态/2026/09/a.md"
@@ -371,11 +409,12 @@ class FeishuWikiMirror {
   }
 
   async prepareDocument(filePath, relativePath) {
-    const stat = fs.statSync(filePath);
+    const stat = await fs.promises.stat(filePath);
     if (stat.size > MAX_DOCUMENT_BYTES) {
       throw new Error(`${path.basename(filePath)} 超过 8 MB，跳过镜像。`);
     }
-    const original = fs.readFileSync(filePath, "utf8");
+    const bytes = await fs.promises.readFile(filePath);
+    const original = bytes.toString("utf8");
     const directory = path.dirname(String(relativePath || ""));
     const relativeDir = directory && directory !== "." ? directory.split(path.sep).join("/") : "";
     const { isSubscriptionDigest, digestDisplayTitle } = require("./subscription-digest.cjs");
@@ -395,7 +434,7 @@ class FeishuWikiMirror {
     return {
       ...prepared,
       title: prepared.title || title,
-      sha256: sha256File(filePath)
+      sha256: crypto.createHash("sha256").update(bytes).digest("hex")
     };
   }
 
@@ -538,7 +577,7 @@ class FeishuWikiMirror {
       return { ok: false, error: "本地资料库目录不可用，无法镜像。" };
     }
     const spaceId = await this.ensureSpace();
-    const targets = mirrorTargetFiles(this.libraryRoot).filter((target) =>
+    const targets = (await mirrorTargetFilesAsync(this.libraryRoot)).filter((target) =>
       !options.relativePaths || options.relativePaths.includes(target.relativePath));
     const result = { ok: true, spaceId, total: targets.length, created: 0, updated: 0, verified: 0, skipped: 0, failed: 0, failures: [] };
     for (const target of targets) {
@@ -546,9 +585,9 @@ class FeishuWikiMirror {
       const entry = this.state.documents[relativePath];
       let sha;
       try {
-        const stat = fs.statSync(target.path);
+        const stat = await fs.promises.stat(target.path);
         if (stat.size > MAX_DOCUMENT_BYTES) throw new Error("超过 8 MB，跳过镜像。");
-        sha = sha256File(target.path);
+        sha = await sha256FileAsync(target.path);
       } catch (error) {
         result.failed += 1;
         result.failures.push({ relativePath, error: error instanceof Error ? error.message : String(error) });
@@ -571,7 +610,7 @@ class FeishuWikiMirror {
             continue;
           }
         }
-        const stat = fs.statSync(target.path);
+        const stat = await fs.promises.stat(target.path);
         if (stat.size > MAX_DOCUMENT_BYTES) {
           throw new Error("超过 8 MB，跳过镜像。");
         }
@@ -627,8 +666,11 @@ module.exports = {
   MIRROR_SPACE_NAME,
   directoryChainOf,
   isMirrorTarget,
+  isMirrorWatchTarget,
   mirrorTargetFiles,
+  mirrorTargetFilesAsync,
   sha256File,
+  sha256FileAsync,
   verifyMirrorText,
   escapeLoneOrderedListStarts: (markdown) => FeishuWikiMirror.escapeLoneOrderedListStarts(markdown)
 };

@@ -155,22 +155,26 @@ function cosineTopK(queryVector, candidate) {
 
 // Streams all embedded chunks in batches and keeps a running top-K. Vectors
 // stay out of long-term memory; each batch is released after scoring.
-function semanticScan(database, queryVector, limit, onBatch = null) {
+function semanticScan(database, queryVector, limit, onBatch = null, rootPath = '') {
   const top = [];
+  const from = rootPath ? 'semantic_chunks c JOIN search_documents d ON d.path=c.path' : 'semantic_chunks c';
+  const rootCondition = rootPath ? ' AND d.root_path = ?' : '';
+  const rootParams = rootPath ? [rootPath] : [];
   const totalChunks = Number(
-    database.prepare("SELECT COUNT(*) AS total FROM semantic_chunks WHERE embedding IS NOT NULL").get()?.total || 0
+    database.prepare(`SELECT COUNT(*) AS total FROM ${from} WHERE c.embedding IS NOT NULL${rootCondition}`)
+      .get(...rootParams)?.total || 0
   );
   let scanned = 0;
   let lastId = 0;
   const select = database.prepare(`
-    SELECT id, path, relative_path, start_line, end_line, start_offset, end_offset, embedding
-    FROM semantic_chunks
-    WHERE embedding IS NOT NULL AND id > ?
-    ORDER BY id
+    SELECT c.id, c.path, c.relative_path, c.start_line, c.end_line, c.start_offset, c.end_offset, c.embedding
+    FROM ${from}
+    WHERE c.embedding IS NOT NULL AND c.id > ?${rootCondition}
+    ORDER BY c.id
     LIMIT ?
   `);
   for (;;) {
-    const rows = select.all(lastId, SEMANTIC_SCAN_BATCH);
+    const rows = select.all(lastId, ...rootParams, SEMANTIC_SCAN_BATCH);
     if (!rows.length) break;
     for (const row of rows) {
       lastId = Math.max(lastId, Number(row.id));
