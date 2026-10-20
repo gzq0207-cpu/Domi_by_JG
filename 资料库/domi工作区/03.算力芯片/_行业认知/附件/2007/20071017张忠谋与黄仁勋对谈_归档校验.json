@@ -1,0 +1,139 @@
+{
+  "sourceUrl": "https://archive.computerhistory.org/resources/access/text/2012/05/102658254-05-01-acc.pdf",
+  "pdfBytes": 56338,
+  "pdfSha256": "5d2ab5931fb7160183a74a4b500da8af413f345d96107ec040dabe2f3e900e65",
+  "pageCount": 14,
+  "pageStats": [
+    {
+      "page": 1,
+      "characters": 295,
+      "replacementCharacters": 0
+    },
+    {
+      "page": 2,
+      "characters": 4768,
+      "replacementCharacters": 0
+    },
+    {
+      "page": 3,
+      "characters": 4740,
+      "replacementCharacters": 0
+    },
+    {
+      "page": 4,
+      "characters": 1948,
+      "replacementCharacters": 0
+    },
+    {
+      "page": 5,
+      "characters": 2338,
+      "replacementCharacters": 0
+    },
+    {
+      "page": 6,
+      "characters": 3321,
+      "replacementCharacters": 0
+    },
+    {
+      "page": 7,
+      "characters": 2825,
+      "replacementCharacters": 0
+    },
+    {
+      "page": 8,
+      "characters": 3332,
+      "replacementCharacters": 0
+    },
+    {
+      "page": 9,
+      "characters": 4391,
+      "replacementCharacters": 0
+    },
+    {
+      "page": 10,
+      "characters": 3834,
+      "replacementCharacters": 0
+    },
+    {
+      "page": 11,
+      "characters": 3492,
+      "replacementCharacters": 0
+    },
+    {
+      "page": 12,
+      "characters": 3180,
+      "replacementCharacters": 0
+    },
+    {
+      "page": 13,
+      "characters": 2918,
+      "replacementCharacters": 0
+    },
+    {
+      "page": 14,
+      "characters": 2361,
+      "replacementCharacters": 0
+    }
+  ],
+  "originalFileSha256": "7d170d7c09575af46a341452a4ea1f05ac20e03937118eabde3612a18f909041",
+  "originalContentSha256": "71731996d23de70586a5ae501cf09f6defe56531a518c44ec5a755644f7cf45d",
+  "originalCharacters": 45439,
+  "duplicateCandidates": [],
+  "taxonomy": {},
+  "translationReceipt": {
+    "version": 7,
+    "model": "gpt-6-luna",
+    "reasoningEffort": "medium",
+    "serviceTier": "standard",
+    "complete": true,
+    "sourceSha256": "71731996d23de70586a5ae501cf09f6defe56531a518c44ec5a755644f7cf45d",
+    "translationSha256": "2ef2c6e2cd018fe31eb1cca2cd59469c9d757a4be75b57cf4b7768d5ff38b090",
+    "sourceCharacters": 45439,
+    "timestampValues": 0,
+    "timestampOrderVerified": true,
+    "englishProseChecked": true,
+    "targetedRepairs": [
+      {
+        "source": "Recorded: October 17, 2007",
+        "replacement": "录制日期：十月 17, 2007",
+        "receipt": {
+          "version": 7,
+          "model": "gpt-6-luna",
+          "reasoningEffort": "medium",
+          "serviceTier": "standard",
+          "complete": true,
+          "sourceSha256": "1982598c10d25eda0a1515a641898a086aa9ba078852d1ecdd266953dad02074",
+          "translationSha256": "df516a21a0c9374e0feb9249a5e399cef9d5bd206cb4d443101e8d12661545f7",
+          "sourceCharacters": 26,
+          "timestampValues": 0,
+          "timestampOrderVerified": true,
+          "englishProseChecked": true
+        }
+      }
+    ]
+  },
+  "validation": {
+    "archived": true,
+    "eventId": "art_b0f426afbaba2065",
+    "eventUri": "domi://news/art_b0f426afbaba2065",
+    "documentPath": "C:\\Users\\Zhaoqing\\Desktop\\Domi1\\资料库\\domi工作区\\03.算力芯片\\_行业认知\\动态\\2007\\20071017张忠谋与黄仁勋对谈：台积电、专业晶圆代工与客户服务（2007）.md",
+    "pdfAttachmentPath": "C:\\Users\\Zhaoqing\\Desktop\\Domi1\\资料库\\domi工作区\\03.算力芯片\\_行业认知\\附件\\2007\\20071017张忠谋与黄仁勋对谈_102658254-05-01-acc.pdf",
+    "pdfPages": 14,
+    "pdfSha256": "5d2ab5931fb7160183a74a4b500da8af413f345d96107ec040dabe2f3e900e65",
+    "englishOriginalCharacters": 45439,
+    "translationCharacters": 17643,
+    "originalContentVerified": true,
+    "translationVerified": true,
+    "urlUnique": true,
+    "titleUnique": true,
+    "summaryPoints": 11,
+    "domains": [
+      "算力芯片"
+    ],
+    "subdomains": [
+      "先进封装与制造",
+      "芯片设计与IP"
+    ],
+    "scope": "PDF 全部14页；未逐句对照视频；中文全文为机器翻译，保留官方英文稿核对"
+  }
+}

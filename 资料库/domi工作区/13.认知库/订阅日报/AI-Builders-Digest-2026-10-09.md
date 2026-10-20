@@ -1,0 +1,352 @@
+# AI 构建者日报 — 2026-10-09
+
+<!-- domi:digest:source {"version":1,"file":".sources/ab240777040765e95f99df3dfc7485b31dec963e1e556a179f8f426420d3def2.md","sha256":"ab240777040765e95f99df3dfc7485b31dec963e1e556a179f8f426420d3def2"} -->
+<!-- domi:translation:start -->
+<!-- domi:translation:receipt {"version":7,"model":"gpt-6-luna","reasoningEffort":"medium","serviceTier":"standard","complete":true,"sourceSha256":"ab240777040765e95f99df3dfc7485b31dec963e1e556a179f8f426420d3def2","translationSha256":"2aa43f2aca36234d9bff09832e2552a104f08b450347dc562407c31de101cf0d","sourceCharacters":17658,"digestVersion":1,"protectedValuesVerified":true,"linksVerified":true,"englishProseChecked":true} -->
+## 中文全文
+
+> 由 GPT-6 Luna 翻译，标准智能、标准速度。英文原文保留供核对。
+
+> 数据源：follow-builders 中央 内容源（生成于 2026/10/08 14:47 (UTC+8)）+ YouTube 频道直抓
+> 追踪 X 上 26 位 AI 构建者、12 个 YouTube 频道、6 档 AI 播客、Anthropic/Claude 工程博客。
+> 想要深度解读、翻译或合并多日内容：把这个文件丢给 CatPaw（“读一下今天的简报”）。
+
+## 🐦 X 动态（19 位构建者 · 41 条）
+
+### Boris Cherny（@bcherny）
+> Claude @anthropicai
+
+**2026-10-08**（❤️ 55） [原文](https://x.com/bcherny/status/2108013947144085714)
+
+> 好，接着读 https://t.co/Kdph4vZuGt
+
+**2026-10-08**（❤️ 28） [原文](https://x.com/bcherny/status/2108008010253533397)
+
+> 就一个提示词，Claude 也验证得相当不错！目前还没发现 缺陷 https://t.co/jjnUzGkdoC
+
+**2026-10-08**（❤️ 57） [原文](https://x.com/bcherny/status/2108006118966665463)
+
+> 试试看 https://t.co/isXGOnEXd5
+
+### Thibault Sottiaux（@thsottiaux）
+> Codex 与 ChatGPT @OpenAI
+
+**2026-10-08**（❤️ 433 · 🔁 23） [原文](https://x.com/thsottiaux/status/2108084615349170480)
+
+> 第 3 天（加演）/
+> 
+> 我们悄悄地重新发布了 Codex Cloud。现在它相当不错 https://t.co/Fau14sCke8
+
+**2026-10-08**（❤️ 4525 · 🔁 72） [原文](https://x.com/thsottiaux/status/2108040921044639779)
+
+> 确认已经在所有账户上线。到目前为止进展如何？ https://t.co/tzw7dNX4pN
+
+**2026-10-08**（❤️ 2203 · 🔁 22） [原文](https://x.com/thsottiaux/status/2107913738791596286)
+
+> 太平洋标准时间（PST）今天下班前会上线。
+
+### Peter Yang（@petergyang）
+> 为忙碌的人提供实用的 AI 教程和访谈 | 在 https://t.co/6VAA6p81x6 获取我最好的 AI 技能和指南
+
+**2026-10-08**（❤️ 40 · 🔁 2） [原文](https://x.com/petergyang/status/2108046949291315385)
+
+> .@suno 说实话，真的太棒了。它可能迟早会超过 Spotify。
+
+**2026-10-08**（❤️ 45 · 🔁 2） [原文](https://x.com/petergyang/status/2108032922527862851)
+
+> AI 已经解决了图像、音乐和视频领域的问题。很快也会攻克游戏。
+
+**2026-10-08**（❤️ 6 · 🔁 1） [原文](https://x.com/petergyang/status/2107981547102245101)
+
+> 看来，现在你发布的任何东西都能被 AI 反编译并重新构建。
+> 
+> 我觉得，除非你拥有专有数据、分发渠道或其他优势，否则很快就会变得极难靠软件赚钱。
+> 
+> 传统 SaaS 尤其脆弱，因为它成本高，而且充斥着为人类设计、智能体并不需要的功能。
+
+### Nan Yu（@thenanyu）
+> 产品、Codex @openai。前产品负责人 @linear
+
+**2026-10-08**（❤️ 21） [原文](https://x.com/thenanyu/status/2108049498648051747)
+
+> 害怕它吧，逃离它吧，唯一正确的效率应用布局终究还是会到来。 https://t.co/fczbE1PHEk
+
+### Cat Wu（@_catwu）
+> @anthropicai 的 Claude Code + Cowork，曾任职于 @dagster、@scale_ai
+
+**2026-10-08**（❤️ 246 · 🔁 8） [原文](https://x.com/_catwu/status/2107967210467803152)
+
+> 我最喜欢用 Claude 来辅助产品经理的一种方式，是问它：“上周谁最常用 &lt;功能&gt;？根据使用量给我做一份排名前 10 的用户资料，然后联系他们并安排 15 分钟聊聊。”这是最快获取用户反馈的方式！ https://t.co/SYL4JOitsB
+
+### Thariq（@trq212）
+> Claude Code @anthropicai。曾任 YC W20、@spc、@medialab
+
+**2026-10-08**（❤️ 148 · 🔁 7） [原文](https://x.com/trq212/status/2108021248966135891)
+
+> 而且由于智能体让事情变得更容易，几乎每个人总会在某个时候做超出自己专业领域的事
+> 
+> 但好在，你可以直接让模型教你不懂的东西
+
+**2026-10-08**（❤️ 1296 · 🔁 41） [原文](https://x.com/trq212/status/2108021247301062894)
+
+> 我最常看到的失败情况是：人们在自己不熟悉的领域里工作，不知道如何把提示词和计划写得精准，所以不得不花很多轮反复迭代，却始终不够精确 https://t.co/mRT3knojCP
+
+**2026-10-08**（❤️ 453 · 🔁 17） [原文](https://x.com/trq212/status/2107957206327173484)
+
+> 我觉得，现在对游戏开发内容创作者来说，可能是个绝佳时机。对许多人而言，做游戏本身就是一种乐趣，他们也愿意为此付费！ https://t.co/iS08bGZZnJ
+
+### Google Labs（@GoogleLabs）
+> Google 推出最新 AI 工具和实验项目的平台。
+
+**2026-10-07**（❤️ 23081 · 🔁 2384） [原文](https://x.com/GoogleLabs/status/2107800195748737042)
+
+> 🚨全新实验项目🚨
+> 
+> Playground 是一个实验性游戏平台，让你无需任何编程经验就能创建自己的游戏。只要想得到，就能玩得到。
+> 
+> 前往 https://t.co/fRUukpuoqM 了解更多！面向美国 18 岁及以上用户开放。 https://t.co/p0X8JR7JMn
+
+### Amjad Masad（@amasad）
+> @replit 首席执行官。文明主义者
+
+**2026-10-08**（❤️ 1095 · 🔁 90） [原文](https://x.com/amasad/status/2107934939287273551)
+
+> 数学注定会最先被攻克。一个领域越纯粹，AI 破解起来就越容易。 https://t.co/OETDJ1JSIz
+
+**2026-10-08**（❤️ 513 · 🔁 21） [原文](https://x.com/amasad/status/2107927076926038273)
+
+> 这是因为 Replit 不是面向消费者的应用。我们的大多数创作者都在创办企业或为企业工作。 https://t.co/B70WFQldgU
+
+**2026-10-08**（❤️ 224 · 🔁 12） [原文](https://x.com/amasad/status/2107926712277438503)
+
+> 桌面 AI 应用很棒，但会让用户暴露在供应链攻击和智能体造成灾难性错误的风险中。
+> 
+> 我们正在打造强大的桌面体验，重点关注安全性和可靠性。
+> 
+> 很高兴能与 @Microsoft 合作，并成为 @nvidia 的 OpenShell 的早期用户。 https://t.co/YixaxIXhpb
+
+### Guillermo Rauch（@rauchg）
+> @vercel 首席执行官
+
+**2026-10-08**（❤️ 605 · 🔁 39） [原文](https://x.com/rauchg/status/2107962327169675566)
+
+> 工程社区将重新发现的一件事是，每个程序都可以①不断加固（消除边缘情况、收紧输入、处理错误），②不断优化（分析性能、进行基准测试、重写），而且基本上可以无限进行。
+> 
+> 每个方向都存在真实成本：时间、注意力、机会成本。你完全可能探索永远不会被触及的输入空间，也可能优化永远不会被使用的功能的性能（“你根本没有用户”）。即使 词元 无限，你也需要知道何时停止、接受哪些取舍。智能体无论如何都会乐此不疲地钻下去。
+
+**2026-10-07**（❤️ 784 · 🔁 11） [原文](https://x.com/rauchg/status/2107861196506595398)
+
+> 从世界上最棒的城市向大家问早 https://t.co/aPDFNR7KhT
+
+### Alex Albert（@alexalbert__）
+> @AnthropicAI 研究员。观点仅代表我个人！
+
+**2026-10-08**（❤️ 349 · 🔁 15） [原文](https://x.com/alexalbert__/status/2107912771568554415)
+
+> 供参考，Haiku 4.5 于 2025年10月15日发布，所以这两列相隔不到一年。
+>
+> 哦对了，Haiku 5.5 也快得多，而且便宜 75% 多…… https://t.co/1Zt19kdTYC
+
+### Aaron Levie（@levie）
+> @box 首席执行官——你的业务蕴藏于内容之中。用 AI 释放它的价值
+
+**2026-10-08**（❤️ 812 · 🔁 65） [原文](https://x.com/levie/status/2108056577697882402)
+
+> 我们即将进入的 AI 阶段所需的算力将会高得惊人。
+> 
+> 个人智能体、守护企业的智能体群、审查我们所有代码以发现安全问题的智能体、在工作流中处理几乎所有企业数据的智能体、在后台处理任务的智能体 24/7，以及更多应用。
+> 
+> 这需要不断增长几个数量级的推理调用量，也需要为智能体提供 词元 之外的基础设施。它们需要计算机、网络、文件系统等等。
+> 
+> 这场基础设施建设还处于早期阶段。
+
+### Matt Turck（@mattturck）
+> @FirstMarkCap 风险投资人。MAD Podcast 主持人；Data Driven NYC 组织者；MAD Landscape 作者。
+
+**2026-10-08**（❤️ 158 · 🔁 8） [原文](https://x.com/mattturck/status/2107876612679020855)
+
+> 趣闻：成功的 AI 创始人、Python/CNN/GPU 专家 Ben Affleck，此前曾在娱乐行业发展。 https://t.co/BZwIs5mQhU
+
+**2026-10-07**（❤️ 40 · 🔁 3） [原文](https://x.com/mattturck/status/2107853622402805803)
+
+> 当然，X 上的所有东西都令人惊叹，但我看过测试版之后，只能说……这真的令人惊叹。 https://t.co/wdySOkrsUd
+
+### Zara Zhang（@zarazhangrui）
+> 创业者。做出人们想要的东西，然后让人们产生需求。哈佛’17. GitHub: https://t.co/KCuEajezlL YouTube: https://t.co/8xzbGWtf6w
+
+**2026-10-08**（❤️ 3） [原文](https://x.com/zarazhangrui/status/2108085347297161399)
+
+> 我喜欢 @stripepress，因为我确实会以貌取书 https://t.co/YMBUiprxUX
+
+**2026-10-08**（❤️ 108 · 🔁 7） [原文](https://x.com/zarazhangrui/status/2108047745936466373)
+
+> 谁的个人网站最酷？
+
+**2026-10-08**（❤️ 139 · 🔁 11） [原文](https://x.com/zarazhangrui/status/2108027410256166930)
+
+> 记住，编程只是达成目的的手段。目的比手段更重要。
+
+### Nikunj Kothari（@nikunj）
+> @fpvventures 合伙人——投资种子轮/A 轮项目。此前曾早期加入 @meter、@opendoor、@atlassian 等公司。爱 @shimoleejhaveri + 👦👧
+
+**2026-10-08**（❤️ 4） [原文](https://x.com/nikunj/status/2108060822698357240)
+
+> 把 @askalphaxiv 移到 程序坞 栏是我这周做过的最棒的事……
+> 
+> 现在我等事情时，会在手机上读论文，从 0 分钟增加到了约 30 分钟。 https://t.co/aPwn0LgfcY
+
+**2026-10-08**（❤️ 152 · 🔁 5） [原文](https://x.com/nikunj/status/2107960134446235985)
+
+> 致所有来旧金山参加科技周的人……
+> 
+> 1）最优秀的构建者可能都在自己的办公室里。所以给他们发私信，试着去他们办公室见面。
+> 
+> 2）别当游客
+> 
+> https://t.co/3YGQQjuyGD
+
+**2026-10-08**（❤️ 2） [原文](https://x.com/nikunj/status/2107883642295144958)
+
+> https://t.co/gn6cYt7bqh
+
+### Peter Steinberger（@steipete）
+> 多智能体关系玩家 ClawFather。退休后重出江湖，折腾 AI，帮一只龙虾接管世界。@OpenClaw🦞 + @OpenAI
+
+**2026-10-08**（❤️ 671 · 🔁 40） [原文](https://x.com/steipete/status/2107911769767440832)
+
+> 大家都在谈智能体的时候，我一直在探索团队如何利用它们更好地协作。
+> 
+> 这是我的看法，来自 OpenAI DevDay 2026。 https://t.co/W3rVoiTo84
+
+### Dan Shipper（@danshipper）
+> @every 首席执行官 | 让你紧跟 AI 前沿的唯一订阅服务
+
+**2026-10-08**（❤️ 49 · 🔁 2） [原文](https://x.com/danshipper/status/2107930827669557713)
+
+> 当你的 ChatGPT 应用控制着你的 Claude 应用，而你的 Claude 应用又控制着你的 ChatGPT 应用 https://t.co/i3QO9tLFSB
+
+**2026-10-08**（❤️ 94 · 🔁 7） [原文](https://x.com/danshipper/status/2107890633486582208)
+
+> OpenAI 的 Dots 上周发布了，它们已经占领了 @every。
+> 
+> 有几件事让我印象深刻：
+> 
+> 它们能保护你的注意力。周末，我的 Dot 把我的模型测试结果发到了 Slack，并带回了回复。我可以继续工作，不用打开 Slack 后就一头扎进去，没完没了地刷下去。我的周末因此保持得相当清静、平和。
+> 
+> 它们能帮你处理那些容易漏掉的小事。Every 的人正用它们从学校邮件中提取重要信息、查找漏看的 Slack 消息，以及标记账户访问请求。
+> 
+> 语音功能让你离开笔记本电脑时也能使用它们。我们的视讯负责人一边忙着四处奔走、准备发布，一边口头指导他的 Dot 修改视频。
+> 
+> 生态系统很重要。Dots 的功能大致已经追平了 Muse、Instinct 和 Grok 机器人。但能让智能体连接到你工作和生活中已经在用的生态系统，是一项实实在在的优势。如果你使用 ChatGPT，我建议你试试其中一个。
+> 
+> 权限问题仍然令人沮丧。同一件基本操作我得批准好几次，有时即使批准了，我的 Dot 还是说它做不到。这需要修好。
+> 
+> 我不太确定我们会一直忠于这些角色。我的叫 Boo，我已经对他有感情了。但我对自己的 OpenClaw 智能体也有过同样的感觉。更好的东西一出现，我就会换掉它。一年后，我预计自己会在用一个持久型智能体。Boo 大概就要不在了。安息吧，Boo。
+> 
+> 本周播客一开始我就会聊到这些，然后坐下来和 @bigwilliestyle 谈谈接下来该怎么走。
+> 
+> 在很多方面，Dots 和 GrokBots 都让我想起八个月前 OpenClaw 掀起的那波热潮。我们会聊个人智能体与公司智能体的区别、我们为什么要打造自己的公司智能体，以及公司最终是否会拥有一整套由智能体组成的影子组织架构。
+> 
+> 完整节目见下方。
+
+**2026-10-07**（❤️ 11） [原文](https://x.com/danshipper/status/2107827332752826790)
+
+> 很高兴看到这个！！https://t.co/jmPN04jKZz
+
+### Aditya Agarwal（@adityaag）
+> 普通合伙人 @SPC，联合创始人 @Bevel_Health | 曾任：早期工程师 @facebook、首席技术官 @Dropbox、董事会成员 @Flipkart | 乐观主义者、构建者、父亲
+
+**2026-10-08**（❤️ 52 · 🔁 7） [原文](https://x.com/adityaag/status/2107934826686759310)
+
+> 我第一次坐上 @Waymo 时，感觉就像经历了一场宗教体验。
+> 
+> 联合首席执行官 @dmitri_dolgov 和我聊了这件事。就在 Waymo 里。  
+> 
+> 完整对话将于明天在 @spc 发布。https://t.co/CdwA6yI5n6
+
+**2026-10-08**（❤️ 179 · 🔁 13） [原文](https://x.com/adityaag/status/2107865115831988530)
+
+> 今天，有抱负的软件工程师应该做什么？
+> 
+> 十年前，成为一名优秀的软件工程师能给你带来一种非同寻常的优势：一项少见的技能，几乎可以应用于任何行业。
+> 
+> 你可以创办一家支付公司、改善医院的运营方式，或者创造一种让人们沟通的新方式。同一种底层能力，能为你打开通往截然不同业务的大门。
+> 
+> 软件正在吞噬世界，而懂得如何构建软件，意味着你几乎可以在任何行业的谈判桌上占据一席之地。
+> 
+> “把软件工程学得非常好”是一条用途极广的建议。你可以先掌握这项技能，以后再考虑把它用在哪里。
+> 
+> AI 正让开发可运行软件的能力变得普及得多。几年前还无法开发产品的人，现在也能取得出人意料的进展。有经验的工程师也能尝试过去需要一个团队才能完成的项目。
+> 
+> 优秀的工程能力依然稀缺。但“我能把它做出来”正逐渐变成一个较弱的理由，无法充分说明为什么偏偏是你拥有优势。
+> 
+> 在我看来，有三条路。
+> 
+> 1. 去做正在吞噬软件的那件事
+> 
+> 帮助创造让软件工程变得更普及的技术。
+> 
+> 这可能意味着从事 AI 研究，也可能是打造让新能力变得实用所需的基础设施、系统和工具。找到那些技术能力仍然构成重大限制的问题，并解决它们，从而拓展其他人能做到的事。
+> 
+> 2. 找一位世界级领域专家并与其合作
+> 
+> 在某个行业深耕十五年的人，可能知道哪些地方容易造成高昂的错误、以往的解决尝试为何失败，以及谁会购买解决方案。这类知识很难从外部获得。
+> 
+> 在 SPC，我们看到越来越多此前几乎没有软件工程经验的人，成为有潜力的创始人。他们拥有深厚的领域知识，也很清楚需要什么样的东西。
+> 
+> 这些人值得结识。优秀的工程合作伙伴能看到他们尚未考虑到的可能性，并帮助他们一起打造出任何一方单独都想象不到的东西。
+> 
+> 3. 一边带着一群智能体干活，一边写原汁原味的代码……
+> 
+> 这是我觉得最没吸引力的方向：在公司里大致做着同样的工作，只不过现在要监督编程智能体。
+> 
+> 这类工作会有价值。但如果你的抱负仅限于更快地完成同一份待办清单，那你就没有充分利用这个时代的机会。
+> 
+> 我仍然会努力把工程能力练得非常扎实。然后，我会认真考虑让这项能力与什么相结合：一个需要推进的技术前沿，或者对某个值得解决的问题的深入了解。
+> 
+> 利用自己能做更多事情这一点，去承担更大的责任。
+
+### Sam Altman（@sama）
+> OpenAI 的使命是确保通用人工智能造福全人类。
+
+**2026-10-08**（❤️ 548 · 🔁 9） [原文](https://x.com/sama/status/2107924677801001381)
+
+> 我等这个等了很久，真不想再回到旧版 Chat！
+
+**2026-10-08**（❤️ 8052 · 🔁 337） [原文](https://x.com/sama/status/2107924408597950702)
+
+> ChatGPT 现在可以为你生成自定义 UI 了！https://t.co/ZdGRMAEjQX
+
+### Claude（@claudeai）
+> Claude 是由 @anthropicai 打造的 AI 助手，旨在做到安全、准确且可靠。你可以在 https://t.co/ZhTwG8d1e5 与 Claude 对话，或下载该应用。
+
+**2026-10-08**（❤️ 10304 · 🔁 517） [原文](https://x.com/claudeai/status/2107894060229034197)
+
+> 还有一件事：我们要把 Claude Sonnet 5.5 的缓存读取价格减半，降到每百万个 词元 0.10 美元。这样一来，在大多数长时间运行的工作中，运行 Sonnet 5.5 的成本大约会便宜 20%。
+
+**2026-10-08**（❤️ 1462 · 🔁 33） [原文](https://x.com/claudeai/status/2107894057615987198)
+
+> Haiku 5.5 现已在所有平台上线，包括 Amazon Web Services、Google Cloud 和 Microsoft Azure。
+> 
+> 了解更多：https://t.co/InzZXcEcRP
+
+**2026-10-08**（❤️ 1507 · 🔁 22） [原文](https://x.com/claudeai/status/2107894054142787877)
+
+> 与 Haiku 4.5 相比，Haiku 5.5 在我们几乎所有的对齐评估中都有显著提升，出现不符合对齐要求的行为也少得多。
+
+## 📺 YouTube 新视频（1 个）
+
+### Asianometry — 半导体/算力硬件
+- **德州的 TSMC？**（2小时前 · 10K） — [观看](https://www.youtube.com/watch?v=wJRfoWXTU80)
+
+> ⚠️ 抓取失败：Matt Wolfe；疑似被 YouTube 软封锁：Chips and Cheese。数据中心出口 IP 所致，换 VPN 节点后通常可自动恢复。
+
+## 📻 播客（1 期）
+
+### AI & I by Every — Every 为何从个人智能体转向一个公司智能体
+- 发布：2026-10-08 · [收听/观看](https://www.youtube.com/playlist?list=PLuMcoKK9mKgHtW_o9h5sGO2vXrffKHwJL)
+- 开场摘录：发言者 1 | 00:00 - 00:12 现在最热门的东西是 Dots。它们是 OpenAI 推出的持久型智能体。我当时在 Dev Day，他们发布 Dots 时我就在现场。我采访过 Sam，聊过它们，而且早在 Dots 发布之前我就在用了。现在我们进入使用 Dots 的第二周了。发言者 1 | 00:12 - 00:46 进展如何？如果你看过我的体验评估，就知道我觉得它们有点粗糙，刚开始……
+
+---
+*由 follow-builders 计划任务自动生成于 2026/10/09 09:54 (UTC+8)*
+<!-- domi:translation:end -->
