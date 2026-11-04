@@ -29,9 +29,15 @@ function execute(executable, args, { input, env = process.env, timeoutMs = 60000
 }
 
 function parseReply(result) {
-  const values = result.stdout.trim().split(/\r?\n/).flatMap(line => { try { return [JSON.parse(line)]; } catch { return []; } });
-  const value = values.at(-1);
-  if (!value) throw new BrowserTranscriptError("BROWSER_CLI_INVALID_REPLY", "独立浏览器 CLI 未返回有效回执。");
+  const objects = text => String(text || "").trim().split(/\r?\n/).flatMap(line => {
+    try { const value = JSON.parse(line); return value && typeof value === "object" && !Array.isArray(value) ? [value] : []; }
+    catch { return []; }
+  });
+  // Some launcher failures are structured JSON on stderr with exit 70. Never
+  // treat stderr as successful output or discard the actual routing error.
+  const value = objects(result.stdout).at(-1) || (result.code !== 0
+    ? objects(result.stderr).findLast(value => value.ok === false && typeof value.error?.code === "string") : null);
+  if (!value) throw new BrowserTranscriptError("BROWSER_CLI_INVALID_REPLY", `独立浏览器 CLI 未返回有效回执（退出码 ${result.code ?? "未知"}）。`);
   return value;
 }
 
@@ -63,7 +69,8 @@ class TabbitCaptionAcquirer {
   async ready() {
     if (this.started) return;
     let reply = await this.cli(["create", "--task", this.taskName]);
-    if (reply.error?.code === "CLI_REGISTRATION_UNAVAILABLE" && !this.relaunched) {
+    const noWindow = value => value.complete === true && value.total === 0 && Array.isArray(value.tabs) && value.tabs.length === 0;
+    if ((reply.error?.code === "CLI_REGISTRATION_UNAVAILABLE" || noWindow(reply)) && !this.relaunched) {
       this.relaunched = true;
       this.onProgress({ phase: "browser-startup-recovery" });
       const helper = path.resolve(__dirname, "../scripts/start-subscription-browser.ps1");
@@ -73,10 +80,11 @@ class TabbitCaptionAcquirer {
       do {
         await new Promise(resolve => setTimeout(resolve, 1000));
         reply = await this.cli(["create", "--task", this.taskName]);
-        if (!reply.error) break;
-      } while (reply.error?.code === "CLI_REGISTRATION_UNAVAILABLE" && Date.now() < deadline);
+        if (!reply.error && !noWindow(reply)) break;
+      } while ((reply.error?.code === "CLI_REGISTRATION_UNAVAILABLE" || noWindow(reply)) && Date.now() < deadline);
     }
     if (reply.error) throw new BrowserTranscriptError(reply.error.code || "BROWSER_UNAVAILABLE", "独立浏览器连接未就绪，保留字幕补取断点。");
+    if (noWindow(reply)) throw new BrowserTranscriptError("BROWSER_WINDOW_UNAVAILABLE", "独立浏览器没有可用窗口；已尝试一次正常启动，保留后续重试。");
     // finish retains a login page as an unowned group. Reacquire that group's
     // observed ID on the next run, rather than opening another login tab daily.
     const retained = (reply.groups || []).filter(group => {
@@ -100,6 +108,11 @@ class TabbitCaptionAcquirer {
       throw new BrowserTranscriptError("BROWSER_REQUEST_PENDING", "字幕获取请求仍未结束，保留回执，暂不重复执行。");
     }
     if (reply.status !== "succeeded") {
+      if (resume && ["REQUEST_FAILED", "OUTCOME_UNKNOWN"].includes(reply.error?.code)
+          && /Unknown request|Unknown task|outcome.+unknown/i.test(reply.error?.message || "")) {
+        this.unsettled = true;
+        throw new BrowserTranscriptError("BROWSER_RECOVERY_REQUIRED", "浏览器原请求回执已不可用；保留原断点，需要确认旧执行停止后再恢复，暂不重复导出。");
+      }
       const code = reply.error?.code || reply.result?.error?.code || "BROWSER_EXPORT_FAILED";
       const error = new BrowserTranscriptError(code, "浏览器字幕导出未完成，已保留原任务回执。");
       error.requestSettled = ["failed", "interrupted"].includes(reply.status); throw error;
@@ -157,7 +170,10 @@ class TabbitCaptionAcquirer {
       fs.renameSync(pending,this.activeRequestPath);
       return this.request(item, requestId, false);
     });
-    this.serial = job.catch(() => {}); return job;
+    this.serial = job.catch(error => {
+      if (["BROWSER_RECOVERY_REQUIRED", "BROWSER_CLI_INVALID_REPLY", "BROWSER_CLI_UNAVAILABLE", "BROWSER_CLI_TIMEOUT",
+        "BROWSER_REQUEST_PENDING", "CLI_REGISTRATION_UNAVAILABLE", "BROWSER_STARTUP_FAILED", "BROWSER_WINDOW_UNAVAILABLE"].includes(error.code)) this.sharedBlock = error;
+    }); return job;
   }
 
   async request(item, requestId, resume) {

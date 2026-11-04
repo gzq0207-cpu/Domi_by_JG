@@ -3,6 +3,7 @@ const path = require("node:path");
 const { parentPort } = require("node:worker_threads");
 const { ensureDocumentLibraryStructure, listDocumentLibrary, createDocumentLibraryEntry } = require("./document-library.cjs");
 const { moveDocumentLibraryEntry } = require('./document-library-move.cjs');
+const { deleteDocumentLibraryEntry } = require('./document-library-delete.cjs');
 
 const CACHE_TTL_MS = 60_000;
 let cache = null;
@@ -64,6 +65,9 @@ parentPort.on("message", ({ id, action, location, request }) => {
         } });
         cache = null;
       } finally { repository?.close(); research?.close(); }
+    } else if (action === 'delete') {
+      result = deleteDocumentLibraryEntry(rootPath, request);
+      cache = null;
     } else {
       throw new Error("未知的文档目录操作。");
     }

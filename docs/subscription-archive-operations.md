@@ -30,7 +30,9 @@ $env:ELECTRON_RUN_AS_NODE='1'
 ## 可恢复故障与证据
 
 - Tabbit 升级使 CLI 注册过期：只正常启动已核验签名的稳定浏览器一次，由浏览器更新自身注册；不编辑注册、ACL 或用户配置目录。
+- 浏览器进程仍在、但完整标签页清单为空时，先正常启动已核验签名的浏览器一次，等待窗口恢复后才导出；仍无窗口则保留全局等待状态。同页跳转到 Google 验证页面时明确记为验证码要求，不能记成页面改变，也不绕过验证。
 - 浏览器执行中断：`archives/browser-active-request.json` 保存原任务和请求 ID。下轮先读取原回执，避免重新导航或重复导出尚未结束的请求。
+- 原请求回执丢失：CLI 的 stderr 错误也必须解析，标记 `BROWSER_RECOVERY_REQUIRED`，本轮只检查一次并按全局原因去重。保留断点，不自动认定旧任务失败，也不直接重发。需先核对浏览器进程启动时间、原任务回执、当前任务是否有执行／排队及已有产物；确认旧执行停止后，把原断点和核对证据存入 `archives/browser-recovery/` 再解除失效断点。视频退避时间保持不变。
 - `archives/browser-status.json`：全局连接／登录状态及提醒去重。
 - `archives/<videoId>/browser-access.json`：该视频准确原因和检查时间。
 - `archives/<videoId>/browser-captions/`：原始平台响应、完整导出、结构化时间戳和哈希。

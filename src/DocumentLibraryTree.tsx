@@ -1,6 +1,6 @@
 import { memo, useRef, useState, useEffect } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
-import { ChevronRight, FileText, FileType2, Folder, FolderOpen } from 'lucide-react';
+import { ChevronRight, FileText, FileType2, Folder, FolderOpen, Trash2 } from 'lucide-react';
 import type { DocumentLibraryNode } from './env';
 import { DOCUMENT_LIBRARY_DRAG_TYPE, hasDocumentLibraryDrag, readDocumentLibraryDrag } from './document-library-drag';
 
@@ -17,6 +17,8 @@ type Props = {
   moving: boolean;
   onMove: (path: string, parentPath: string, mtimeMs: number) => void;
   onExpand: (path: string) => void;
+  deleting: boolean;
+  onDelete: (path: string, name: string, mtimeMs: number) => void;
 };
 
 // App also owns conversation streaming, editor drafts and timers. None of
@@ -66,6 +68,21 @@ export default memo(function DocumentLibraryTree(props: Props) {
         <span className="document-library-node-name">{node.displayName || node.name}</span>
         {!isFolder && <small>{props.formatSize(node.size)}</small>}
       </button>
+      {!isFolder && (
+        <button
+          className="document-library-node-delete"
+          type="button"
+          title={`删除 ${node.displayName || node.name}`}
+          aria-label={`删除 ${node.displayName || node.name}`}
+          disabled={props.deleting || props.moving}
+          onClick={(event) => {
+            event.stopPropagation();
+            props.onDelete(node.path, node.displayName || node.name, node.mtimeMs);
+          }}
+        >
+          <Trash2 size={13} />
+        </button>
+      )}
       {expanded && node.children && <div className="document-library-children" role="group">
         {node.children.length ? node.children.map(child => renderNode(child, node.path, depth + 1)) :
           <span className="document-library-empty-folder" style={{ '--tree-indent': `${(depth + 1) * 14}px` } as CSSProperties}>空文件夹</span>}

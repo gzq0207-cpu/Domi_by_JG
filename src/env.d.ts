@@ -74,6 +74,7 @@ declare global {
         request: DocumentLibraryCreateRequest
       ) => Promise<DocumentLibraryCreateResult>;
       moveDocumentLibraryEntry: (request: DocumentLibraryMoveRequest) => Promise<DocumentLibraryMoveResult>;
+      deleteDocumentLibraryEntry: (request: DocumentLibraryDeleteRequest) => Promise<DocumentLibraryDeleteResult>;
       finalizeSubscriptionDigest: (request: { day: string }) => Promise<{ ok: boolean; files?: string[]; error?: string }>;
       readMarkdown: (request: MarkdownReadRequest) => Promise<MarkdownReadResult>;
       saveMarkdown: (request: MarkdownSaveRequest) => Promise<MarkdownSaveResult>;
@@ -293,6 +294,12 @@ export type DocumentLibraryMoveRequest = { path: string; parentPath: string; exp
 export type DocumentLibraryMoveResult = {
   ok: boolean; rootPath?: string; previousPath?: string; path?: string; parentPath?: string;
   node?: DocumentLibraryNode; unchanged?: boolean; error?: string;
+};
+
+export type DocumentLibraryDeleteRequest = { path: string; expectedMtimeMs?: number };
+export type DocumentLibraryDeleteResult = {
+  ok: boolean; rootPath?: string; path?: string; parentPath?: string;
+  kind?: "markdown" | "pdf" | "word"; name?: string; deletedAt?: number; error?: string;
 };
 
 export type MarkdownReadRequest = {

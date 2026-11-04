@@ -315,6 +315,32 @@ test("serialized worker updates are visible to the immediately following search"
   }
 });
 
+test("a deleted document leaves the search index before the next search runs", async () => {
+  const sample = fixture();
+  const minutesDir = path.join(sample.rootPath, "3.项目库", "AI", "示例项目", "纪要");
+  const notePath = path.join(minutesDir, "将被删除.md");
+  fs.writeFileSync(notePath, "被删除文档的独有关键词将被移除。\n");
+  const service = new DocumentSearchService({ databasePath: sample.databasePath });
+  try {
+    service.scheduleIndex(sample.rootPath, true);
+    let settled = false;
+    const deadline = Date.now() + 5_000;
+    while (!settled && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const probe = await service.search(sample.rootPath, { query: "独有关键词" });
+      settled = !probe.indexing && probe.results.length === 1;
+    }
+    assert.equal(settled, true, "initial indexing must finish first");
+    fs.rmSync(notePath);
+    service.removeFile(sample.rootPath, notePath);
+    const immediate = await service.search(sample.rootPath, { query: "独有关键词" });
+    assert.equal(immediate.results.length, 0, "remove-file must land before the next search runs");
+  } finally {
+    await service.close();
+    sample.close();
+  }
+});
+
 test("applyOcrToEmptyPages fills only empty pages within the page cap and reports failures", async () => {
   const calls = [];
   const ocrPage = async (filePath, pageNumber) => {

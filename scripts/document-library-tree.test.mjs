@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { insertDocumentLibraryNode, moveDocumentLibraryNode } from '../src/document-library-tree.ts';
+import { insertDocumentLibraryNode, moveDocumentLibraryNode, removeDocumentLibraryNode } from '../src/document-library-tree.ts';
 import { DOCUMENT_LIBRARY_DRAG_TYPE, hasDocumentLibraryDrag, readDocumentLibraryDrag } from '../src/document-library-drag.ts';
 
 const rootPath = 'C:\\资料库';
@@ -51,6 +51,37 @@ test('moves remove the old entry and insert the new one without changing documen
   const back = moveDocumentLibraryNode(next, rootPath, moved.path, rootPath, node('材料.md'));
   assert.equal(back.nodes[3].path, node('材料.md').path);
   assert.equal(moveDocumentLibraryNode(next, rootPath, moved.path, 'C:\\资料库\\缺失', source), null);
+});
+
+test('removals copy only the ancestor branch, recount documents and keep folders', () => {
+  const a = node('A', 'folder'), b = node('B', 'folder');
+  const first = node('材料.md', 'markdown', a.path), second = node('笔记.md', 'markdown', a.path);
+  a.children = [first, second];
+  const original = snapshot([a, b]);
+  const next = removeDocumentLibraryNode(original, rootPath, second.path);
+  assert.equal(next.documentCount, original.documentCount - 1);
+  assert.deepEqual(next.nodes[0].children.map(item => item.name), ['材料.md']);
+  assert.equal(next.nodes[1], b, 'untouched folders keep their identity');
+  assert.equal(original.nodes[0].children.length, 2, 'never mutate the old snapshot');
+  // 删除根目录文档和嵌套文档同样只更新计数与对应分支。
+  const withRoot = insertDocumentLibraryNode(next, rootPath, rootPath, node('独立.md'));
+  const removedRoot = removeDocumentLibraryNode(withRoot, rootPath, node('独立.md').path);
+  assert.equal(removedRoot.documentCount, withRoot.documentCount - 1);
+  assert.deepEqual(removedRoot.nodes.map(item => item.name), ['A', 'B']);
+  assert.equal(removedRoot.nodes[0], next.nodes[0], 'unchanged branches keep their identity');
+  // 大小写不同的路径键按同一文档处理。
+  assert.equal(removeDocumentLibraryNode(removedRoot, rootPath.toLowerCase(), first.path.toUpperCase()).documentCount, removedRoot.documentCount - 1);
+});
+
+test('removals of folders, foreign paths or unknown documents fall back to a refresh', () => {
+  const a = node('A', 'folder');
+  a.children = [node('材料.md', 'markdown', a.path)];
+  const original = snapshot([a]);
+  assert.equal(removeDocumentLibraryNode(original, rootPath, a.path), null, 'folders are never removed');
+  assert.equal(removeDocumentLibraryNode(original, rootPath, `${rootPath}\\材料.md`), null, 'missing paths require a refresh');
+  assert.equal(removeDocumentLibraryNode(original, 'D:\\其他库', a.children[0].path), null, 'another root requires a refresh');
+  assert.equal(removeDocumentLibraryNode({ ...original, ok: false }, rootPath, a.children[0].path), null);
+  assert.equal(original.nodes[0].children.length, 1, 'failed removals never mutate the snapshot');
 });
 
 test('drag payloads only accept library documents from the current root', () => {

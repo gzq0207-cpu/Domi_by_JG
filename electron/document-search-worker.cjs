@@ -313,17 +313,21 @@ parentPort.on("message", (message) => {
   if (!message || typeof message !== "object") return;
   adoptSemanticSettings(message);
   adoptOcrCommand(message);
-  if (message.type === "index-file" || message.type === 'move-file') {
+  if (message.type === "index-file" || message.type === 'move-file' || message.type === 'remove-file') {
     cloudContentAllowed = message.cloudContentAllowed === true;
     const rootPath = path.resolve(message.rootPath);
     const filePath = path.resolve(message.filePath);
     const context = rootContext(rootPath);
     if (context.isCurrent()
       && pathInsideRoot(rootPath, filePath)
-      && shouldIndexFile(filePath)) {
+      && (message.type !== 'remove-file' || shouldIndexFile(filePath))) {
       enqueue(async () => {
         try {
           if (!context.isCurrent()) return;
+          if (message.type === 'remove-file') {
+            removeIndexedDocument(database, filePath);
+            return;
+          }
           if (message.type === 'move-file' && pathInsideRoot(rootPath, message.previousPath)
             && !fs.existsSync(message.previousPath)) removeIndexedDocument(database, message.previousPath);
           const stat = await fs.promises.stat(filePath);

@@ -121,6 +121,32 @@ test('creation cannot follow a directory junction outside the library', async ()
   } finally { await f.close(); fs.rmSync(outside, { recursive: true, force: true }); }
 });
 
+test('worker deletes remove the file and invalidate cached snapshots without a scan', async () => {
+  const f = fixture();
+  try {
+    const created = await f.service.create(f.location, { kind: 'markdown', name: '将被删除' });
+    assert.equal(created.ok, true);
+    await f.service.list(f.location);
+    const scansBefore = f.scans.length;
+    const removed = await f.service.delete(f.location, { path: created.path });
+    assert.equal(removed.ok, true, removed.error);
+    assert.equal(removed.kind, 'markdown');
+    assert.equal(fs.existsSync(created.path), false);
+    assert.equal(f.scans.length, scansBefore, 'deleting must not scan the entire directory');
+    const snapshot = await f.service.list(f.location);
+    assert.equal(snapshot.documentCount, 0, 'the cached tree must reflect the deletion');
+    const managed = await f.service.create(f.location, { kind: 'markdown', name: '研究入口' });
+    fs.writeFileSync(managed.path, 'domiResearchId: id-1\n# 研究入口');
+    const rejected = await f.service.delete(f.location, { path: managed.path });
+    assert.equal(rejected.ok, false);
+    assert.match(rejected.error, /对应工作区管理/);
+    assert.equal(fs.existsSync(managed.path), true);
+    const stale = await f.service.delete(f.location, { path: created.path, expectedMtimeMs: 123 });
+    assert.equal(stale.ok, false);
+    assert.match(stale.error, /已被其他应用修改|文档不存在/);
+  } finally { await f.close(); }
+});
+
 test('worker moves keep article paths and reading comments linked without a directory scan', async () => {
   const f = fixture();
   const { LocalDomiRepository } = require('../electron/local-domi-repository.cjs');

@@ -81,3 +81,24 @@ export function moveDocumentLibraryNode(snapshot: DocumentLibrarySnapshot, rootP
   const result = insertDocumentLibraryNode({ ...snapshot, nodes, documentCount: snapshot.documentCount - 1 }, rootPath, parentPath, node);
   return result ? { ...result, documentCount: snapshot.documentCount } : null;
 }
+
+// Copy-on-write removal of one document. A missing path means the renderer
+// tree is partial or stale; the caller falls back to a full refresh.
+export function removeDocumentLibraryNode(snapshot: DocumentLibrarySnapshot, rootPath: string, targetPath: string): DocumentLibrarySnapshot | null {
+  if (!snapshot.ok || pathKey(snapshot.rootPath) !== pathKey(rootPath)) return null;
+  const target = pathKey(targetPath);
+  const remove = (nodes: DocumentLibraryNode[]): DocumentLibraryNode[] | null => {
+    for (let index = 0; index < nodes.length; index++) {
+      const item = nodes[index], key = pathKey(item.path);
+      if (key === target && item.kind !== 'folder') return nodes.filter((_, at) => at !== index);
+      if (item.kind === 'folder' && target.startsWith(`${key}/`)) {
+        const children = remove(item.children || []);
+        if (children) { const next = [...nodes]; next[index] = { ...item, children }; return next; }
+      }
+    }
+    return null;
+  };
+  const nodes = remove(snapshot.nodes);
+  if (!nodes) return null;
+  return { ...snapshot, nodes, documentCount: Math.max(0, snapshot.documentCount - 1) };
+}

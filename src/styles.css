@@ -2358,6 +2358,50 @@ body.panel-resizing .main-grid {
   white-space: nowrap;
 }
 
+.document-library-node {
+  position: relative;
+}
+
+/* The row action stays in the tab order (opacity, not display) so keyboard
+   users can reach it, but never intercepts clicks while invisible. */
+.document-library-node-delete {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid #dddcd7;
+  border-radius: 5px;
+  color: #8b8b85;
+  background: #ffffff;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease, color 120ms ease, background 120ms ease;
+}
+
+.document-library-node:hover .document-library-node-delete,
+.document-library-node-delete:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.document-library-node-delete:hover:not(:disabled) {
+  color: #b4232a;
+  border-color: #e8bcb9;
+  background: #fdf3f2;
+}
+
+.document-library-node-delete:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .document-library-empty-folder {
   display: block;
   color: #aaa9a3;

@@ -114,12 +114,12 @@ test("waiting browser jobs never revisit the blocked CLI and repeated login fail
   worker.close();
 });
 
-test("one persistent browser login problem is not reannounced for each newly discovered video", async t => {
+for (const code of ["AUTH_REQUIRED", "BROWSER_CLI_INVALID_REPLY", "BROWSER_RECOVERY_REQUIRED"]) test(`one persistent browser ${code} problem is not reannounced for each newly discovered video`, async t => {
   const f=fixture(t),q=f.queue();q.items.push({...q.items[0],videoId:"lmnopqrstuv",url:"https://www.youtube.com/watch?v=lmnopqrstuv"});
   for(const item of q.items) Object.assign(item,{status:"blocked",requiresBrowserTranscript:true});
   fs.writeFileSync(f.queuePath,JSON.stringify(q));
   const worker=new SubscriptionArchiveWorker({...f.options,getMedia:async()=>assert.fail("CLI blocked"),acquireBrowserTranscript:async()=>{
-    const e=new Error("YouTube 页面要求正常登录。");Object.assign(e,{code:"AUTH_REQUIRED",requiresBrowserTranscript:true,needsUserAction:true,retryAfterMs:60000});throw e;}});
+    const e=new Error("全局浏览器故障，保留恢复断点。");Object.assign(e,{code,requiresBrowserTranscript:true,needsUserAction:code==="AUTH_REQUIRED",retryAfterMs:60000});throw e;}});
   const first=await worker.runOnce({force:true,concurrency:2});assert.equal(first.failed,2);assert.equal(first.newFailures,1);
   const later=f.queue();later.items.push({...later.items[0],videoId:"zyxwvutsrqp",url:"https://www.youtube.com/watch?v=zyxwvutsrqp",error:null,browserErrorCode:null});
   fs.writeFileSync(f.queuePath,JSON.stringify(later));

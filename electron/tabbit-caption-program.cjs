@@ -3,6 +3,8 @@
 // No account data, credentials, cookies or alternate YouTube clients are read.
 function inspectYouTubePage({ videoId }) {
   const fail = (code, message) => ({ state: "blocked", code, message });
+  if (location.protocol === "https:" && location.hostname === "www.google.com" && location.pathname.startsWith("/sorry/"))
+    return fail("CAPTCHA_REQUIRED", "YouTube 访问被重定向到 Google 验证页面，等待用户在 Tabbit 中正常完成验证。");
   if (location.protocol !== "https:" || location.hostname !== "www.youtube.com"
       || location.pathname !== "/watch" || new URL(location.href).searchParams.get("v") !== videoId)
     return fail("PAGE_CHANGED", "原视频页面已改变，停止字幕获取。");

@@ -1076,6 +1076,23 @@ async function moveDocumentLibraryItem(request) {
   } catch (error) { return { ok: false, error: error.message || String(error) }; }
 }
 
+async function deleteDocumentLibraryItem(request) {
+  try {
+    const location = documentLibraryLocation(getAppSettings().load().settings);
+    const result = await documentLibraryService.delete(location, request);
+    if (result.ok) {
+      researchAllowedPaths.delete(result.path);
+      try {
+        if (documentLibraryLocation(getAppSettings().load().settings).rootPath === location.rootPath) {
+          getDocumentSearchService().removeFile(location.rootPath, result.path);
+        }
+      }
+      catch (error) { appendRuntimeLog('document-delete-index-failed', { error: error.message || String(error) }); }
+    }
+    return result;
+  } catch (error) { return { ok: false, error: error.message || String(error) }; }
+}
+
 async function openResource(resource) {
   const webResource = normalizeWebResource(resource);
   if (webResource) {
@@ -5152,6 +5169,7 @@ ipcMain.handle("document-library:create", (_event, request) =>
   createDocumentLibraryItem(request)
 );
 ipcMain.handle('document-library:move', (_event, request) => moveDocumentLibraryItem(request));
+ipcMain.handle('document-library:delete', (_event, request) => deleteDocumentLibraryItem(request));
 ipcMain.handle("domi:subscription-digest-finalize", async (_event, request) => {
   const settings = getAppSettings().load().settings;
   if (settings.storageBackend !== "local" || !settings.localRepositoryDir) return { ok: false, error: "订阅日报需要本地资料库。" };

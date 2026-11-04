@@ -74,6 +74,11 @@ class DocumentLibraryService {
     return this.send('move', location, request);
   }
 
+  delete(location, request) {
+    this.lists.clear();
+    return this.send('delete', location, request);
+  }
+
   invalidate() {
     this.lists.clear();
     this.worker?.postMessage({ action: "invalidate" });

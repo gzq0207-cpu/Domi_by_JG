@@ -114,6 +114,10 @@ class DocumentSearchService {
     if (rootPath && previousPath && filePath) this.postToWorker({ type: 'move-file', rootPath, previousPath, filePath });
   }
 
+  removeFile(rootPath, filePath) {
+    if (rootPath && filePath) this.postToWorker({ type: 'remove-file', rootPath, filePath });
+  }
+
   search(rootPath, request) {
     if (!rootPath || !String(request?.query || "").trim()) {
       return Promise.resolve({

@@ -356,7 +356,8 @@ class SubscriptionArchiveWorker {
           const browserRequired = !quota && (error.requiresBrowserTranscript || /YouTube[^\n]*(?:要求登录|访问验证)/i.test(message));
           let reasonChanged = item.error !== message || item.browserErrorCode !== (error.code || null);
           if (browserRequired && ["AUTH_REQUIRED", "CAPTCHA_REQUIRED", "NETWORK_UNAVAILABLE", "CLI_REGISTRATION_UNAVAILABLE",
-            "BROWSER_CLI_UNAVAILABLE", "BROWSER_STARTUP_FAILED", "BROWSER_CLI_TIMEOUT", "BROWSER_REQUEST_PENDING"].includes(error.code)) {
+            "BROWSER_CLI_UNAVAILABLE", "BROWSER_STARTUP_FAILED", "BROWSER_CLI_TIMEOUT", "BROWSER_REQUEST_PENDING",
+            "BROWSER_CLI_INVALID_REPLY", "BROWSER_RECOVERY_REQUIRED", "BROWSER_WINDOW_UNAVAILABLE"].includes(error.code)) {
             const globalPath = path.join(this.stateRoot, "browser-status.json");
             let previous = {}; try { previous = JSON.parse(fs.readFileSync(globalPath, "utf8")); } catch {}
             if (previous.status === "waiting-for-browser" && previous.errorCode === error.code) reasonChanged = false;

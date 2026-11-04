@@ -33,12 +33,13 @@ fs.writeFileSync(entry, `
   const {DocumentLibraryService}=require(${JSON.stringify(path.join(root, 'electron/document-library-service.cjs'))});
   const service=new DocumentLibraryService();
   const location={rootPath:${JSON.stringify(libraryRoot)},initializeStructure:false};
-  global.metrics={lists:0,creates:[],moves:[]};
+  global.metrics={lists:0,creates:[],moves:[],deletes:[]};
   const describe=file=>{const stat=fs.statSync(file);return {path:file,name:path.basename(file),content:fs.readFileSync(file,'utf8'),size:stat.size,mtimeMs:stat.mtimeMs};};
   ipcMain.handle('library-test',async(_,action,request)=>{
     if(action==='list'){global.metrics.lists++;return service.list(location,request);}
     if(action==='create'){const start=performance.now();const result=await service.create(location,request);global.metrics.creates.push({ok:result.ok,kind:request.kind,ms:performance.now()-start});return result;}
     if(action==='move'){const result=await service.move(location,request);global.metrics.moves.push(result.ok);return result;}
+    if(action==='delete'){const start=performance.now();const result=await service.delete(location,request);global.metrics.deletes.push({ok:result.ok,ms:performance.now()-start});return result;}
     if(action==='read')return {ok:true,document:describe(request.resource)};
     if(action==='save'){fs.writeFileSync(request.path,request.content);return {ok:true,document:describe(request.path)};}
     if(action==='research')return request.action==='source' ? {ok:true,source:{id:request.path,path:request.path,name:path.basename(request.path),kind:'markdown',version:'fixture'},annotations:[]} : {ok:true,topics:[]};
@@ -66,6 +67,7 @@ try {
       listDocumentLibrary:request=>window.__libraryRpc.call('list',request),
       createDocumentLibraryEntry:request=>window.__libraryRpc.call('create',request),
       moveDocumentLibraryEntry:request=>window.__libraryRpc.call('move',request),
+      deleteDocumentLibraryEntry:request=>window.__libraryRpc.call('delete',request),
       readMarkdown:request=>window.__libraryRpc.call('read',request),
       saveMarkdown:request=>window.__libraryRpc.call('save',request),
       research:request=>window.__libraryRpc.call('research',request)
@@ -165,6 +167,29 @@ try {
   assert.equal(fs.readFileSync(collisionPath, 'utf8'), '# 原有内容必须保留\n');
   await drag(row(filePath), sidebar.getByRole('treeitem', { name: '流畅性验证', exact: true }));
   await sidebar.locator('.document-library-notice').filter({ hasText: '已在此文件夹' }).waitFor();
+  // Deleting the open document: the confirm dialog guards the irreversible
+  // write, the editor closes without flushing the draft, and the tree updates
+  // without a full directory refresh.
+  const listsBeforeDelete = await electronApp.evaluate(() => global.metrics.lists);
+  await row(filePath).hover();
+  await sidebar.getByRole('button', { name: '删除 连续新建中文研究笔记.md' }).click();
+  await page.getByRole('alertdialog').getByRole('button', { name: '删除文档' }).click();
+  await row(filePath).waitFor({ state: 'detached' });
+  assert.equal(fs.existsSync(filePath), false);
+  await page.locator('.document-library-welcome').waitFor();
+  await sidebar.locator('.document-library-notice').filter({ hasText: '已删除' }).waitFor();
+  assert.equal(await electronApp.evaluate(() => global.metrics.lists), listsBeforeDelete, 'deleting must not force a full library refresh');
+  assert.equal((await electronApp.evaluate(() => global.metrics.deletes)).length, 1);
+  // 取消删除时文件保持不变，树不重建。已展开的其他文件夹里有同名文件，
+  // 所以从行元素的父节点（节点容器）作用域内找该行自己的删除按钮。
+  const survivor = path.join(libraryRoot, '行业2', '材料1.md');
+  await sidebar.getByRole('treeitem', { name: '行业2', exact: true }).click();
+  await row(survivor).hover();
+  await row(survivor).locator('..').getByRole('button', { name: '删除 材料1.md' }).click();
+  await page.getByRole('alertdialog').getByRole('button', { name: '取消' }).click();
+  await row(survivor).waitFor();
+  assert.equal(fs.existsSync(survivor), true);
+  assert.equal((await electronApp.evaluate(() => global.metrics.deletes)).length, 1, 'cancel must not delete');
   await sidebar.getByRole('textbox', { name: '搜索本地文档库' }).fill('材料49');
   await sidebar.getByRole('treeitem', { name: /材料49.md/ }).first().waitFor();
   assert.equal(await sidebar.getByRole('treeitem', { name: /材料49.md/ }).count(), 80);
@@ -180,7 +205,7 @@ try {
   });
   fs.writeFileSync(path.join(output, 'electron-library.png'), Buffer.from(screenshot, 'base64'));
   const report = { ok: true, engine: 'Electron production renderer + real worker + real filesystem', documents: 4000,
-    checks: ['nested folder + Markdown creation', 'new file opens in editor', 'no full refresh on create', 'stale refresh cannot erase new entries', 'duplicate keeps original', 'cancel resets name', 'external update refresh', 'native file drag saves open draft', 'drag to root and back', 'moves avoid full refresh', 'drag collision preserves both files', 'same-folder drop', 'search through 80 folders', 'no renderer errors'], metrics, input };
+    checks: ['nested folder + Markdown creation', 'new file opens in editor', 'no full refresh on create', 'stale refresh cannot erase new entries', 'duplicate keeps original', 'cancel resets name', 'external update refresh', 'native file drag saves open draft', 'drag to root and back', 'moves avoid full refresh', 'drag collision preserves both files', 'same-folder drop', 'delete with confirm closes the open editor', 'delete cancel keeps the file', 'search through 80 folders', 'no renderer errors'], metrics, input };
   fs.writeFileSync(path.join(output, 'ui-results.json'), JSON.stringify(report, null, 2));
   process.stdout.write(JSON.stringify(report) + '\n');
 } catch (error) {

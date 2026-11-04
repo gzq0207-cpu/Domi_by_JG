@@ -55,6 +55,7 @@ contextBridge.exposeInMainWorld("workbench", {
   searchDocumentLibrary: (request) => ipcRenderer.invoke("document-library:search", request),
   createDocumentLibraryEntry: (request) => ipcRenderer.invoke("document-library:create", request),
   moveDocumentLibraryEntry: (request) => ipcRenderer.invoke('document-library:move', request),
+    deleteDocumentLibraryEntry: (request) => ipcRenderer.invoke('document-library:delete', request),
   finalizeSubscriptionDigest: (request) => ipcRenderer.invoke("domi:subscription-digest-finalize", request),
   readMarkdown: (request) => ipcRenderer.invoke("markdown:read", request),
   saveMarkdown: (request) => ipcRenderer.invoke("markdown:save", request),

@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs"), path = require("node:path"), os = require("node:os");
 const {ACQUISITION,PANEL_ACQUISITION,platformCaptionExport} = require("../electron/platform-captions.cjs");
 const {importExport,readExport} = require("../electron/browser-transcript.cjs");
-const {TabbitCaptionAcquirer,BrowserTranscriptError} = require("../electron/tabbit-captions.cjs");
+const {TabbitCaptionAcquirer,BrowserTranscriptError,parseReply} = require("../electron/tabbit-captions.cjs");
 const {buildCaptionProgram,inspectYouTubePage} = require("../electron/tabbit-caption-program.cjs");
 const vm = require("node:vm");
 function fixture(t,id="abcdefghijk") {
@@ -16,6 +16,30 @@ function fixture(t,id="abcdefghijk") {
     value:{ok:true,videoId:id,title:raw.title,durationSeconds:100,platformResponsePath:rawPath}};
 }
 const reply=value=>({code:0,stdout:JSON.stringify(value),stderr:""});
+
+test("launcher error envelopes on stderr preserve the real failure without admitting success data",()=>{
+  const error={ok:false,error:{code:"CLI_REGISTRATION_UNAVAILABLE",message:"route unavailable"}};
+  assert.deepEqual(parseReply({code:70,stdout:"",stderr:JSON.stringify(error)}),error);
+  assert.deepEqual(parseReply(reply({status:"succeeded",result:{value:{ok:true}}})).status,"succeeded");
+  assert.throws(()=>parseReply({code:0,stdout:"",stderr:JSON.stringify({status:"succeeded"})}),/退出码 0/);
+  assert.throws(()=>parseReply({code:70,stdout:"",stderr:'credential-like diagnostic without JSON'}),error=>
+    error.code==="BROWSER_CLI_INVALID_REPLY"&&!error.message.includes("credential-like"));
+});
+
+test("a missing old receipt blocks once globally and retains the original request without re-exporting",async t=>{
+  const f=fixture(t),stateRoot=path.join(f.root,"archives"),pending={videoId:f.item.videoId,taskName:"Domi 字幕维护",requestId:"old-original-request"};
+  fs.mkdirSync(stateRoot);const pendingPath=path.join(stateRoot,"browser-active-request.json");fs.writeFileSync(pendingPath,JSON.stringify(pending));
+  const calls=[],service=new TabbitCaptionAcquirer({stateRoot,run:async(exe,args)=>{
+    calls.push(args[0]);if(args[0]==="create")return reply({task:{}});
+    assert.equal(args[0],"receipt");assert.equal(args.at(-1),pending.requestId);
+    return {code:70,stdout:"",stderr:JSON.stringify({ok:false,error:{code:"REQUEST_FAILED",message:"Unknown request: old-original-request"}})};
+  }});
+  const second={videoId:"lmnopqrstuv",url:"https://www.youtube.com/watch?v=lmnopqrstuv"};
+  const results=await Promise.allSettled([service.acquire(f.item),service.acquire(second)]);
+  assert.ok(results.every(result=>result.status==="rejected"&&result.reason.code==="BROWSER_RECOVERY_REQUIRED"));
+  assert.deepEqual(calls,["create","receipt"]);assert.deepEqual(JSON.parse(fs.readFileSync(pendingPath,"utf8")),pending);
+  await service.close();assert.deepEqual(calls,["create","receipt"],"unresolved requests must not be finished or re-exported");
+});
 
 test("all platform text events survive conversion and raw-response tampering is rejected",t=>{
   const f=fixture(t);f.raw.response.events.splice(1,0,{tStartMs:1000,segs:[{utf8:"\n"}]});
@@ -114,6 +138,24 @@ test("a stale CLI registration triggers one normal browser launch and no registr
     if(args[0]==="create"){creates++;return reply(creates===1?{error:{code:"CLI_REGISTRATION_UNAVAILABLE"}}:{task:{}});}
     if(args[0]==="finish")return reply({finished:true});return reply({status:"succeeded",result:{value:f.value}});}});
   await service.acquire(f.item);assert.equal(starts,1);assert.equal(creates,2);await service.close();
+});
+
+test("a live runtime with no browser window is normally launched once before any export",async t=>{
+  const f=fixture(t);let creates=0,starts=0;
+  const service=new TabbitCaptionAcquirer({stateRoot:path.join(f.root,"archives"),run:async(exe,args)=>{
+    if(exe==="powershell.exe"){starts++;assert.ok(args.includes("-BrowserExecutable"));return reply({started:true});}
+    if(args[0]==="create"){creates++;return reply(creates===1?{complete:true,total:0,tabs:[],task:{}}
+      :{complete:true,total:1,tabs:[{tabId:17,state:"available"}],task:{}});}
+    if(args[0]==="finish")return reply({finished:true});
+    assert.equal(starts,1);return reply({status:"succeeded",result:{value:f.value}});
+  }});
+  assert.equal((await service.acquire(f.item)).validation.cueCount,21);assert.equal(starts,1);assert.equal(creates,2);await service.close();
+});
+
+test("an observed Google verification redirect is retained as a CAPTCHA requirement",()=>{
+  const result=vm.runInNewContext(`(${inspectYouTubePage.toString()})({videoId:"abcdefghijk"})`,{
+    location:{protocol:"https:",hostname:"www.google.com",pathname:"/sorry/index"}});
+  assert.equal(result.code,"CAPTCHA_REQUIRED");assert.match(result.message,/正常完成验证/);
 });
 
 test("incomplete captions fail before being admitted to the verified cache",async t=>{

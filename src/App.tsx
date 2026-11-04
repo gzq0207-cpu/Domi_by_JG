@@ -73,7 +73,7 @@ import {
 import { hasNativeWorkbench, workbench } from "./bridge";
 import { CodexModelReadiness } from "./codex-model-readiness";
 import DocumentLibraryTree from './DocumentLibraryTree';
-import { insertDocumentLibraryNode, moveDocumentLibraryNode } from './document-library-tree';
+import { insertDocumentLibraryNode, moveDocumentLibraryNode, removeDocumentLibraryNode } from './document-library-tree';
 import { hasDocumentLibraryDrag, readDocumentLibraryDrag } from './document-library-drag';
 import { filesFromClipboardData } from "./clipboard-files";
 import { isLocalPdfResource, isLocalWordResource } from "./document-resources";
@@ -1929,11 +1929,18 @@ function App() {
   }, []);
   const [documentLibraryMoving, setDocumentLibraryMoving] = useState(false);
   const [documentLibraryRootDragOver, setDocumentLibraryRootDragOver] = useState(false);
+  const [documentLibraryDeleting, setDocumentLibraryDeleting] = useState(false);
   const documentLibraryMovingRef = useRef(false);
+  const documentLibraryDeletingRef = useRef(false);
   const documentLibraryMoveRef = useRef(moveDocumentLibraryDocument);
   documentLibraryMoveRef.current = moveDocumentLibraryDocument;
+  const documentLibraryDeleteRef = useRef(deleteDocumentLibraryDocument);
+  documentLibraryDeleteRef.current = deleteDocumentLibraryDocument;
   const onMoveDocumentLibraryNode = useCallback((path: string, parentPath: string, mtimeMs: number) => {
     void documentLibraryMoveRef.current(path, parentPath, mtimeMs);
+  }, []);
+  const onDeleteDocumentLibraryNode = useCallback((path: string, name: string, mtimeMs: number) => {
+    void documentLibraryDeleteRef.current(path, name, mtimeMs);
   }, []);
   const onExpandDocumentLibraryFolder = useCallback((path: string) => {
     setDocumentLibraryExpandedPaths(current => current.has(path) ? current : new Set(current).add(path));
@@ -9153,6 +9160,78 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
     }
   }
 
+  async function deleteDocumentLibraryDocument(path: string, name: string, mtimeMs: number) {
+    const library = documentLibraryRef.current;
+    if (!library?.ok || documentLibraryDeletingRef.current || documentLibraryMovingRef.current
+      || documentLibraryCreating || markdownRenameInFlightRef.current) return;
+    const rootPath = library.rootPath;
+    const confirmed = await requestConfirmation({
+      title: "删除这篇文档？",
+      message: `“${name}”将从本地资料库中永久删除。`,
+      detail: "删除后无法在应用内恢复；如需找回，请从系统备份中恢复文件。",
+      confirmLabel: "删除文档",
+      tone: "danger"
+    });
+    if (!confirmed) return;
+    // The confirmation dialog yields to the event loop; a concurrent operation
+    // or a library switch may have claimed this document in the meantime.
+    if (documentLibraryRef.current !== library || documentLibraryDeletingRef.current
+      || documentLibraryMovingRef.current || documentLibraryCreating
+      || markdownRenameInFlightRef.current) return;
+    documentLibraryDeletingRef.current = true;
+    setDocumentLibraryDeleting(true);
+    setDocumentLibraryError('');
+    setDocumentLibraryNotice('正在删除文档…');
+    try {
+      const deletingOpenMarkdown = documentPathKey(markdownDocumentRef.current?.path || '') === documentPathKey(path);
+      if (deletingOpenMarkdown) {
+        // An in-flight save could otherwise recreate the file after the delete.
+        const activeSave = markdownSaveInFlightRef.current;
+        if (activeSave) await activeSave;
+        const openDocument = markdownDocumentRef.current;
+        if (openDocument && documentPathKey(openDocument.path) === documentPathKey(path)) {
+          clearMarkdownAutoSaveTimer();
+          // Deletion discards unsaved edits; aligning the draft also stops
+          // later autosaves from flushing a deleted file.
+          markdownDraftRef.current = openDocument.content;
+          mtimeMs = openDocument.mtimeMs || mtimeMs;
+        }
+      }
+      const result = await workbench.deleteDocumentLibraryEntry({ path, expectedMtimeMs: mtimeMs });
+      if (documentLibraryRef.current?.rootPath !== rootPath) return;
+      if (!result.ok || !result.path) throw new Error(result.error || '删除文档失败。');
+      documentLibraryRequestRef.current += 1;
+      setDocumentLibraryLoading(false);
+      const current = documentLibraryRef.current;
+      const updated = current ? removeDocumentLibraryNode(current, rootPath, result.path) : null;
+      if (updated) { documentLibraryRef.current = updated; setDocumentLibrary(updated); }
+      else void refreshDocumentLibrary({ silent: true, force: true });
+      setDocumentLibrarySearchActivePath(active => active === path ? '' : active);
+      // Close any viewer showing the deleted file. closeMarkdown() would flush
+      // the draft, so reset it again: keystrokes that arrived while the delete
+      // was in flight die with the file instead of recreating it.
+      if (documentPathKey(markdownDocumentRef.current?.path || '') === documentPathKey(result.path)) {
+        const deleted = markdownDocumentRef.current;
+        if (deleted) markdownDraftRef.current = deleted.content;
+        await closeMarkdown({ restoreOrigin: false });
+      } else if (documentPathKey(pdfDocumentRef.current?.path || '') === documentPathKey(result.path)) {
+        closePdf({ restoreOrigin: false });
+      }
+      setDocumentLibraryNotice(`已删除“${name}”。`);
+    } catch (error) {
+      if (documentLibraryRef.current?.rootPath === rootPath) {
+        setDocumentLibraryNotice('');
+        setDocumentLibraryError(describeOperationError(error, '删除文档失败。'));
+        // A stale-mtime rejection leaves the tree outdated; refresh so the
+        // next attempt can see the current document version.
+        void refreshDocumentLibrary({ silent: true, force: true });
+      }
+    } finally {
+      documentLibraryDeletingRef.current = false;
+      setDocumentLibraryDeleting(false);
+    }
+  }
+
   function openDocumentLibraryNode(node: DocumentLibraryNode, parentPath: string) {
     if (node.kind === "folder") {
       cancelPendingDomiEntityOpen();
@@ -10013,6 +10092,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
             selectedDocument={selectedDocumentLibraryPath} searching={Boolean(documentLibraryQuery.trim())}
             activePath={documentLibrarySearchActivePath} onOpen={onOpenDocumentLibraryNode} formatSize={formatFileSize}
             moving={documentLibraryMoving} onMove={onMoveDocumentLibraryNode} onExpand={onExpandDocumentLibraryFolder}
+            deleting={documentLibraryDeleting} onDelete={onDeleteDocumentLibraryNode}
           />}
           {documentLibrary?.ok && filteredDocumentLibraryNodes.length === 0 && (
             <div className="document-library-state">
