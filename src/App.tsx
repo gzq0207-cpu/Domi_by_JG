@@ -76,8 +76,9 @@ import DocumentLibraryTree from './DocumentLibraryTree';
 import { insertDocumentLibraryNode, moveDocumentLibraryNode, removeDocumentLibraryNode } from './document-library-tree';
 import { hasDocumentLibraryDrag, readDocumentLibraryDrag } from './document-library-drag';
 import { filesFromClipboardData } from "./clipboard-files";
-import { isLocalPdfResource, isLocalWordResource } from "./document-resources";
-import type {WordDocument} from './research-types';
+import { isLocalPdfResource, isLocalWordResource, isLocalPresentationResource } from "./document-resources";
+import type {WordDocument, PresentationDocument} from './research-types';
+import PresentationResearchReader from './PresentationResearchReader';
 import {
   automaticallyRoutedProject,
   DomiEntityResult,
@@ -2045,7 +2046,7 @@ function App() {
   const [markdownTitleDraft, setMarkdownTitleDraft] = useState("");
   const [markdownError, setMarkdownError] = useState("");
   const [markdownRequestLabel, setMarkdownRequestLabel] = useState("");
-  const [pdfDocument, setPdfDocument] = useState<PdfDocument | WordDocument | null>(null);
+  const [pdfDocument, setPdfDocument] = useState<PdfDocument | WordDocument | PresentationDocument | null>(null);
   const [pdfTargetPage, setPdfTargetPage] = useState(1);
   const [pdfLoading, setPdfLoading] = useState(false);
   const [pdfFrameLoading, setPdfFrameLoading] = useState(false);
@@ -3488,6 +3489,18 @@ function App() {
 useEffect(() => {
 if (typeof workbench.onIntakeItem !== "function") return;
 return workbench.onIntakeItem((item) => intakeItemHandlerRef.current(item));
+}, []);
+
+// 外部直接修改资料库目录（复制/移动/重命名/删除文件）时，主进程广播
+// document-library:changed；这里静默强制刷新目录树（force 绕过 worker
+// 的 60 秒列表缓存，避免旧快照）。刷新带请求序号防护，不会与手动刷新冲突。
+const documentLibraryChangedHandlerRef = useRef<() => void>(() => {});
+documentLibraryChangedHandlerRef.current = () => {
+void refreshDocumentLibrary({ silent: true, force: true });
+};
+useEffect(() => {
+if (typeof workbench.onDocumentLibraryChanged !== "function") return;
+return workbench.onDocumentLibraryChanged(() => documentLibraryChangedHandlerRef.current());
 }, []);
 
 // The Subscriptions view reads the same radar source snapshot the manager
@@ -6532,7 +6545,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
       requestId !== domiEntityOpenRequestRef.current
       || workspaceViewRef.current !== "documents"
     ) return;
-    if (isLocalPdfResource(homepageResource) || isLocalWordResource(homepageResource)) {
+    if (isLocalPdfResource(homepageResource) || isLocalWordResource(homepageResource) || isLocalPresentationResource(homepageResource)) {
       await openPdf(homepageResource, undefined, false, requestId);
     } else {
       await openMarkdown(homepageResource, undefined, requestId);
@@ -9239,7 +9252,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
       return;
     }
     setDocumentLibrarySelectedFolder(parentPath);
-    if (node.kind === "pdf" || node.kind === 'word') openDocument(node.path);
+    if (node.kind === "pdf" || node.kind === 'word' || node.kind === 'presentation') openDocument(node.path);
     else void openMarkdown(node.path);
   }
 
@@ -9385,7 +9398,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
     setPdfFrameLoading(false);
     setPdfError("");
     try {
-      const result = await (isLocalWordResource(resource) ? workbench.readWord({resource,basePath}) : workbench.readPdf({ resource, basePath }));
+      const result = await (isLocalPresentationResource(resource) ? workbench.readPresentation({ resource, basePath }) : isLocalWordResource(resource) ? workbench.readWord({ resource, basePath }) : workbench.readPdf({ resource, basePath }));
       if (
         requestId !== pdfOpenRequestRef.current
         || (
@@ -9416,7 +9429,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
   }
 
   function openDocument(resource: string, initialSearchQuery = "") {
-    if (isLocalPdfResource(resource) || isLocalWordResource(resource)) {
+    if (isLocalPdfResource(resource) || isLocalWordResource(resource) || isLocalPresentationResource(resource)) {
       setMarkdownInitialSearchQuery(initialSearchQuery);
       setPdfTargetPage(Math.max(1, Number(resource.match(/#page=(\d+)/i)?.[1]) || 1));
       void openPdf(resource);
@@ -9856,7 +9869,7 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
   }
 
   function renderPdfPanel() {
-    const format=isLocalWordResource(pdfDocument?.path || pdfRequestLabel)?'Word':'PDF';
+    const format=isLocalPresentationResource(pdfDocument?.path || pdfRequestLabel)?'PPT':isLocalWordResource(pdfDocument?.path || pdfRequestLabel)?'Word':'PDF';
     return (
       <div className="markdown-panel-shell pdf-panel-shell">
         <div className="markdown-panel-header">
@@ -9903,13 +9916,17 @@ prompt: workflowPrompt(undefined, requestText, "", true, "programmatic"),
             <div className="markdown-panel-state"><RefreshCw className="spinning" size={18} />正在载入 {format}</div>
           ) : !pdfDocument ? (
             <div className="markdown-panel-state error"><AlertCircle size={18} />{pdfError}</div>
+          ) : 'slides' in pdfDocument ? (
+            <PresentationResearchReader
+              key={`${pdfDocument.path}:${pdfDocument.mtimeMs}`}
+              document={pdfDocument}
+              initialSearchQuery={markdownInitialSearchQuery}
+            />
           ) : (
-            <>
-              <Suspense fallback={<div className="markdown-panel-state">正在加载 PDF 阅读器…</div>}><MaterialReader
-                key={`${pdfDocument.path}:${pdfDocument.mtimeMs}:${pdfTargetPage}`}
-                pdf={'html' in pdfDocument ? undefined : pdfDocument} word={'html' in pdfDocument ? pdfDocument : undefined} targetPage={pdfTargetPage} initialSearchQuery={markdownInitialSearchQuery}
-              /></Suspense>
-            </>
+            <Suspense fallback={<div className="markdown-panel-state">正在加载 PDF 阅读器…</div>}><MaterialReader
+              key={`${pdfDocument.path}:${pdfDocument.mtimeMs}:${pdfTargetPage}`}
+              pdf={'html' in pdfDocument ? undefined : pdfDocument} word={'html' in pdfDocument ? pdfDocument : undefined} targetPage={pdfTargetPage} initialSearchQuery={markdownInitialSearchQuery}
+            /></Suspense>
           )}
         </div>
       </div>

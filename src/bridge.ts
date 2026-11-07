@@ -19,6 +19,8 @@ function browserWebResource(resource: string) {
 
 const browserFallback: Window["workbench"] = {
   readWord: async()=>({ok:false,error:'Word 阅读需要在 Domi 桌面应用中使用。'}),
+  readPresentation: async()=>({ok:false,error:'PPT 阅读需要在 Domi 桌面应用中使用。'}),
+  onDocumentLibraryChanged: () => () => {},
   exportAnnotatedDocument: async()=>({ok:false,error:'导出带批注副本需要在 Domi 桌面应用中使用。'}),
   research: async () => ({ ok: false, error: '主题研究需要在 Domi 桌面应用中使用。' }),
   loadSettings: async () => ({

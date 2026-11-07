@@ -4,7 +4,7 @@ import ReactMarkdown, { defaultUrlTransform, type Components } from "react-markd
 import remarkGfm from "remark-gfm";
 import { workbench } from "./bridge";
 import type { LibraryCitation, LibraryUsage } from "./env";
-import { isLocalMarkdownResource, isLocalPdfResource } from "./document-resources";
+import { isLocalMarkdownResource, isLocalPdfResource, isLocalWordResource, isLocalPresentationResource } from "./document-resources";
 import { stripDomiEntityResultMarker } from "./entity-routing";
 import { codexFileCitationPath, domiEvidenceId, remarkCodexFileCitations } from "./message-citations";
 
@@ -118,7 +118,7 @@ const MessageContent = memo(function MessageContent({ message, onOpenDocument }:
         onClick={(event) => {
           event.preventDefault();
           if (!target) return;
-          if (isLocalMarkdownResource(target) || isLocalPdfResource(target)) openDocumentRef.current(target);
+          if (isLocalMarkdownResource(target) || isLocalPdfResource(target) || isLocalWordResource(target) || isLocalPresentationResource(target)) openDocumentRef.current(target);
           else void workbench.openResource(target);
         }}>
         {citationPath && <FileText size={14} aria-hidden="true" />}<span>{children}</span>
@@ -141,7 +141,7 @@ const MessageContent = memo(function MessageContent({ message, onOpenDocument }:
         remarkPlugins={[remarkGfm, remarkCodexFileCitations]}
         urlTransform={(url, key, node) => {
           if (key === "href" && (codexFileCitationPath(url) || domiEvidenceId(url))) return url;
-          if (key === "href" && (isLocalMarkdownResource(url) || isLocalPdfResource(url))) return url;
+          if (key === "href" && (isLocalMarkdownResource(url) || isLocalPdfResource(url) || isLocalWordResource(url) || isLocalPresentationResource(url))) return url;
           return defaultUrlTransform(url);
         }}
         components={markdownComponents}

@@ -1,6 +1,7 @@
 export type ResearchTopic = { id: string; title: string; industry: string; path: string; archived: boolean; updatedAt: number };
 export type SourceIdentity = { id: string; path: string; version: string; name: string; kind: 'markdown' | 'pdf' | 'word' };
 export type WordDocument = { path:string; name:string; size:number; mtimeMs:number; version:string; html:string; text:string; blocks:{id:string;text:string;offset:number}[]; warnings:string[]; converted:boolean };
+export type PresentationDocument = { path:string; name:string; size:number; mtimeMs:number; version:string; width:number; height:number; slides:{id:string;number:number;title:string;text:string;html:string}[]; warnings:string[]; converted:boolean };
 export type PdfRect = [number, number, number, number];
 export type AnnotationAnchor = {
   quote: string; prefix?: string; suffix?: string; offset?: number; heading?: string;

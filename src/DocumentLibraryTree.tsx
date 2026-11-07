@@ -1,6 +1,6 @@
 import { memo, useRef, useState, useEffect } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
-import { ChevronRight, FileText, FileType2, Folder, FolderOpen, Trash2 } from 'lucide-react';
+import { ChevronRight, FileText, FileType2, Folder, FolderOpen, Presentation, Trash2 } from 'lucide-react';
 import type { DocumentLibraryNode } from './env';
 import { DOCUMENT_LIBRARY_DRAG_TYPE, hasDocumentLibraryDrag, readDocumentLibraryDrag } from './document-library-drag';
 
@@ -63,7 +63,7 @@ export default memo(function DocumentLibraryTree(props: Props) {
         }}>
         <span className="document-library-disclosure" aria-hidden="true">{isFolder ? <ChevronRight className={expanded ? 'open' : ''} size={13} /> : null}</span>
         <span className={`document-library-node-icon ${node.kind}`} aria-hidden="true">
-          {isFolder ? expanded ? <FolderOpen size={16} /> : <Folder size={16} /> : node.kind === 'pdf' ? <FileType2 size={16} /> : <FileText size={16} />}
+          {isFolder ? expanded ? <FolderOpen size={16} /> : <Folder size={16} /> : node.kind === 'pdf' ? <FileType2 size={16} /> : node.kind === 'presentation' ? <Presentation size={16} /> : <FileText size={16} />}
         </span>
         <span className="document-library-node-name">{node.displayName || node.name}</span>
         {!isFolder && <small>{props.formatSize(node.size)}</small>}

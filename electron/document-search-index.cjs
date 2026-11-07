@@ -3,13 +3,13 @@ const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
 const { createSemanticSchema, replaceSemanticChunks } = require("./semantic-chunks.cjs");
 
-const SEARCHABLE_EXTENSIONS = new Set([".md", ".markdown", ".pdf", ".docx", ".doc"]);
+const SEARCHABLE_EXTENSIONS = new Set([".md", ".markdown", ".pdf", ".docx", ".doc", ".pptx", ".ppt"]);
 const MARKDOWN_EXTENSIONS = new Set([".md", ".markdown"]);
 const MAX_MARKDOWN_BYTES = 2 * 1024 * 1024;
 const MAX_PDF_BYTES = 20 * 1024 * 1024;
 const MAX_PDF_TEXT_CHARS = 200_000;
 const TRANSCRIPT_PATTERN = /(?:PLAUD\s*)?文字稿|transcript/i;
-const SCHEMA_VERSION = "6";
+const SCHEMA_VERSION = "7";
 const BM25_WEIGHTS = "0.0, 4.0, 2.0, 3.0";
 // Corpus budget (in content characters) for substring scans on queries that
 // cannot use the trigram FTS index. Exported so tests can tighten it.
@@ -37,7 +37,7 @@ function createSearchSchema(database) {
       root_path TEXT NOT NULL,
       name TEXT NOT NULL,
       relative_path TEXT NOT NULL,
-      kind TEXT NOT NULL CHECK(kind IN ('markdown', 'pdf', 'word')),
+      kind TEXT NOT NULL CHECK(kind IN ('markdown', 'pdf', 'word', 'presentation')),
       size INTEGER NOT NULL,
       mtime_ms REAL NOT NULL,
       content TEXT NOT NULL,
@@ -211,7 +211,7 @@ async function upsertIndexedDocument(database, rootPath, filePath, stat, generat
   if (!pathInsideRoot(rootPath, resolvedPath)) return false;
   const relativePath = path.relative(rootPath, resolvedPath);
   const extension = path.extname(resolvedPath).toLocaleLowerCase("en-US");
-  const kind = extension === ".pdf" ? "pdf" : /\.docx?$/.test(extension) ? 'word' : "markdown";
+  const kind = extension === ".pdf" ? "pdf" : /\.docx?$/.test(extension) ? 'word' : /\.pptx?$/.test(extension) ? 'presentation' : "markdown";
   const skipContent = options.skipContent === true;
   const existing = database.prepare(`
     SELECT size, mtime_ms FROM search_documents WHERE path = ?
@@ -224,16 +224,18 @@ async function upsertIndexedDocument(database, rootPath, filePath, stat, generat
   }
   const transcript = isTranscript(relativePath);
   let content = "",wordIncomplete=false;
-  if (kind === "markdown") {
-    content = readMarkdownContent(resolvedPath, stat, { skipContent });
-  } else if(kind==='word') {
-    if(!skipContent && stat.size<=64*1024*1024)try{const word=await require('./word-document.cjs').readWordFile(resolvedPath,{includeHtml:false});content=word.text.slice(0,MAX_PDF_TEXT_CHARS);wordIncomplete=word.incomplete;}catch{/* Filename search remains available when Word conversion is unavailable. */}
-  } else {
+if (kind === "markdown") {
+content = readMarkdownContent(resolvedPath, stat, { skipContent });
+} else if(kind==='word') {
+if(!skipContent && stat.size<=64*1024*1024)try{const word=await require('./word-document.cjs').readWordFile(resolvedPath,{includeHtml:false});content=word.text.slice(0,MAX_PDF_TEXT_CHARS);wordIncomplete=word.incomplete;}catch{/* Filename search remains available when Word conversion is unavailable. */}
+} else if(kind==='presentation') {
+if(!skipContent && stat.size<=64*1024*1024)try{const presentation=await require('./presentation-document.cjs').readPresentationFile(resolvedPath,{includeHtml:false});content=presentation.slides.map(slide=>slide.text).join('\n\n').slice(0,MAX_PDF_TEXT_CHARS);}catch{/* Filename search remains available when PPT conversion is unavailable. */}
+} else {
     content = await extractPdfText(resolvedPath, stat, { skipContent, ocrPage: options.ocrPage || null });
   }
   const contentStatus = skipContent ? "blocked"
     : !content && stat.size > 0 ? "unreadable"
-    : wordIncomplete || (kind === "pdf" || kind === 'word') && content.length >= MAX_PDF_TEXT_CHARS ? "truncated" : "complete";
+    : wordIncomplete || (kind === "pdf" || kind === 'word' || kind === 'presentation') && content.length >= MAX_PDF_TEXT_CHARS ? "truncated" : "complete";
   // PDF/Word extraction can await while the worker adopts a different root.
   // Check again at the commit boundary, including A -> B -> A switches.
   if (!isCurrent()) return false;

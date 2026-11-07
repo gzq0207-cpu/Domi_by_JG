@@ -23,8 +23,8 @@ function deleteDocumentLibraryEntry(rootPath, request = {}) {
     throw new Error('不能删除资料库的内部文件。');
   }
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('请选择普通文档进行删除。');
-  const kind = new Map([['.md','markdown'],['.markdown','markdown'],['.pdf','pdf'],['.docx','word'],['.doc','word']]).get(path.extname(target).toLowerCase());
-  if (!kind) throw new Error('仅支持删除 Markdown、PDF 和 Word 文档。');
+const kind = new Map([['.md','markdown'],['.markdown','markdown'],['.pdf','pdf'],['.docx','word'],['.doc','word'],['.pptx','presentation'],['.ppt','presentation']]).get(path.extname(target).toLowerCase());
+if (!kind) throw new Error('仅支持删除 Markdown、PDF、Word 和 PPT 文档。');
   if (kind === 'markdown') {
     if (stat.size > 8 * 1024 * 1024) throw new Error('Markdown 文档超过 8 MB，请使用系统文件管理器删除。');
     const text = fs.readFileSync(target, 'utf8');

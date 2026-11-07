@@ -91,6 +91,7 @@ const {
   ensureDocumentLibraryStructure
 } = require("./document-library.cjs");
 const { DocumentLibraryService } = require("./document-library-service.cjs");
+const { DocumentLibraryWatcher } = require("./document-library-watcher.cjs");
 const { DocumentSearchService } = require("./document-search-service.cjs");
 const { ResearchService } = require("./research-service.cjs");
 const {createDocumentAnnotationService}=require('./document-annotations.cjs');
@@ -116,6 +117,7 @@ function getResearchStore() {
 const documentAnnotations=createDocumentAnnotationService({getStore:getResearchStore,allowedPaths:researchAllowedPaths,cacheDir:()=>path.join(app.getPath('userData'),'word-preview'),chooseSave:(options,owner)=>dialog.showSaveDialog(owner,options)});
 const { normalizeWebResource } = require("./resource-target.cjs");
 const { normalizeLocalDocumentResource } = require("./document-resource.cjs");
+const { readPresentationFile, presentationView } = require("./presentation-document.cjs");
 const { prepareApplicationBrandPaths } = require("./brand-migration.cjs");
 const { withMediaRuntimeEnvironment } = require("./media-runtime.cjs");
 const {
@@ -219,6 +221,11 @@ const CODEX_HEALTH_REQUEST_TIMEOUT_MS = 20_000;
 const codexConnectionTests = new CodexConnectionTestController();
 const LARK_STATUS_CACHE_TTL_MS = 5 * 60 * 1000;
 const documentLibraryService = new DocumentLibraryService();
+// 用户在 domi 之外直接复制/移动/重命名/删除资料库文件时，监听根目录变化，
+// 失效列表缓存并通知前端刷新目录树（worker 的 60s TTL 不会自动过期）。
+const documentLibraryWatcher = new DocumentLibraryWatcher({
+  onChanged: ({ rootPath, reason }) => notifyDocumentLibraryChanged(rootPath, reason)
+});
 let documentSearchService = null;
 const externalDomiWorkflows = new Map([
   ["domi-analyst", "使用 domi-AI分析师，并可能读取当前 domi 资料库"],
@@ -1013,11 +1020,22 @@ function invalidateDocumentLibraryCache() {
   documentLibraryService.invalidate();
 }
 
+function notifyDocumentLibraryChanged(rootPath, reason) {
+  invalidateDocumentLibraryCache();
+  try { getDocumentSearchService().scheduleIndex(rootPath, true); }
+  catch (error) { appendRuntimeLog("document-library-watcher-index-failed", { error: error.message || String(error) }); }
+  for (const win of BrowserWindow.getAllWindows()) {
+    win.webContents.send("document-library:changed", { rootPath, reason });
+  }
+}
+
 async function readDocumentLibrary(request = {}) {
   try {
     const location = documentLibraryLocation(getAppSettings().load().settings);
     const snapshot = await documentLibraryService.list(location, request);
     if (!snapshot.ok) throw new Error(snapshot.error);
+    // 每次成功读取都收敛到当前根目录；watch 幂等，重复调用无副作用。
+    documentLibraryWatcher.watch(location);
     if (documentLibraryLocation(getAppSettings().load().settings).rootPath === location.rootPath) {
       getDocumentSearchService().scheduleIndex(location.rootPath, request?.force === true);
     }
@@ -1261,6 +1279,27 @@ async function readPdfDocument(request) {
         mtimeMs: stat.mtimeMs
       }
     };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function readPresentationDocument(request) {
+  try {
+    const resource = normalizeLocalDocumentResource(request?.resource);
+    const candidate = resource?.path || "";
+    if (!resource || !/\.pptx?$/i.test(candidate)) {
+      return { ok: false, error: "仅支持预览 .pptx 或 .ppt 演示文稿。" };
+    }
+    const resolved = path.isAbsolute(candidate) ? candidate : path.resolve(String(request?.basePath || ""), candidate);
+    const filePath = fs.realpathSync(resolved);
+    const stat = await fs.promises.stat(filePath);
+    if (!stat.isFile()) return { ok: false, error: "演示文稿文件不存在或已移动。" };
+    const document = presentationView(await readPresentationFile(filePath, {
+      cacheDir: path.join(app.getPath("userData"), "ppt-preview")
+    }));
+    researchAllowedPaths.add(filePath);
+    return { ok: true, document };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
@@ -2943,6 +2982,8 @@ async function saveRuntimeSettings(request) {
       documentSearchService?.adoptRoot(documentLibraryLocation(result.settings).rootPath);
       // 资料库根目录变化时重建自动镜像监听；镜像账本在下次同步时重新对账。
       startLibraryMirrorWatcher();
+      // 目录监听同样切换到新根，前端随后收到一次 changed 事件强制刷新。
+      documentLibraryWatcher.watch(documentLibraryLocation(result.settings));
     }
     getUpdateService().configureChannel(result.settings.updateChannel);
     const warning = current.storageBackend === "feishu"
@@ -5011,6 +5052,7 @@ app.on("before-quit", (event) => {
     clearInterval(knowledgeTranslationTimer);
     knowledgeTranslationService?.close();
     stopLibraryMirrorWatcher();
+    documentLibraryWatcher.close();
     inboxAnswerGenerator?.close();
     codexClient?.close();
     if (remaining === 0) stateStore?.close();
@@ -5197,6 +5239,7 @@ ipcMain.handle("markdown:image-save", (_event, request) => saveMarkdownImage(req
 ipcMain.handle("markdown:copy", (_event, request) => copyMarkdownDocument(request));
 ipcMain.handle("pdf:read", (_event, request) => readPdfDocument(request));
 ipcMain.handle('word:read',(_event,request)=>documentAnnotations.readWord(request));
+ipcMain.handle('presentation:read',(_event,request)=>readPresentationDocument(request));
 ipcMain.handle('document:export-annotated',(event,request)=>documentAnnotations.exportAnnotated(request,BrowserWindow.fromWebContents(event.sender)));
 ipcMain.handle("domi:entity-workspace", async (_event, request) => {
   try {

@@ -61,7 +61,9 @@ const DOCUMENT_EXTENSIONS = new Map([
   [".markdown", "markdown"],
   [".pdf", "pdf"],
   [".docx", "word"],
-  [".doc", "word"]
+  [".doc", "word"],
+  [".pptx", "presentation"],
+  [".ppt", "presentation"]
 ]);
 
 function expandHomePath(value) {

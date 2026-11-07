@@ -25,7 +25,7 @@ import {
   X
 } from "lucide-react";
 import { workbench } from "./bridge";
-import { isLocalMarkdownResource, isLocalPdfResource, isLocalWordResource, resolveLocalDocumentLink } from "./document-resources";
+import { isLocalMarkdownResource, isLocalPdfResource, isLocalWordResource, isLocalPresentationResource, resolveLocalDocumentLink } from "./document-resources";
 import { prepareMarkdownForEditor, restoreMarkdownFromEditor } from "./markdownDialect";
 import "./RichMarkdownEditor.css";
 import { anchorRange, editorTextIndex, readingAnnotationExtension, readingAnnotationKey, researchNoteExtension } from './research-editor';
@@ -792,7 +792,7 @@ export default function RichMarkdownEditor({
           const target = resolveLocalDocumentLink(href, documentPath);
           if (target) {
             event.preventDefault();
-            if ((isLocalMarkdownResource(target) || isLocalPdfResource(target) || isLocalWordResource(target)) && onOpenDocument) {
+            if ((isLocalMarkdownResource(target) || isLocalPdfResource(target) || isLocalWordResource(target) || isLocalPresentationResource(target)) && onOpenDocument) {
               onOpenDocument(target);
             } else {
               void workbench.openResource(target);

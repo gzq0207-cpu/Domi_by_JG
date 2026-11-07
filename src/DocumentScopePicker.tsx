@@ -59,7 +59,7 @@ export default function DocumentScopePicker({ library, loading, error, initialSe
           {folder ? <Folder size={16} /> : <FileText size={16} />}
           <span>{node.displayName || node.name}</span>
         </label>
-        <small>{folder ? `${count ? `${count}/` : ""}${files.length} 份` : node.kind === "pdf" ? "PDF" : node.kind==='word'?'Word':"Markdown"}</small>
+<small>{folder ? `${count ? `${count}/` : ""}${files.length} 份` : node.kind === "pdf" ? "PDF" : node.kind==='word'?'Word' : node.kind==='presentation'?'PPT' : "Markdown"}</small>
       </div>
       {open && node.children?.map((child) => renderNode(child, depth + 1))}
     </div>;

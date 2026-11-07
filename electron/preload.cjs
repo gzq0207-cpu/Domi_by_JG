@@ -65,6 +65,7 @@ contextBridge.exposeInMainWorld("workbench", {
   copyMarkdown: (request) => ipcRenderer.invoke("markdown:copy", request),
   readPdf: (request) => ipcRenderer.invoke("pdf:read", request),
   readWord: (request) => ipcRenderer.invoke("word:read", request),
+  readPresentation: (request) => ipcRenderer.invoke("presentation:read", request),
   exportAnnotatedDocument: (request) => ipcRenderer.invoke("document:export-annotated", request),
   research: (request) => ipcRenderer.invoke("research:request", request),
   loadState: (defaultState) => ipcRenderer.invoke("storage:load", defaultState),
@@ -116,6 +117,11 @@ contextBridge.exposeInMainWorld("workbench", {
     const handler = (_event, payload) => callback(payload);
     ipcRenderer.on("app:intake-item", handler);
     return () => ipcRenderer.removeListener("app:intake-item", handler);
+  },
+  onDocumentLibraryChanged: (callback) => {
+    const handler = (_event, payload) => callback(payload);
+    ipcRenderer.on("document-library:changed", handler);
+    return () => ipcRenderer.removeListener("document-library:changed", handler);
   },
   onUpdateStatus: (callback) => {
     const handler = (_event, payload) => callback(payload);

@@ -75,6 +75,7 @@ declare global {
       ) => Promise<DocumentLibraryCreateResult>;
       moveDocumentLibraryEntry: (request: DocumentLibraryMoveRequest) => Promise<DocumentLibraryMoveResult>;
       deleteDocumentLibraryEntry: (request: DocumentLibraryDeleteRequest) => Promise<DocumentLibraryDeleteResult>;
+onDocumentLibraryChanged: (callback: (payload: { rootPath: string; reason: string }) => void) => () => void;
       finalizeSubscriptionDigest: (request: { day: string }) => Promise<{ ok: boolean; files?: string[]; error?: string }>;
       readMarkdown: (request: MarkdownReadRequest) => Promise<MarkdownReadResult>;
       saveMarkdown: (request: MarkdownSaveRequest) => Promise<MarkdownSaveResult>;
@@ -87,6 +88,7 @@ declare global {
       readPdf: (request: PdfReadRequest) => Promise<PdfReadResult>;
       research: (request: import('./research-types').ResearchRequest) => Promise<import('./research-types').ResearchResult>;
       readWord: (request: PdfReadRequest) => Promise<{ok:boolean;document?:import('./research-types').WordDocument;error?:string}>;
+readPresentation: (request: PdfReadRequest) => Promise<{ok:boolean;document?:import('./research-types').PresentationDocument;error?:string}>;
       exportAnnotatedDocument: (request:{path:string;expectedVersion:string;preserveUnlocated?:boolean}) => Promise<{ok:boolean;path?:string;count?:number;unlocatedCount?:number;canceled?:boolean;error?:string}>;
       loadState: (defaultState: unknown) => Promise<StateLoadResult>;
       saveState: (state: unknown) => Promise<StateSaveResult>;
@@ -216,7 +218,7 @@ export type MarkdownDocument = {
 };
 
 export type DocumentLibraryNode = {
-  kind: "folder" | "markdown" | "pdf" | "word";
+kind: "folder" | "markdown" | "pdf" | "word" | "presentation";
   name: string;
   displayName?: string;
   path: string;
@@ -254,10 +256,10 @@ export type DocumentLibrarySearchMatch = {
   path: string;
   name: string;
   relativePath: string;
-  kind: "markdown" | "pdf" | "word";
-  size: number;
-  mtimeMs: number;
-  snippet: string;
+kind: "markdown" | "pdf" | "word" | "presentation";
+size: number;
+mtimeMs: number;
+snippet: string;
   line?: number;
 };
 
@@ -299,7 +301,7 @@ export type DocumentLibraryMoveResult = {
 export type DocumentLibraryDeleteRequest = { path: string; expectedMtimeMs?: number };
 export type DocumentLibraryDeleteResult = {
   ok: boolean; rootPath?: string; path?: string; parentPath?: string;
-  kind?: "markdown" | "pdf" | "word"; name?: string; deletedAt?: number; error?: string;
+  kind?: "markdown" | "pdf" | "word" | "presentation"; name?: string; deletedAt?: number; error?: string;
 };
 
 export type MarkdownReadRequest = {

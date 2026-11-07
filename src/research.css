@@ -142,3 +142,16 @@
   .material-reader-body { flex-direction:column; }
   .document-comments { width:auto; max-height:45%; border-left:0; border-top:1px solid #e0dcd2; }
 }
+
+.ppt-reader { display:flex; flex:1; flex-direction:column; min-height:0; }
+.ppt-reader-scroll { overflow:auto; flex:1; padding:22px; background:#232722; overscroll-behavior:contain; }
+.ppt-slide-frame { position:relative; margin:0 auto 20px; box-shadow:0 3px 16px #0006; border-radius:4px; overflow:hidden; background:white; }
+.ppt-slide-frame.ppt-search-target { outline:3px solid #e8b34b; outline-offset:2px; }
+.ppt-slide { position:relative; transform-origin:top left; background:white; color:#333; font-family:Arial,"Microsoft YaHei",sans-serif; }
+.ppt-slide .ppt-shape { position:absolute; box-sizing:border-box; overflow:hidden; }
+.ppt-slide .ppt-title { font-weight:700; }
+.ppt-slide .ppt-shape p { margin:0; overflow-wrap:anywhere; line-height:1.35; }
+.ppt-slide .ppt-shape table { width:100%; border-collapse:collapse; table-layout:fixed; }
+.ppt-slide .ppt-shape td { border:1px solid #ccc; padding:3px 6px; min-width:16px; vertical-align:top; }
+.ppt-slide .ppt-picture img { width:100%; height:100%; object-fit:contain; display:block; }
+.ppt-object-placeholder { color:#999; font-size:10pt; }
